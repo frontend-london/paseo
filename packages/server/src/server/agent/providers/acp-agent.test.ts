@@ -118,6 +118,7 @@ interface ACPConfiguredOverrideInternals {
   };
   configOptions: SessionConfigOption[];
   availableModes: Array<{ id: string; label: string; description?: string }>;
+  modeSource: "legacy" | "config" | "fallback";
   availableModels: Array<{ modelId: string; name: string; description?: string | null }> | null;
   currentMode: string | null;
   currentModel: string | null;
@@ -380,6 +381,7 @@ function prepareConfiguredOverrideSession(
   options: {
     currentMode?: string | null;
     availableModes?: Array<{ id: string; label: string; description?: string }>;
+    modeSource?: "legacy" | "config" | "fallback";
     currentModel?: string | null;
     availableModels?: Array<{ modelId: string; name: string; description?: string | null }> | null;
     configOptions?: SessionConfigOption[];
@@ -405,6 +407,11 @@ function prepareConfiguredOverrideSession(
     ...options.connection,
   };
   internals.availableModes = options.availableModes ?? [];
+  // Tests that inject availableModes without an explicit source are modeling legacy
+  // ACP session modes (session/set_mode), not config-mirrored lists.
+  internals.modeSource =
+    options.modeSource ??
+    (options.availableModes && options.availableModes.length > 0 ? "legacy" : "fallback");
   internals.availableModels = options.availableModels ?? null;
   internals.configOptions = options.configOptions ?? [];
   internals.currentMode = options.currentMode ?? null;
@@ -716,6 +723,7 @@ describe("deriveModesFromACP", () => {
         { id: "plan", label: "Plan", description: "Read only" },
       ],
       currentModeId: "plan",
+      source: "legacy",
     });
   });
 
@@ -740,6 +748,7 @@ describe("deriveModesFromACP", () => {
         { id: "acceptEdits", label: "Accept File Edits", description: undefined },
       ],
       currentModeId: "acceptEdits",
+      source: "config",
     });
   });
 
@@ -762,6 +771,7 @@ describe("deriveModesFromACP", () => {
     expect(result).toEqual({
       modes: [],
       currentModeId: null,
+      source: "fallback",
     });
   });
 });
@@ -784,14 +794,51 @@ describe("ACP selection validity helpers", () => {
           options: [{ value: "default", name: "Always Ask" }],
         },
       ],
+      modeSource: "legacy",
     });
 
     expect(result).toMatchObject({
       availableMode: { id: "plan", label: "Plan" },
       configChoice: null,
       hasAvailableModes: true,
+      modeSource: "legacy",
+      usesLegacySessionMode: true,
     });
     expect(result.configOption?.id).toBe("mode");
+  });
+
+  test("does not treat config-mirrored mode lists as legacy session modes", () => {
+    const result = resolveACPModeSelection({
+      modeId: "bypassPermissions",
+      availableModes: [
+        { id: "default", label: "Standard" },
+        { id: "plan", label: "Plan Mode" },
+        { id: "bypassPermissions", label: "Skip Permissions" },
+      ],
+      configOptions: [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: "default",
+          options: [
+            { value: "default", name: "Standard" },
+            { value: "plan", name: "Plan Mode" },
+            { value: "bypassPermissions", name: "Skip Permissions" },
+          ],
+        },
+      ],
+      modeSource: "config",
+    });
+
+    expect(result).toMatchObject({
+      availableMode: { id: "bypassPermissions", label: "Skip Permissions" },
+      configChoice: { value: "bypassPermissions", name: "Skip Permissions" },
+      hasAvailableModes: true,
+      modeSource: "config",
+      usesLegacySessionMode: false,
+    });
   });
 
   test("classifies model select config option choices separately from advertised models", () => {
@@ -1041,6 +1088,13 @@ describe("ACPAgentSession Zed parity", () => {
     const unsubscribe = session.subscribe((event) => events.push(event));
     internals.sessionId = "session-1";
     internals.configOptions = [selectConfigOption("mode", ["ask", "default"], "ask")];
+    asInternals<{ modeSource: string; availableModes: Array<{ id: string; label: string }> }>(
+      session,
+    ).modeSource = "config";
+    asInternals<{ availableModes: Array<{ id: string; label: string }> }>(session).availableModes = [
+      { id: "ask", label: "ask" },
+      { id: "default", label: "default" },
+    ];
     internals.connection = {
       setSessionConfigOption: vi.fn(async () => ({
         configOptions: [selectConfigOption("mode", ["ask", "default"], "default")],
@@ -1062,6 +1116,77 @@ describe("ACPAgentSession Zed parity", () => {
         ],
       },
     ]);
+  });
+
+  test("routes legacy session modes through session/set_mode", async () => {
+    const session = createSessionWithConfig({ modeId: "plan" });
+    const { internals, setSessionMode, setSessionConfigOption } = prepareConfiguredOverrideSession(
+      session,
+      {
+        currentMode: "default",
+        modeSource: "legacy",
+        availableModes: [
+          { id: "default", label: "Always Ask" },
+          { id: "plan", label: "Plan" },
+        ],
+        configOptions: [selectConfigOption("mode", ["default", "plan"], "default")],
+      },
+    );
+
+    await internals.applyConfiguredOverrides();
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "plan" });
+    expect(setSessionConfigOption).not.toHaveBeenCalled();
+  });
+
+  test("routes config-option modes through session/set_config_option (antigravity bypassPermissions)", async () => {
+    const antigravityModes = [
+      { id: "default", label: "Standard" },
+      { id: "plan", label: "Plan Mode" },
+      { id: "bypassPermissions", label: "Skip Permissions" },
+    ];
+    const modeConfig = {
+      id: "mode",
+      name: "Mode",
+      category: "mode" as const,
+      type: "select" as const,
+      currentValue: "default",
+      options: [
+        { value: "default", name: "Standard" },
+        { value: "plan", name: "Plan Mode" },
+        { value: "bypassPermissions", name: "Skip Permissions" },
+      ],
+    };
+    const session = createSessionWithConfig({
+      provider: "antigravity-acp",
+      modeId: "bypassPermissions",
+    });
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [{ ...modeConfig, currentValue: "bypassPermissions" }],
+    }));
+    const setSessionMode = vi.fn(async () => {
+      throw Object.assign(new Error('"Method not found": session/set_mode'), {
+        code: -32601,
+        data: { method: "session/set_mode" },
+      });
+    });
+    const { internals } = prepareConfiguredOverrideSession(session, {
+      currentMode: "default",
+      modeSource: "config",
+      availableModes: antigravityModes,
+      configOptions: [modeConfig],
+      connection: { setSessionConfigOption, setSessionMode },
+    });
+
+    await internals.applyConfiguredOverrides();
+
+    expect(setSessionConfigOption).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      configId: "mode",
+      value: "bypassPermissions",
+    });
+    expect(setSessionMode).not.toHaveBeenCalled();
+    await expect(session.getCurrentMode()).resolves.toBe("bypassPermissions");
   });
 
   test("uses canonical model returned by setSessionConfigOption response", async () => {
