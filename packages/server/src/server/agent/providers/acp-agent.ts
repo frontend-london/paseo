@@ -519,11 +519,21 @@ interface SelectConfigChoice {
 }
 type AvailableACPModel = NonNullable<SessionModelState["availableModels"]>[number];
 
+/** Where the current mode list originated for ACP mode switching. */
+export type ACPModeSource = "legacy" | "config" | "fallback";
+
 interface ACPModeSelection {
   availableMode: AgentMode | null;
   configOption: SelectConfigOption | null;
   configChoice: SelectConfigChoice | null;
   hasAvailableModes: boolean;
+  modeSource: ACPModeSource;
+  /**
+   * True when modes came from ACP session mode state (`modes` / `session/set_mode`).
+   * False when the UI list was only mirrored from `configOptions` — those must use
+   * `session/set_config_option` (e.g. antigravity-acp Skip Permissions).
+   */
+  usesLegacySessionMode: boolean;
 }
 
 interface ACPModelSelection {
@@ -569,17 +579,24 @@ export function resolveACPModeSelection({
   modeId,
   availableModes,
   configOptions,
+  modeSource = "fallback",
 }: {
   modeId: string;
   availableModes: AgentMode[];
   configOptions: SessionConfigOption[] | null | undefined;
+  modeSource?: ACPModeSource;
 }): ACPModeSelection {
   const configOption = findSelectConfigOption({ configOptions, category: "mode" });
+  const hasAvailableModes = availableModes.length > 0;
+  // Config-mirrored mode lists must not be treated as legacy session modes.
+  const usesLegacySessionMode = modeSource === "legacy" && hasAvailableModes;
   return {
     availableMode: availableModes.find((mode) => mode.id === modeId) ?? null,
     configOption,
     configChoice: findSelectConfigChoice({ option: configOption, value: modeId }),
-    hasAvailableModes: availableModes.length > 0,
+    hasAvailableModes,
+    modeSource,
+    usesLegacySessionMode,
   };
 }
 
@@ -605,7 +622,7 @@ export function deriveModesFromACP(
   fallbackModes: AgentMode[],
   modeState?: { availableModes?: SessionMode[] | null; currentModeId?: string | null } | null,
   configOptions?: SessionConfigOption[] | null,
-): { modes: AgentMode[]; currentModeId: string | null } {
+): { modes: AgentMode[]; currentModeId: string | null; source: ACPModeSource } {
   if (modeState?.availableModes?.length) {
     return {
       modes: modeState.availableModes.map((mode) => ({
@@ -614,6 +631,7 @@ export function deriveModesFromACP(
         description: mode.description ?? undefined,
       })),
       currentModeId: modeState.currentModeId ?? null,
+      source: "legacy",
     };
   }
 
@@ -627,12 +645,14 @@ export function deriveModesFromACP(
         description: option.description ?? undefined,
       })),
       currentModeId: modeOption.currentValue,
+      source: "config",
     };
   }
 
   return {
     modes: fallbackModes,
     currentModeId: null,
+    source: "fallback",
   };
 }
 
@@ -1311,6 +1331,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private sessionId: string | null = null;
   private currentMode: string | null = null;
   private availableModes: AgentMode[];
+  /** Tracks whether availableModes came from legacy session modes or configOptions. */
+  private modeSource: ACPModeSource = "fallback";
   private currentModel: string | null = null;
   private availableModels: AvailableACPModel[] | null = null;
   private thinkingOptionId: string | null = null;
@@ -1352,6 +1374,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.beforeModeWriter = options.beforeModeWriter;
     this.thinkingOptionWriter = options.thinkingOptionWriter;
     this.availableModes = options.defaultModes;
+    this.modeSource = "fallback";
     this.agentId = options.agentId;
     this.launchEnv = options.launchEnv;
     this.initialHandle = options.handle;
@@ -1630,6 +1653,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       modeId,
       availableModes: this.availableModes,
       configOptions: this.configOptions,
+      modeSource: this.modeSource,
     });
     await this.setModeWithSelection({ modeId, selection });
   }
@@ -1655,7 +1679,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       if (providerResult.configOptions) {
         this.configOptions = this.transformConfigOptions(providerResult.configOptions);
       }
-      this.availableModes = deriveModesFromACP(this.defaultModes, null, this.configOptions).modes;
+      this.applyDerivedModes(deriveModesFromACP(this.defaultModes, null, this.configOptions));
       this.pushEvent({
         type: "mode_changed",
         provider: this.provider,
@@ -1665,7 +1689,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
 
-    if (selection.hasAvailableModes) {
+    // Prefer config-option switching when modes were only mirrored from configOptions
+    // (antigravity-acp and similar). Legacy session modes still use session/set_mode.
+    if (selection.usesLegacySessionMode) {
       if (!selection.availableMode) {
         this.warnInvalidSelection(
           modeId,
@@ -1678,18 +1704,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     } else {
       const modeOption = selection.configOption;
       if (!modeOption) {
-        throw new Error(`${this.provider} does not expose ACP mode switching`);
-      }
-      if (!selection.configChoice) {
-        this.warnInvalidSelection(
-          modeId,
-          `is not valid ${this.provider} mode config option. Available options: ${flattenSelectOptions(
-            modeOption.options,
-          )
-            .map((option) => option.value)
-            .join(", ")}`,
-        );
-        return;
+        // No config mode option: fall back to legacy session mode API when we have a list.
+        if (selection.hasAvailableModes) {
+          if (!selection.availableMode) {
+            this.warnInvalidSelection(
+              modeId,
+              `is not valid ${this.provider} mode. Available options: ${this.availableModes
+                .map((mode) => mode.id)
+                .join(", ")}`,
+            );
+            return;
+          }
+        } else {
+          throw new Error(`${this.provider} does not expose ACP mode switching`);
+        }
+      } else if (!selection.configChoice) {
+        // Config option exists but choice is missing — if we still have a legacy mode
+        // list match, allow set_mode; otherwise warn.
+        if (selection.hasAvailableModes && selection.availableMode && selection.modeSource !== "config") {
+          // proceed via legacy path below
+        } else {
+          this.warnInvalidSelection(
+            modeId,
+            `is not valid ${this.provider} mode config option. Available options: ${flattenSelectOptions(
+              modeOption.options,
+            )
+              .map((option) => option.value)
+              .join(", ")}`,
+          );
+          return;
+        }
       }
     }
 
@@ -1700,9 +1744,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }
     }
 
-    if (selection.hasAvailableModes) {
+    const shouldUseLegacySessionMode =
+      selection.usesLegacySessionMode ||
+      (!selection.configOption && selection.hasAvailableModes && Boolean(selection.availableMode)) ||
+      (selection.modeSource !== "config" &&
+        selection.hasAvailableModes &&
+        Boolean(selection.availableMode) &&
+        !selection.configChoice);
+
+    if (shouldUseLegacySessionMode) {
       await this.connection.setSessionMode({ sessionId: this.sessionId, modeId });
       this.currentMode = modeId;
+      this.modeSource = "legacy";
       this.pushEvent({
         type: "mode_changed",
         provider: this.provider,
@@ -1729,13 +1782,22 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       requestedValue: modeId,
       label: "mode",
     });
-    this.availableModes = deriveModesFromACP(this.defaultModes, null, this.configOptions).modes;
+    this.applyDerivedModes(deriveModesFromACP(this.defaultModes, null, this.configOptions));
     this.pushEvent({
       type: "mode_changed",
       provider: this.provider,
       currentModeId: this.currentMode,
       availableModes: [...this.availableModes],
     });
+  }
+
+  private applyDerivedModes(modeInfo: {
+    modes: AgentMode[];
+    currentModeId: string | null;
+    source: ACPModeSource;
+  }): void {
+    this.availableModes = modeInfo.modes;
+    this.modeSource = modeInfo.source;
   }
 
   private createProviderModeWriterContext(
@@ -2394,7 +2456,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.configOptions = this.transformConfigOptions(transformed.configOptions ?? []);
 
     const modeInfo = deriveModesFromACP(this.defaultModes, transformed.modes, this.configOptions);
-    this.availableModes = modeInfo.modes;
+    this.applyDerivedModes(modeInfo);
     this.currentMode = modeInfo.currentModeId ?? this.currentMode;
 
     this.availableModels = transformed.models?.availableModels ?? null;
@@ -2421,6 +2483,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         modeId: configuredModeId,
         availableModes: this.availableModes,
         configOptions: this.configOptions,
+        modeSource: this.modeSource,
       });
       await this.setModeWithSelection({ modeId: configuredModeId, selection });
     }
@@ -2634,12 +2697,21 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   private handleConfigOptionUpdate(update: ConfigOptionUpdate): AgentStreamEvent[] {
     this.configOptions = this.transformConfigOptions(update.configOptions);
-    const modeInfo = deriveModesFromACP(this.defaultModes, null, this.configOptions);
+    // Config updates only refresh the config-derived mode list when we are not
+    // already bound to legacy session modes (which keep session/set_mode).
+    const modeInfo =
+      this.modeSource === "legacy"
+        ? {
+            modes: this.availableModes,
+            currentModeId: deriveCurrentConfigValue(this.configOptions, "mode"),
+            source: "legacy" as const,
+          }
+        : deriveModesFromACP(this.defaultModes, null, this.configOptions);
     const nextMode = modeInfo.currentModeId;
     const nextModel = deriveCurrentConfigValue(this.configOptions, "model");
     const nextThinkingOptionId = deriveCurrentConfigValue(this.configOptions, "thought_level");
 
-    this.availableModes = modeInfo.modes;
+    this.applyDerivedModes(modeInfo);
     this.currentMode = nextMode ?? this.currentMode;
     this.currentModel = nextModel ?? this.currentModel;
     this.thinkingOptionId = nextThinkingOptionId ?? this.thinkingOptionId;
