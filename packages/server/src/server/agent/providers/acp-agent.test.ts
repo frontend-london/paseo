@@ -1091,10 +1091,11 @@ describe("ACPAgentSession Zed parity", () => {
     asInternals<{ modeSource: string; availableModes: Array<{ id: string; label: string }> }>(
       session,
     ).modeSource = "config";
-    asInternals<{ availableModes: Array<{ id: string; label: string }> }>(session).availableModes = [
-      { id: "ask", label: "ask" },
-      { id: "default", label: "default" },
-    ];
+    asInternals<{ availableModes: Array<{ id: string; label: string }> }>(session).availableModes =
+      [
+        { id: "ask", label: "ask" },
+        { id: "default", label: "default" },
+      ];
     internals.connection = {
       setSessionConfigOption: vi.fn(async () => ({
         configOptions: [selectConfigOption("mode", ["ask", "default"], "default")],

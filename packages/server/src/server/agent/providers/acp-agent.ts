@@ -1721,7 +1721,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       } else if (!selection.configChoice) {
         // Config option exists but choice is missing — if we still have a legacy mode
         // list match, allow set_mode; otherwise warn.
-        if (selection.hasAvailableModes && selection.availableMode && selection.modeSource !== "config") {
+        if (
+          selection.hasAvailableModes &&
+          selection.availableMode &&
+          selection.modeSource !== "config"
+        ) {
           // proceed via legacy path below
         } else {
           this.warnInvalidSelection(
@@ -1746,7 +1750,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     const shouldUseLegacySessionMode =
       selection.usesLegacySessionMode ||
-      (!selection.configOption && selection.hasAvailableModes && Boolean(selection.availableMode)) ||
+      (!selection.configOption &&
+        selection.hasAvailableModes &&
+        Boolean(selection.availableMode)) ||
       (selection.modeSource !== "config" &&
         selection.hasAvailableModes &&
         Boolean(selection.availableMode) &&
