@@ -3606,9 +3606,11 @@ describe("ACPAgentSession process crash recovery", () => {
       mcpServers: [],
     });
     expect(resumedAgent.newSession).not.toHaveBeenCalled();
-    expect(resumedAgent.prompt).toHaveBeenCalled();
     expect(internalsOf(session).processState).toBe("running");
 
+    await vi.waitFor(() => {
+      expect(resumedAgent.prompt).toHaveBeenCalled();
+    });
     await vi.waitFor(() => {
       expect(
         events.some((event) => event.type === "turn_completed" && event.turnId === turnId),
