@@ -131,6 +131,10 @@ function isACPError(value: unknown): value is ACPError {
   return isRecord(value) && typeof value.message === "string" && typeof value.code === "number";
 }
 
+function isSessionResumeUnsupportedError(error: unknown): boolean {
+  return error instanceof Error && error.message.endsWith("does not support ACP session resume");
+}
+
 function extractACPErrorDataMessage(data: unknown): string | null {
   if (!isRecord(data)) {
     return null;
@@ -476,6 +480,17 @@ interface PendingUserMessage {
 }
 
 export type SessionStateResponse = NewSessionResponse | LoadSessionResponse | ResumeSessionResponse;
+
+/**
+ * Mutable per-session runtime state, tracked separately from the create-time
+ * config snapshot so a crash respawn restores what the user actually set.
+ */
+interface ACPEffectiveRuntimeState {
+  modeId: string | null;
+  model: string | null;
+  thinkingOptionId: string | null;
+  featureValues: Record<string, unknown>;
+}
 
 interface TerminalExit {
   exitCode?: number | null;
@@ -1356,13 +1371,17 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private processState: "starting" | "running" | "dead" | "stopping" = "starting";
-  private processGeneration = 0;
   private processExit: { code: number | null; signal: NodeJS.Signals | null; at: number } | null =
     null;
   private respawnPromise: Promise<void> | null = null;
+  private resumeUnsupported = false;
+  private readonly startingTurnIds = new Set<string>();
+  private readonly cancelRequestedTurnIds = new Set<string>();
+  private featureValues: Record<string, unknown>;
   private closed = false;
   private readonly managedProcesses?: ManagedProcessRegistry;
   private managedProcessRecordId: string | null = null;
+  private managedProcessRecordSessionId: string | null = null;
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
@@ -1401,6 +1420,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
     this.managedProcesses = options.managedProcesses;
+    this.featureValues = { ...config.featureValues };
   }
 
   get id(): string | null {
@@ -1423,8 +1443,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.sessionId = response.sessionId;
       this.bootstrapThreadEventPending = true;
       this.applySessionState(response);
+      await this.updateManagedProcessMetadata();
       await this.applyConfiguredOverrides();
-      this.processGeneration += 1;
       this.processState = "running";
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
@@ -1469,6 +1489,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       } finally {
         this.replayingHistory = false;
       }
+      await this.updateManagedProcessMetadata();
       return;
     }
 
@@ -1481,6 +1502,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         }),
       );
       this.applySessionState(response);
+      await this.updateManagedProcessMetadata();
       return;
     }
 
@@ -1502,8 +1524,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.bootstrapThreadEventPending = true;
 
       await this.loadPersistedSession({ keepReplayedHistory: true });
+      await this.updateManagedProcessMetadata();
       await this.applyConfiguredOverrides();
-      this.processGeneration += 1;
       this.processState = "running";
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
@@ -1547,47 +1569,69 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.closed) {
       throw new Error(`${this.provider} session is closed`);
     }
-    await this.ensureProcess();
-    if (!this.connection || !this.sessionId) {
-      throw new Error(`${this.provider} session is not initialized`);
-    }
-    if (this.activeForegroundTurnId) {
-      throw new Error("A foreground turn is already active");
-    }
 
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     const turnId = randomUUID();
     const messageId = options?.clientMessageId ?? randomUUID();
-    this.activeForegroundTurnId = turnId;
-    this.fallbackAssistantMessageId = null;
-    this.submittedUserMessageTurnId = null;
-    this.emitBootstrapThreadEvent();
-    this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
-    this.emitSubmittedUserMessage(prompt, messageId, turnId, options?.clientMessageId);
+    this.startingTurnIds.add(turnId);
+    try {
+      await this.ensureProcess();
+      if (this.closed) {
+        throw new Error(`${this.provider} session is closed`);
+      }
+      if (!this.connection || !this.sessionId) {
+        throw new Error(`${this.provider} session is not initialized`);
+      }
+      if (this.activeForegroundTurnId) {
+        throw new Error("A foreground turn is already active");
+      }
 
-    void this.connection
-      .prompt({
-        sessionId: this.sessionId,
-        messageId,
-        prompt: toACPContentBlocks(prompt),
-      })
-      .then((response) => {
-        this.handlePromptResponse(response, turnId);
-        return;
-      })
-      .catch((error) => {
-        const summary = summarizeACPRequestError(error);
+      this.activeForegroundTurnId = turnId;
+      this.fallbackAssistantMessageId = null;
+      this.submittedUserMessageTurnId = null;
+      this.emitBootstrapThreadEvent();
+      this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+      this.emitSubmittedUserMessage(prompt, messageId, turnId, options?.clientMessageId);
+
+      if (this.cancelRequestedTurnIds.delete(turnId)) {
+        // interrupt() landed while the process was respawning; the prompt
+        // never reached a provider, so finish locally instead of dispatching.
         this.finishTurn({
-          type: "turn_failed",
+          type: "turn_canceled",
           provider: this.provider,
-          error: summary.message,
-          code: summary.code,
-          diagnostic: this.collectDiagnostic(summary.diagnostic ?? summary.message),
+          reason: "Interrupted",
           turnId,
         });
-      });
+        return { turnId };
+      }
 
-    return { turnId };
+      void this.connection
+        .prompt({
+          sessionId: this.sessionId,
+          messageId,
+          prompt: toACPContentBlocks(prompt),
+        })
+        .then((response) => {
+          this.handlePromptResponse(response, turnId);
+          return;
+        })
+        .catch((error) => {
+          const summary = summarizeACPRequestError(error);
+          this.finishTurn({
+            type: "turn_failed",
+            provider: this.provider,
+            error: summary.message,
+            code: summary.code,
+            diagnostic: this.collectDiagnostic(summary.diagnostic ?? summary.message),
+            turnId,
+          });
+        });
+
+      return { turnId };
+    } finally {
+      this.startingTurnIds.delete(turnId);
+      this.cancelRequestedTurnIds.delete(turnId);
+    }
   }
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
@@ -1688,10 +1732,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     return this.cachedCommands;
   }
 
-  async setMode(modeId: string): Promise<void> {
+  private async ensureSessionAvailableForMutation(): Promise<void> {
+    if (this.closed) {
+      throw new Error(`${this.provider} session is closed`);
+    }
+    await this.ensureProcess();
     if (!this.connection || !this.sessionId) {
       throw new Error("ACP session not initialized");
     }
+  }
+
+  async setMode(modeId: string): Promise<void> {
+    await this.ensureSessionAvailableForMutation();
 
     const selection = resolveACPModeSelection({
       modeId,
@@ -1869,9 +1921,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   async setModel(modelId: string | null): Promise<void> {
-    if (!this.connection || !this.sessionId) {
-      throw new Error("ACP session not initialized");
-    }
+    await this.ensureSessionAvailableForMutation();
     if (!modelId) {
       this.currentModel = null;
       return;
@@ -1964,12 +2014,17 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
-    if (!this.connection || !this.sessionId) {
-      throw new Error("ACP session not initialized");
-    }
+    await this.ensureSessionAvailableForMutation();
     if (!thinkingOptionId) {
       this.thinkingOptionId = null;
       return;
+    }
+    await this.applyThinkingOption(thinkingOptionId);
+  }
+
+  private async applyThinkingOption(thinkingOptionId: string): Promise<void> {
+    if (!this.connection || !this.sessionId) {
+      throw new Error("ACP session not initialized");
     }
 
     if (this.thinkingOptionWriter) {
@@ -2010,6 +2065,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   async setFeature(featureId: string, value: unknown): Promise<void> {
+    await this.ensureSessionAvailableForMutation();
+    await this.applyFeatureValue(featureId, value);
+  }
+
+  private async applyFeatureValue(featureId: string, value: unknown): Promise<void> {
     if (!this.connection || !this.sessionId) {
       throw new Error("ACP session not initialized");
     }
@@ -2044,7 +2104,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       requestedValue,
       label: featureOption.label,
     });
-    this.config.featureValues = { ...this.config.featureValues, [featureId]: currentValue };
+    this.featureValues = { ...this.featureValues, [featureId]: currentValue };
   }
 
   private applyConfigOptionResponse({
@@ -2125,23 +2185,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       nativeHandle: this.sessionId,
       metadata: {
         ...this.config,
+        // Persist the effective runtime state, not the create-time snapshot,
+        // so a daemon-restart resume restores what the user actually set.
+        modeId: this.currentMode ?? undefined,
+        model: this.currentModel ?? undefined,
+        thinkingOptionId: this.thinkingOptionId ?? undefined,
+        featureValues: { ...this.featureValues },
         title: this.currentTitle,
       },
     };
   }
 
   async interrupt(): Promise<void> {
-    if (!this.connection || !this.sessionId) {
-      return;
-    }
-
     for (const pending of this.pendingPermissions.values()) {
       pending.resolve({ outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
 
-    if (this.activeForegroundTurnId) {
+    // Turns still waiting on a respawn have not reached a provider; mark them
+    // so startTurn finishes them as canceled instead of dispatching.
+    for (const turnId of this.startingTurnIds) {
+      this.cancelRequestedTurnIds.add(turnId);
+    }
+
+    if (!this.activeForegroundTurnId) {
+      return;
+    }
+    if (this.connection && this.sessionId) {
       await this.connection.cancel({ sessionId: this.sessionId });
+    } else {
+      this.cancelRequestedTurnIds.add(this.activeForegroundTurnId);
     }
   }
 
@@ -2191,6 +2264,15 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     if (this.child) {
       await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+    }
+
+    // Killing the current child unblocks a respawn parked on its transport;
+    // the respawn's closed checks then tear down anything it spawned or
+    // recorded. Wait for it so close() leaves no process and no ledger record.
+    if (this.respawnPromise) {
+      try {
+        await this.respawnPromise;
+      } catch {}
     }
     await this.removeManagedProcessRecord();
 
@@ -2453,8 +2535,32 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     child.stderr.on("data", (chunk: Buffer | string) => {
       stderrChunks.push(chunk.toString());
     });
+    child.once("error", (error) => {
+      this.reconcileProcessFailure(child, {
+        reason: "process_exit",
+        code: null,
+        signal: null,
+        message: `ACP agent process failed (${error instanceof Error ? error.message : String(error)})`,
+        diagnostic: stderrChunks.join("").trim() || undefined,
+      });
+    });
     child.once("exit", (code, signal) => {
-      this.handleProcessExit(child, code, signal, stderrChunks);
+      this.reconcileProcessFailure(child, {
+        reason: "process_exit",
+        code,
+        signal,
+        message: `ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
+        diagnostic: stderrChunks.join("").trim() || undefined,
+      });
+    });
+    child.stdout.once("close", () => {
+      this.scheduleTransportFailureCheck(child);
+    });
+    child.stdout.once("error", () => {
+      this.scheduleTransportFailureCheck(child);
+    });
+    child.stdin.once("error", () => {
+      this.scheduleTransportFailureCheck(child);
     });
 
     const stream = createLoggedNdJsonStream(
@@ -2521,6 +2627,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private async removeManagedProcessRecord(): Promise<void> {
     const recordId = this.managedProcessRecordId;
     this.managedProcessRecordId = null;
+    this.managedProcessRecordSessionId = null;
     if (!recordId || !this.managedProcesses) {
       return;
     }
@@ -2532,15 +2639,45 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   /**
-   * Reconcile session state with a process exit, expected or not. The child
-   * reference doubles as the generation guard: an exit event from a replaced
-   * process must not tear down the current one.
+   * The ledger record is written right after spawn, before session/new or
+   * session/load produces the session id; backfill it once known so reaping
+   * diagnostics can tie a leftover process to its agent session.
    */
-  private handleProcessExit(
+  private async updateManagedProcessMetadata(): Promise<void> {
+    const recordId = this.managedProcessRecordId;
+    const sessionId = this.sessionId;
+    if (
+      !this.managedProcesses ||
+      !recordId ||
+      !sessionId ||
+      this.managedProcessRecordSessionId === sessionId
+    ) {
+      return;
+    }
+    this.managedProcessRecordSessionId = sessionId;
+    try {
+      await this.managedProcesses.updateMetadata(recordId, { sessionId });
+    } catch (error) {
+      this.logger.warn({ err: error, id: recordId }, "Failed to update ACP agent process record");
+    }
+  }
+
+  /**
+   * Single reconciliation point for every way the process/transport can die:
+   * child exit, child error, and NDJSON transport failure without an exit.
+   * The child reference is the generation guard: an event from a replaced
+   * process must not tear down the current one, and repeat events for the
+   * same death are idempotent because the first one clears this.child.
+   */
+  private reconcileProcessFailure(
     child: ChildProcessWithoutNullStreams,
-    code: number | null,
-    signal: NodeJS.Signals | null,
-    stderrChunks: string[],
+    failure: {
+      reason: "process_exit" | "transport_closed";
+      code: number | null;
+      signal: NodeJS.Signals | null;
+      message: string;
+      diagnostic?: string;
+    },
   ): void {
     if (this.child !== child) {
       return;
@@ -2548,7 +2685,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     const expected = this.closed || this.processState === "stopping";
     this.processState = "dead";
-    this.processExit = { code, signal, at: Date.now() };
+    this.processExit = { code: failure.code, signal: failure.signal, at: Date.now() };
     this.child = null;
     this.connection = null;
     void this.removeManagedProcessRecord();
@@ -2558,8 +2695,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
 
     this.logger.warn(
-      { agentId: this.agentId, sessionId: this.sessionId, exitCode: code, signal },
-      "ACP agent process exited unexpectedly",
+      {
+        agentId: this.agentId,
+        sessionId: this.sessionId,
+        reason: failure.reason,
+        exitCode: failure.code,
+        signal: failure.signal,
+      },
+      "ACP agent process or transport failed unexpectedly",
     );
 
     for (const pending of this.pendingPermissions.values()) {
@@ -2572,12 +2715,40 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.finishTurn({
         type: "turn_failed",
         provider: this.provider,
-        error: `ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
-        code: "process_exit",
-        diagnostic: stderrChunks.join("").trim() || undefined,
+        error: failure.message,
+        code: failure.reason,
+        diagnostic: failure.diagnostic,
         turnId: this.activeForegroundTurnId,
       });
     }
+
+    if (failure.reason === "transport_closed") {
+      // The process outlived its transport; kill the tree so it cannot linger.
+      void this.terminateProcess(child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 }).catch(
+        (error) => {
+          this.logger.warn({ err: error }, "Failed to terminate ACP process after transport loss");
+        },
+      );
+    }
+  }
+
+  /**
+   * A closed stdout means the NDJSON transport is gone. Defer one tick so a
+   * simultaneous process exit (which carries the better process_exit signal)
+   * wins the reconciliation instead.
+   */
+  private scheduleTransportFailureCheck(child: ChildProcessWithoutNullStreams): void {
+    setImmediate(() => {
+      if (this.child !== child) {
+        return;
+      }
+      this.reconcileProcessFailure(child, {
+        reason: "transport_closed",
+        code: null,
+        signal: null,
+        message: "ACP agent transport closed while the process is still running",
+      });
+    });
   }
 
   /**
@@ -2588,6 +2759,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * happen per crash.
    */
   private async ensureProcess(): Promise<void> {
+    if (this.resumeUnsupported) {
+      throw new Error(
+        `${this.provider} session cannot be resumed after process loss (session_resume_unsupported)`,
+      );
+    }
     // Only a known-dead process triggers a respawn; a live connection (or one
     // still being established) is used as-is.
     if (this.processState !== "dead" && this.connection && this.sessionId) {
@@ -2631,12 +2807,22 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.processState = "dead";
     }
 
+    // Capture before session/load: applySessionState overwrites the runtime
+    // state with whatever the provider persisted, and the effective runtime
+    // state (not the create-time config snapshot) must win afterwards.
+    const effectiveRuntimeState = this.captureEffectiveRuntimeState();
+
     this.processState = "starting";
-    const spawned = await this.spawnProcess();
+    let spawned: SpawnedACPProcess;
+    try {
+      spawned = await this.spawnProcess();
+    } catch (error) {
+      this.processState = "dead";
+      throw error;
+    }
     if (this.closed) {
       // close() raced the respawn; do not leave the fresh process behind.
-      await terminateChildProcess(spawned.child, 2_000, this.terminateProcess);
-      this.processState = "dead";
+      await this.teardownFailedRespawn(spawned.child);
       throw new Error(`${this.provider} session is closed`);
     }
     this.child = spawned.child;
@@ -2645,29 +2831,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     try {
       await this.loadPersistedSession({ keepReplayedHistory: false });
-      await this.applyConfiguredOverrides();
+      await this.applyRuntimeOverrides(effectiveRuntimeState);
+      if (this.closed) {
+        throw new Error(`${this.provider} session is closed`);
+      }
     } catch (error) {
       // Resume failed: tear down the half-initialized process instead of
       // falling back to session/new, which would silently fork the session.
-      this.processState = "stopping";
-      try {
-        await terminateChildProcess(spawned.child, 2_000, this.terminateProcess);
-      } catch (terminateError) {
-        this.logger.warn(
-          { err: terminateError },
-          "Failed to terminate ACP process after failed session resume",
-        );
+      await this.teardownFailedRespawn(spawned.child);
+      if (isSessionResumeUnsupportedError(error)) {
+        this.resumeUnsupported = true;
       }
-      if (this.child === spawned.child) {
-        this.child = null;
-      }
-      this.connection = null;
-      this.processState = "dead";
       throw error;
     }
 
-    this.processGeneration += 1;
     this.processState = "running";
+  }
+
+  private async teardownFailedRespawn(child: ChildProcessWithoutNullStreams): Promise<void> {
+    this.processState = "stopping";
+    try {
+      await terminateChildProcess(child, 2_000, this.terminateProcess);
+    } catch (error) {
+      this.logger.warn({ err: error }, "Failed to terminate ACP process after failed respawn");
+    }
+    if (this.child === child) {
+      this.child = null;
+    }
+    this.connection = null;
+    this.processState = "dead";
+    await this.removeManagedProcessRecord();
   }
 
   private async runACPRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -2711,7 +2904,31 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   private async applyConfiguredOverrides(): Promise<void> {
-    const configuredModeId = this.config.modeId;
+    await this.applyRuntimeOverrides({
+      modeId: this.config.modeId ?? null,
+      model: this.config.model ?? null,
+      thinkingOptionId: this.config.thinkingOptionId ?? null,
+      featureValues: this.config.featureValues ?? {},
+    });
+  }
+
+  /**
+   * The effective runtime state: values confirmed by the provider through
+   * mutators (or reported via session updates), which must survive a crash
+   * respawn. this.config is only the create-time snapshot and is never used
+   * as the source of truth for these.
+   */
+  private captureEffectiveRuntimeState(): ACPEffectiveRuntimeState {
+    return {
+      modeId: this.currentMode,
+      model: this.currentModel,
+      thinkingOptionId: this.thinkingOptionId,
+      featureValues: { ...this.featureValues },
+    };
+  }
+
+  private async applyRuntimeOverrides(overrides: ACPEffectiveRuntimeState): Promise<void> {
+    const configuredModeId = overrides.modeId;
     if (configuredModeId && configuredModeId !== this.currentMode) {
       const selection = resolveACPModeSelection({
         modeId: configuredModeId,
@@ -2721,7 +2938,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       });
       await this.setModeWithSelection({ modeId: configuredModeId, selection });
     }
-    const configuredModelId = this.config.model;
+    const configuredModelId = overrides.model;
     if (configuredModelId && configuredModelId !== this.currentModel) {
       const selection = resolveACPModelSelection({
         modelId: configuredModelId,
@@ -2740,15 +2957,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         );
       }
     }
-    if (this.config.thinkingOptionId && this.config.thinkingOptionId !== this.thinkingOptionId) {
-      await this.setThinkingOption(this.config.thinkingOptionId);
+    if (overrides.thinkingOptionId && overrides.thinkingOptionId !== this.thinkingOptionId) {
+      await this.applyThinkingOption(overrides.thinkingOptionId);
     }
-    const configuredFeatureValues = this.config.featureValues ?? {};
     for (const featureOption of this.configFeatureOptions) {
-      if (!Object.prototype.hasOwnProperty.call(configuredFeatureValues, featureOption.id)) {
+      if (!Object.prototype.hasOwnProperty.call(overrides.featureValues, featureOption.id)) {
         continue;
       }
-      await this.setFeature(featureOption.id, configuredFeatureValues[featureOption.id]);
+      await this.applyFeatureValue(featureOption.id, overrides.featureValues[featureOption.id]);
     }
   }
 
