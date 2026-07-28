@@ -1348,6 +1348,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
+  private processState: "starting" | "running" | "dead" | "stopping" = "starting";
+  private processGeneration = 0;
+  private processExit: { code: number | null; signal: NodeJS.Signals | null; at: number } | null =
+    null;
+  private respawnPromise: Promise<void> | null = null;
   private closed = false;
   private historyPending = false;
   private replayingHistory = false;
@@ -1409,6 +1414,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.bootstrapThreadEventPending = true;
       this.applySessionState(response);
       await this.applyConfiguredOverrides();
+      this.processGeneration += 1;
+      this.processState = "running";
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
     }
@@ -1420,7 +1427,56 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * unstable_resumeSession — even when mcpServers is an empty array — and
    * return "Invalid params" if any are omitted. Never drop cwd or mcpServers
    * from these calls regardless of capabilities.
+   *
+   * keepReplayedHistory distinguishes the daemon-restart resume (the replayed
+   * history stays pending for streamHistory) from a crash respawn (subscribers
+   * already saw that history, so the replay is swallowed and discarded).
    */
+  private async loadPersistedSession(options: { keepReplayedHistory: boolean }): Promise<void> {
+    const sessionId = this.sessionId;
+    if (!sessionId) {
+      throw new Error(`${this.provider} session is not initialized`);
+    }
+
+    const sessionCapabilities = this.agentCapabilities?.sessionCapabilities;
+    if (this.agentCapabilities?.loadSession) {
+      const persistedBefore = this.persistedHistory.length;
+      this.replayingHistory = true;
+      try {
+        const response = await this.runACPRequest(() =>
+          this.connection!.loadSession({
+            sessionId,
+            cwd: this.config.cwd,
+            mcpServers: this.acpMcpServers(),
+          }),
+        );
+        if (options.keepReplayedHistory) {
+          this.historyPending = this.persistedHistory.length > 0;
+        } else {
+          this.persistedHistory.length = persistedBefore;
+        }
+        this.applySessionState(response);
+      } finally {
+        this.replayingHistory = false;
+      }
+      return;
+    }
+
+    if (sessionCapabilities?.resume) {
+      const response = await this.runACPRequest(() =>
+        this.connection!.unstable_resumeSession({
+          sessionId,
+          cwd: this.config.cwd,
+          mcpServers: this.acpMcpServers(),
+        }),
+      );
+      this.applySessionState(response);
+      return;
+    }
+
+    throw new Error(`${this.provider} does not support ACP session resume`);
+  }
+
   async initializeResumedSession(): Promise<void> {
     try {
       const handle = this.initialHandle;
@@ -1435,34 +1491,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.sessionId = handle.sessionId;
       this.bootstrapThreadEventPending = true;
 
-      const sessionCapabilities = this.agentCapabilities?.sessionCapabilities;
-      if (this.agentCapabilities?.loadSession) {
-        this.replayingHistory = true;
-        const response = await this.runACPRequest(() =>
-          this.connection!.loadSession({
-            sessionId: handle.sessionId,
-            cwd: this.config.cwd,
-            mcpServers: this.acpMcpServers(),
-          }),
-        );
-        this.deliverTranslatedEvents(this.flushPendingUserMessage());
-        this.replayingHistory = false;
-        this.historyPending = this.persistedHistory.length > 0;
-        this.applySessionState(response);
-      } else if (sessionCapabilities?.resume) {
-        const response = await this.runACPRequest(() =>
-          this.connection!.unstable_resumeSession({
-            sessionId: handle.sessionId,
-            cwd: this.config.cwd,
-            mcpServers: this.acpMcpServers(),
-          }),
-        );
-        this.applySessionState(response);
-      } else {
-        throw new Error(`${this.provider} does not support ACP session resume`);
-      }
-
+      await this.loadPersistedSession({ keepReplayedHistory: true });
       await this.applyConfiguredOverrides();
+      this.processGeneration += 1;
+      this.processState = "running";
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
     }
@@ -1478,6 +1510,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       );
     }
     throw error;
+  }
   }
 
   async run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult> {
@@ -1504,6 +1537,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.closed) {
       throw new Error(`${this.provider} session is closed`);
     }
+    await this.ensureProcess();
     if (!this.connection || !this.sessionId) {
       throw new Error(`${this.provider} session is not initialized`);
     }
@@ -2106,6 +2140,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
     this.closed = true;
+    if (this.processState !== "dead") {
+      // Mark before terminating so the exit handler treats the teardown as
+      // expected and never turns it into a crash or a respawn.
+      this.processState = "stopping";
+    }
 
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.settleCommandsReady();
@@ -2144,6 +2183,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
     }
 
+    this.processState = "dead";
     this.subscribers.clear();
     this.connection = null;
     this.child = null;
@@ -2403,19 +2443,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       stderrChunks.push(chunk.toString());
     });
     child.once("exit", (code, signal) => {
-      if (this.closed) {
-        return;
-      }
-      if (this.activeForegroundTurnId) {
-        this.synthesizeCanceledToolCalls();
-        this.finishTurn({
-          type: "turn_failed",
-          provider: this.provider,
-          error: `ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
-          diagnostic: stderrChunks.join("").trim() || undefined,
-          turnId: this.activeForegroundTurnId,
-        });
-      }
+      this.handleProcessExit(child, code, signal, stderrChunks);
     });
 
     const stream = createLoggedNdJsonStream(
@@ -2428,18 +2456,162 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     // close the process even when the ACP handshake itself rejects.
     this.child = child;
     this.connection = connection;
-    const initialize = await this.runACPRequest(() =>
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: buildACPClientCapabilities(
-          this.clientCapabilityMeta,
-          this.clientCapabilities,
-        ),
-        clientInfo: { name: "Paseo", version: "dev" },
-      }),
-    );
+    let initialize: InitializeResponse;
+    try {
+      initialize = await this.runACPRequest(() =>
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: buildACPClientCapabilities(
+            this.clientCapabilityMeta,
+            this.clientCapabilities,
+          ),
+          clientInfo: { name: "Paseo", version: "dev" },
+        }),
+      );
+    } catch (error) {
+      await terminateChildProcess(child, 2_000, this.terminateProcess);
+      throw error;
+    }
 
     return { child, connection, initialize };
+  }
+
+  /**
+   * Reconcile session state with a process exit, expected or not. The child
+   * reference doubles as the generation guard: an exit event from a replaced
+   * process must not tear down the current one.
+   */
+  private handleProcessExit(
+    child: ChildProcessWithoutNullStreams,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    stderrChunks: string[],
+  ): void {
+    if (this.child !== child) {
+      return;
+    }
+
+    const expected = this.closed || this.processState === "stopping";
+    this.processState = "dead";
+    this.processExit = { code, signal, at: Date.now() };
+    this.child = null;
+    this.connection = null;
+
+    if (expected) {
+      return;
+    }
+
+    this.logger.warn(
+      { agentId: this.agentId, sessionId: this.sessionId, exitCode: code, signal },
+      "ACP agent process exited unexpectedly",
+    );
+
+    for (const pending of this.pendingPermissions.values()) {
+      pending.resolve({ outcome: { outcome: "cancelled" } });
+    }
+    this.pendingPermissions.clear();
+
+    if (this.activeForegroundTurnId) {
+      this.synthesizeCanceledToolCalls();
+      this.finishTurn({
+        type: "turn_failed",
+        provider: this.provider,
+        error: `ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
+        code: "process_exit",
+        diagnostic: stderrChunks.join("").trim() || undefined,
+        turnId: this.activeForegroundTurnId,
+      });
+    }
+  }
+
+  /**
+   * Guarantee a live process and connection before a turn starts. A dead
+   * process is respawned and the persisted session re-attached via
+   * session/load (or unstable_resumeSession); concurrent callers share one
+   * respawn, so exactly one process, one initialize, and one session/load
+   * happen per crash.
+   */
+  private async ensureProcess(): Promise<void> {
+    // Only a known-dead process triggers a respawn; a live connection (or one
+    // still being established) is used as-is.
+    if (this.processState !== "dead" && this.connection && this.sessionId) {
+      return;
+    }
+    if (this.respawnPromise) {
+      await this.respawnPromise;
+      return;
+    }
+    const respawn = this.respawnProcess();
+    this.respawnPromise = respawn;
+    try {
+      await respawn;
+    } finally {
+      this.respawnPromise = null;
+    }
+  }
+
+  private async respawnProcess(): Promise<void> {
+    if (this.closed) {
+      throw new Error(`${this.provider} session is closed`);
+    }
+    if (!this.sessionId) {
+      throw new Error(`${this.provider} session is not initialized`);
+    }
+
+    // A previous process may still be alive (e.g. the initial session setup
+    // failed after spawning); never leave two host processes on one session.
+    if (this.child) {
+      const stale = this.child;
+      this.processState = "stopping";
+      try {
+        await this.terminateProcess(stale, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+      } catch (error) {
+        this.logger.warn({ err: error }, "Failed to terminate stale ACP process before respawn");
+      }
+      if (this.child === stale) {
+        this.child = null;
+      }
+      this.connection = null;
+      this.processState = "dead";
+    }
+
+    this.processState = "starting";
+    const spawned = await this.spawnProcess();
+    if (this.closed) {
+      // close() raced the respawn; do not leave the fresh process behind.
+      await terminateChildProcess(spawned.child, 2_000, this.terminateProcess);
+      this.processState = "dead";
+      throw new Error(`${this.provider} session is closed`);
+    }
+    this.child = spawned.child;
+    this.connection = spawned.connection;
+    this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+
+    try {
+      await this.loadPersistedSession({ keepReplayedHistory: false });
+      await this.applyConfiguredOverrides();
+    } catch (error) {
+      // Resume failed: tear down the half-initialized process instead of
+      // falling back to session/new, which would silently fork the session.
+      this.processState = "stopping";
+      try {
+        await terminateChildProcess(spawned.child, 2_000, this.terminateProcess);
+      } catch (terminateError) {
+        this.logger.warn(
+          { err: terminateError },
+          "Failed to terminate ACP process after failed session resume",
+        );
+      }
+      if (this.child === spawned.child) {
+        this.child = null;
+      }
+      this.connection = null;
+      this.processState = "dead";
+      throw error;
+    }
+
+    this.processGeneration += 1;
+    this.processState = "running";
   }
 
   private async runACPRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -2855,6 +3027,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private finishTurn(
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
+    // A turn can be finished by the process-exit handler and by a late prompt
+    // rejection racing it; only the first finish of the active turn counts,
+    // and a stale finish must never clear a newer foreground turn.
+    if (event.turnId && this.activeForegroundTurnId !== event.turnId) {
+      return;
+    }
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.activeForegroundTurnId = null;
     this.fallbackAssistantMessageId = null;
@@ -2893,11 +3071,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   private collectDiagnostic(message: string): string | undefined {
     const parts: string[] = [message];
-    if (this.child?.exitCode != null) {
-      parts.push(`exitCode=${this.child.exitCode}`);
+    const exit = this.child
+      ? { code: this.child.exitCode, signal: this.child.signalCode }
+      : this.processExit;
+    if (exit?.code != null) {
+      parts.push(`exitCode=${exit.code}`);
     }
-    if (this.child?.signalCode) {
-      parts.push(`signal=${this.child.signalCode}`);
+    if (exit?.signal) {
+      parts.push(`signal=${exit.signal}`);
     }
     return parts.length > 0 ? parts.join(" | ") : undefined;
   }
