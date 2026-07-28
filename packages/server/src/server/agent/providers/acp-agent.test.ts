@@ -19,6 +19,7 @@ import {
 import {
   ACPAgentClient,
   ACPAgentSession,
+  type ACPConfigFeatureOption,
   type SpawnedACPProcess,
   type SessionStateResponse,
   buildACPClientCapabilities,
@@ -46,6 +47,7 @@ import { GenericACPAgentClient } from "./generic-acp-agent.js";
 import { parseKiroExtensionCommands } from "./kiro-acp-agent.js";
 import { transformPiModels } from "./pi/agent.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
+import { getAgentStreamEventTurnId } from "../agent-sdk-types.js";
 import type { AgentCapabilityFlags, AgentPersistenceHandle } from "../agent-sdk-types.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { buildStringCommandShellInvocation } from "../../../utils/string-command-shell.js";
@@ -3437,15 +3439,17 @@ interface ACPCrashRecoveryInternals {
   child: unknown;
   activeForegroundTurnId: string | null;
   processState?: string;
-  processGeneration?: number;
 }
 
 interface FakeACPAgentBehavior {
   agentCapabilities?: Record<string, unknown>;
   sessionId?: string;
+  /** Extra fields merged into new/load/resume session responses (modes, models, configOptions). */
+  sessionState?: Record<string, unknown>;
   prompt?: (params: { sessionId: string }) => Promise<PromptResponse>;
   loadSession?: ReturnType<typeof vi.fn>;
   resumeSession?: ReturnType<typeof vi.fn>;
+  failInitialize?: Error;
 }
 
 /**
@@ -3469,19 +3473,26 @@ class FakeACPAgentProcess extends EventEmitter {
     super();
     this.pid = pid;
     const sessionId = behavior.sessionId ?? "session-1";
+    const sessionState = { modes: null, models: null, configOptions: [], ...behavior.sessionState };
     this.agent = {
-      initialize: vi.fn(async () => ({
-        protocolVersion: PROTOCOL_VERSION,
-        agentCapabilities: behavior.agentCapabilities ?? { loadSession: true },
-        authMethods: [],
-      })),
-      newSession: vi.fn(async () => ({ sessionId })),
+      initialize: vi.fn(async () => {
+        if (behavior.failInitialize) {
+          throw behavior.failInitialize;
+        }
+        return {
+          protocolVersion: PROTOCOL_VERSION,
+          agentCapabilities: behavior.agentCapabilities ?? { loadSession: true },
+          authMethods: [],
+        };
+      }),
+      newSession: vi.fn(async () => ({ sessionId, ...sessionState })),
       loadSession:
-        behavior.loadSession ??
-        vi.fn(async () => ({ sessionId, modes: null, models: null, configOptions: [] })),
+        behavior.loadSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
       unstable_resumeSession:
-        behavior.resumeSession ??
-        vi.fn(async () => ({ sessionId, modes: null, models: null, configOptions: [] })),
+        behavior.resumeSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
+      setSessionMode: vi.fn(async () => {}),
+      setSessionConfigOption: vi.fn(async () => ({ configOptions: sessionState.configOptions })),
+      unstable_setSessionModel: vi.fn(async () => {}),
       prompt: vi.fn(
         behavior.prompt ?? (async () => ({ stopReason: "end_turn" }) as PromptResponse),
       ),
@@ -3502,6 +3513,18 @@ class FakeACPAgentProcess extends EventEmitter {
     this.stderr.destroy();
     this.emit("exit", code, signal);
   }
+
+  /** Kills the NDJSON transport while the process itself stays alive. */
+  killTransport(): void {
+    this.stdout.destroy();
+  }
+
+  emitSpawnError(error: Error): void {
+    this.stdin.destroy();
+    this.stdout.destroy();
+    this.stderr.destroy();
+    this.emit("error", error);
+  }
 }
 
 function createFakeManagedProcessRegistry() {
@@ -3514,6 +3537,7 @@ function createFakeManagedProcessRegistry() {
       createdAt: new Date().toISOString(),
     })),
     remove: vi.fn(async () => {}),
+    updateMetadata: vi.fn(async () => {}),
     list: vi.fn(async () => []),
     reapStale: vi.fn(async () => ({
       checked: 0,
@@ -3526,56 +3550,102 @@ function createFakeManagedProcessRegistry() {
   };
 }
 
+function createCrashTestHarness(
+  options: {
+    behaviors?: FakeACPAgentBehavior[] | ((spawnIndex: number) => FakeACPAgentBehavior);
+    managedProcesses?: ReturnType<typeof createFakeManagedProcessRegistry>;
+    terminateProcess?: ProcessTerminator;
+    configFeatureOptions?: ACPConfigFeatureOption[];
+  } = {},
+) {
+  const children: FakeACPAgentProcess[] = [];
+  let nextPid = 41000;
+  const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockImplementation(() => {
+    const index = children.length;
+    const behavior =
+      typeof options.behaviors === "function"
+        ? options.behaviors(index)
+        : (options.behaviors?.[index] ?? {});
+    const child = new FakeACPAgentProcess(nextPid++, behavior);
+    children.push(child);
+    return child as unknown as ChildProcessWithoutNullStreams;
+  });
+
+  const session = new ACPAgentSession({ provider: "claude-acp", cwd: "/tmp/paseo-acp-test" }, {
+    provider: "claude-acp",
+    logger: createTestLogger(),
+    // An absolute, always-resolvable binary path: the spawn itself is
+    // mocked, but launch resolution still checks the command exists.
+    defaultCommand: [process.execPath, "--fake-acp"],
+    defaultModes: [],
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: true,
+      supportsMcpServers: true,
+      supportsReasoningStream: true,
+      supportsToolInvocations: true,
+    },
+    ...(options.managedProcesses ? { managedProcesses: options.managedProcesses } : {}),
+    ...(options.terminateProcess ? { terminateProcess: options.terminateProcess } : {}),
+    ...(options.configFeatureOptions ? { configFeatureOptions: options.configFeatureOptions } : {}),
+  } as ConstructorParameters<typeof ACPAgentSession>[1]);
+
+  return { session, children, spawnSpy };
+}
+
+function internalsOf(session: ACPAgentSession): ACPCrashRecoveryInternals {
+  return asInternals<ACPCrashRecoveryInternals>(session);
+}
+
+type ACPTurnFinishType = "turn_completed" | "turn_failed" | "turn_canceled";
+
+function countTurnEvents(
+  events: AgentStreamEvent[],
+  type: ACPTurnFinishType,
+  turnId?: string,
+): number {
+  return events.filter(
+    (event) =>
+      event.type === type && (turnId === undefined || getAgentStreamEventTurnId(event) === turnId),
+  ).length;
+}
+
+function turnFailedEvents(
+  events: AgentStreamEvent[],
+): Array<Extract<AgentStreamEvent, { type: "turn_failed" }>> {
+  return events.filter(
+    (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+      event.type === "turn_failed",
+  );
+}
+
+function waitForTurnEvent(
+  events: AgentStreamEvent[],
+  type: ACPTurnFinishType,
+  turnId?: string,
+): Promise<void> {
+  return vi.waitFor(() => {
+    expect(countTurnEvents(events, type, turnId)).toBeGreaterThan(0);
+  });
+}
+
+function waitForAssertion(assertion: () => void): Promise<void> {
+  return vi.waitFor(assertion);
+}
+
+function deferredPromise<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 describe("ACPAgentSession process crash recovery", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
-
-  function createCrashTestHarness(
-    options: {
-      behaviors?: FakeACPAgentBehavior[] | ((spawnIndex: number) => FakeACPAgentBehavior);
-      managedProcesses?: ReturnType<typeof createFakeManagedProcessRegistry>;
-      terminateProcess?: ProcessTerminator;
-    } = {},
-  ) {
-    const children: FakeACPAgentProcess[] = [];
-    let nextPid = 41000;
-    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockImplementation(() => {
-      const index = children.length;
-      const behavior =
-        typeof options.behaviors === "function"
-          ? options.behaviors(index)
-          : (options.behaviors?.[index] ?? {});
-      const child = new FakeACPAgentProcess(nextPid++, behavior);
-      children.push(child);
-      return child as unknown as ChildProcessWithoutNullStreams;
-    });
-
-    const session = new ACPAgentSession({ provider: "claude-acp", cwd: "/tmp/paseo-acp-test" }, {
-      provider: "claude-acp",
-      logger: createTestLogger(),
-      // An absolute, always-resolvable binary path: the spawn itself is
-      // mocked, but launch resolution still checks the command exists.
-      defaultCommand: [process.execPath, "--fake-acp"],
-      defaultModes: [],
-      capabilities: {
-        supportsStreaming: true,
-        supportsSessionPersistence: true,
-        supportsDynamicModes: true,
-        supportsMcpServers: true,
-        supportsReasoningStream: true,
-        supportsToolInvocations: true,
-      },
-      ...(options.managedProcesses ? { managedProcesses: options.managedProcesses } : {}),
-      ...(options.terminateProcess ? { terminateProcess: options.terminateProcess } : {}),
-    } as ConstructorParameters<typeof ACPAgentSession>[1]);
-
-    return { session, children, spawnSpy };
-  }
-
-  function internalsOf(session: ACPAgentSession): ACPCrashRecoveryInternals {
-    return asInternals<ACPCrashRecoveryInternals>(session);
-  }
 
   test("detects an idle process exit and respawns with session/load on the next prompt", async () => {
     const { session, children, spawnSpy } = createCrashTestHarness();
@@ -3608,14 +3678,10 @@ describe("ACPAgentSession process crash recovery", () => {
     expect(resumedAgent.newSession).not.toHaveBeenCalled();
     expect(internalsOf(session).processState).toBe("running");
 
-    await vi.waitFor(() => {
+    await waitForAssertion(() => {
       expect(resumedAgent.prompt).toHaveBeenCalled();
     });
-    await vi.waitFor(() => {
-      expect(
-        events.some((event) => event.type === "turn_completed" && event.turnId === turnId),
-      ).toBe(true);
-    });
+    await waitForTurnEvent(events, "turn_completed", turnId);
   });
 
   test("fails the active turn with process_exit on crash and unblocks the next prompt", async () => {
@@ -3630,14 +3696,9 @@ describe("ACPAgentSession process crash recovery", () => {
     const { turnId } = await session.startTurn("work");
     children[0].crash(137, "SIGKILL");
 
-    await vi.waitFor(() => {
-      expect(events.some((event) => event.type === "turn_failed")).toBe(true);
-    });
+    await waitForTurnEvent(events, "turn_failed", turnId);
 
-    const failed = events.filter(
-      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
-        event.type === "turn_failed",
-    );
+    const failed = turnFailedEvents(events);
     expect(failed).toHaveLength(1);
     expect(failed[0]).toMatchObject({
       turnId,
@@ -3649,13 +3710,9 @@ describe("ACPAgentSession process crash recovery", () => {
     // The next prompt respawns instead of failing with "foreground turn is already active".
     const next = await session.startTurn("again");
     expect(children).toHaveLength(2);
-    await vi.waitFor(() => {
-      expect(
-        events.some((event) => event.type === "turn_completed" && event.turnId === next.turnId),
-      ).toBe(true);
-    });
+    await waitForTurnEvent(events, "turn_completed", next.turnId);
     // The prompt-stream rejection after the crash must not double-finish the turn.
-    expect(events.filter((event) => event.type === "turn_failed")).toHaveLength(1);
+    expect(turnFailedEvents(events)).toHaveLength(1);
   });
 
   test("coalesces concurrent prompts after a crash into a single respawn", async () => {
@@ -3693,13 +3750,7 @@ describe("ACPAgentSession process crash recovery", () => {
     expect(rejected?.reason.message).toContain("foreground turn");
     expect(internalsOf(session).processState).toBe("running");
 
-    await vi.waitFor(() => {
-      expect(
-        events.some(
-          (event) => event.type === "turn_completed" && event.turnId === fulfilled?.value.turnId,
-        ),
-      ).toBe(true);
-    });
+    await waitForTurnEvent(events, "turn_completed", fulfilled?.value.turnId);
     await expect(session.startTurn("three")).resolves.toBeDefined();
   });
 
@@ -3802,5 +3853,544 @@ describe("ACPAgentSession process crash recovery", () => {
       mcpServers: [],
     });
     expect(resumedAgent.loadSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("ACPAgentSession runtime state across crash respawn", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function modeSessionState(currentModeId: string): Record<string, unknown> {
+    return {
+      modes: {
+        availableModes: [
+          { id: "yolo", name: "Yolo" },
+          { id: "plan", name: "Plan" },
+        ],
+        currentModeId,
+      },
+    };
+  }
+
+  test("runtime mode survives crash respawn in both directions", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: () => ({ sessionState: modeSessionState("yolo") }),
+    });
+    await session.initializeNewSession();
+
+    // yolo (create-time) -> plan (runtime) -> crash -> the new process gets plan.
+    await session.setMode("plan");
+    children[0].crash(1, null);
+    const first = await session.startTurn("after first crash");
+
+    const firstRespawn = children[1].agent;
+    expect(firstRespawn.setSessionMode).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      modeId: "plan",
+    });
+    // The runtime state is re-applied before the queued prompt goes out.
+    const modeCallOrder = (firstRespawn.setSessionMode as ReturnType<typeof vi.fn>).mock
+      .invocationCallOrder[0];
+    const promptCallOrder = (firstRespawn.prompt as ReturnType<typeof vi.fn>).mock
+      .invocationCallOrder[0];
+    expect(modeCallOrder).toBeLessThan(promptCallOrder);
+    await waitForTurnEventToCome(session, first.turnId);
+    expect(await session.getCurrentMode()).toBe("plan");
+
+    // plan -> yolo (runtime) -> crash -> the new process must NOT be dragged back to plan.
+    await session.setMode("yolo");
+    children[1].crash(1, null);
+    await session.startTurn("after second crash");
+
+    expect(children[2].agent.setSessionMode).not.toHaveBeenCalled();
+    expect(await session.getCurrentMode()).toBe("yolo");
+  });
+
+  test("runtime model survives crash respawn", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: () => ({
+        sessionState: {
+          models: {
+            availableModels: [
+              { modelId: "m-fast", name: "Fast" },
+              { modelId: "m-smart", name: "Smart" },
+            ],
+            currentModelId: "m-fast",
+          },
+        },
+      }),
+    });
+    await session.initializeNewSession();
+
+    await session.setModel("m-smart");
+    children[0].crash(1, null);
+    await session.startTurn("after crash");
+
+    expect(children[1].agent.unstable_setSessionModel).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      modelId: "m-smart",
+    });
+    const runtimeInfo = await session.getRuntimeInfo();
+    expect(runtimeInfo.model).toBe("m-smart");
+  });
+
+  test("thinking option and feature values survive crash respawn", async () => {
+    const configOptions = [
+      {
+        id: "thought",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "low",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "high", name: "High" },
+        ],
+      },
+      {
+        id: "agent",
+        name: "Agent",
+        category: "_agent",
+        type: "select",
+        currentValue: "",
+        options: [
+          { value: "", name: "Default" },
+          { value: "probe", name: "Probe" },
+        ],
+      },
+    ];
+    const { session, children } = createCrashTestHarness({
+      behaviors: () => ({ sessionState: { configOptions } }),
+      configFeatureOptions: [
+        {
+          id: "agent",
+          configId: "agent",
+          category: "_agent",
+          label: "Agent",
+        },
+      ],
+    });
+    await session.initializeNewSession();
+
+    await session.setThinkingOption("high");
+    await session.setFeature("agent", "probe");
+    children[0].crash(1, null);
+    await session.startTurn("after crash");
+
+    const resumedConfigCalls = (
+      children[1].agent.setSessionConfigOption as ReturnType<typeof vi.fn>
+    ).mock.calls.map((call) => call[0]);
+    expect(resumedConfigCalls).toContainEqual({
+      sessionId: "session-1",
+      configId: "thought",
+      value: "high",
+    });
+    expect(resumedConfigCalls).toContainEqual({
+      sessionId: "session-1",
+      configId: "agent",
+      value: "probe",
+    });
+
+    const runtimeInfo = await session.getRuntimeInfo();
+    expect(runtimeInfo.thinkingOptionId).toBe("high");
+    expect(session.features).toEqual([
+      expect.objectContaining({ id: "agent", value: "probe" }),
+    ]);
+  });
+
+  async function waitForTurnEventToCome(
+    session: ACPAgentSession,
+    turnId: string,
+  ): Promise<void> {
+    const seen: AgentStreamEvent[] = [];
+    session.subscribe((event) => seen.push(event));
+    await waitForTurnEvent(seen, "turn_completed", turnId);
+  }
+});
+
+describe("ACPAgentSession transport failure without process exit", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("transport dies without child exit → current turn fails and next prompt respawns", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      behaviors: [{ prompt: () => new Promise<PromptResponse>(() => {}) }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const { turnId } = await session.startTurn("work");
+    children[0].killTransport();
+
+    await waitForTurnEvent(events, "turn_failed", turnId);
+    const failed = turnFailedEvents(events);
+    expect(failed).toHaveLength(1);
+    expect(failed[0].code).toBe("transport_closed");
+    expect(failed[0].error).not.toContain("ERR_STREAM_PREMATURE_CLOSE");
+    expect(internalsOf(session).activeForegroundTurnId).toBeNull();
+    expect(internalsOf(session).processState).toBe("dead");
+
+    // The process outlived its transport, so its tree is killed explicitly.
+    await waitForAssertion(() => {
+      expect(terminator.terminated).toContain(children[0]);
+    });
+
+    const next = await session.startTurn("again");
+    expect(children).toHaveLength(2);
+    expect(children[1].agent.loadSession).toHaveBeenCalledTimes(1);
+    await waitForTurnEvent(events, "turn_completed", next.turnId);
+    expect(turnFailedEvents(events)).toHaveLength(1);
+  });
+
+  test("stale events from a replaced process do not affect the new generation", async () => {
+    const oldPrompt = deferredPromise<PromptResponse>();
+    const newPrompt = deferredPromise<PromptResponse>();
+    const { session, children } = createCrashTestHarness({
+      behaviors: [{ prompt: () => oldPrompt.promise }, { prompt: () => newPrompt.promise }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const turn1 = await session.startTurn("one");
+    children[0].killTransport();
+    children[0].crash(9, null);
+    await waitForTurnEvent(events, "turn_failed", turn1.turnId);
+
+    const turn2 = await session.startTurn("two");
+    expect(children).toHaveLength(2);
+
+    // Late events from the dead generation: exit re-emission, transport close
+    // settling, and the old prompt promise resolving must all be ignored.
+    children[0].emit("exit", 9, null);
+    oldPrompt.resolve({ stopReason: "end_turn" } as PromptResponse);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(internalsOf(session).processState).toBe("running");
+    expect(internalsOf(session).activeForegroundTurnId).toBe(turn2.turnId);
+    expect(countTurnEvents(events, "turn_completed", turn2.turnId)).toBe(0);
+    expect(countTurnEvents(events, "turn_completed", turn1.turnId)).toBe(0);
+    expect(children).toHaveLength(2);
+
+    newPrompt.resolve({ stopReason: "end_turn" } as PromptResponse);
+    await waitForTurnEvent(events, "turn_completed", turn2.turnId);
+    expect(countTurnEvents(events, "turn_completed")).toBe(1);
+    expect(turnFailedEvents(events)).toHaveLength(1);
+  });
+});
+
+describe("ACPAgentSession cancel and close races", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("cancel during respawn prevents the queued prompt from being dispatched", async () => {
+    const loadGate = deferredPromise<void>();
+    const { session, children } = createCrashTestHarness({
+      behaviors: (spawnIndex) =>
+        spawnIndex === 1
+          ? {
+              loadSession: vi.fn(async () => {
+                await loadGate.promise;
+                return { sessionId: "session-1", modes: null, models: null, configOptions: [] };
+              }),
+            }
+          : {},
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    children[0].crash(1, null);
+    const startPromise = session.startTurn("queued");
+    await waitForAssertion(() => {
+      expect(children).toHaveLength(2);
+    });
+
+    await session.interrupt();
+    loadGate.resolve();
+
+    const { turnId } = await startPromise;
+    await waitForTurnEvent(events, "turn_canceled", turnId);
+    expect(children[1].agent.prompt).not.toHaveBeenCalled();
+    // The prompt never reached the provider, so no session/cancel may go out.
+    expect(children[1].agent.cancel).not.toHaveBeenCalled();
+    expect(turnFailedEvents(events)).toHaveLength(0);
+    expect(internalsOf(session).activeForegroundTurnId).toBeNull();
+  });
+
+  test("cancel after prompt dispatch invokes provider cancel", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: [{ prompt: () => new Promise<PromptResponse>(() => {}) }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.startTurn("work");
+    await session.interrupt();
+
+    expect(children[0].agent.cancel).toHaveBeenCalledWith({ sessionId: "session-1" });
+  });
+
+  test("cancel racing with process exit finishes the turn exactly once", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: [{ prompt: () => new Promise<PromptResponse>(() => {}) }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const { turnId } = await session.startTurn("work");
+    const interruptPromise = session.interrupt();
+    children[0].crash(9, null);
+    await interruptPromise;
+
+    await waitForTurnEvent(events, "turn_failed", turnId);
+    const finishes =
+      countTurnEvents(events, "turn_failed", turnId) +
+      countTurnEvents(events, "turn_canceled", turnId) +
+      countTurnEvents(events, "turn_completed", turnId);
+    expect(finishes).toBe(1);
+  });
+
+  test("cancel followed by a new prompt works normally", async () => {
+    const cancelledPrompt = deferredPromise<PromptResponse>();
+    const { session, children } = createCrashTestHarness({
+      behaviors: [{ prompt: () => cancelledPrompt.promise }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const first = await session.startTurn("first");
+    await session.interrupt();
+    cancelledPrompt.resolve({ stopReason: "cancelled" } as PromptResponse);
+    await waitForTurnEvent(events, "turn_canceled", first.turnId);
+
+    const second = await session.startTurn("second");
+    await waitForTurnEvent(events, "turn_completed", second.turnId);
+    expect(children).toHaveLength(1);
+  });
+
+  test("cancel from an old turn cannot cancel a newer turn", async () => {
+    const oldPrompt = deferredPromise<PromptResponse>();
+    const { session, children } = createCrashTestHarness({
+      behaviors: [{ prompt: () => oldPrompt.promise }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const first = await session.startTurn("first");
+    await session.interrupt();
+    oldPrompt.resolve({ stopReason: "cancelled" } as PromptResponse);
+    await waitForTurnEvent(events, "turn_canceled", first.turnId);
+
+    const second = await session.startTurn("second");
+    await waitForTurnEvent(events, "turn_completed", second.turnId);
+    expect(children[0].agent.cancel).toHaveBeenCalledTimes(1);
+    expect(countTurnEvents(events, "turn_canceled", second.turnId)).toBe(0);
+  });
+
+  test("close during respawn leaves no process and no ledger record", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const loadGate = deferredPromise<void>();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      managedProcesses,
+      behaviors: (spawnIndex) =>
+        spawnIndex === 1
+          ? {
+              loadSession: vi.fn(async () => {
+                await loadGate.promise;
+                return { sessionId: "session-1", modes: null, models: null, configOptions: [] };
+              }),
+            }
+          : {},
+    });
+    await session.initializeNewSession();
+
+    children[0].crash(1, null);
+    const startPromise = session.startTurn("revive");
+    await waitForAssertion(() => {
+      expect(children).toHaveLength(2);
+    });
+
+    const closePromise = session.close();
+    loadGate.resolve();
+    await closePromise;
+
+    await expect(startPromise).rejects.toThrow("session is closed");
+    expect(internalsOf(session).processState).toBe("dead");
+    expect(internalsOf(session).child).toBeNull();
+    expect(terminator.terminated).toContain(children[1]);
+    expect(managedProcesses.record).toHaveBeenCalledTimes(2);
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+    await expect(session.startTurn("after close")).rejects.toThrow("session is closed");
+  });
+});
+
+describe("ACPAgentSession respawn robustness", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("initialize failure during respawn surfaces a controlled error and allows retry", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      behaviors: (spawnIndex) =>
+        spawnIndex === 1 ? { failInitialize: new Error("init boom") } : {},
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await expect(session.startTurn("revive")).rejects.toThrow("init boom");
+    expect(children).toHaveLength(2);
+    expect(terminator.terminated).toContain(children[1]);
+    expect(internalsOf(session).processState).toBe("dead");
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("retry");
+    expect(children).toHaveLength(3);
+    await waitForTurnEvent(events, "turn_completed", turnId);
+  });
+
+  test("several successive crashes respawn cleanly each time", async () => {
+    const { session, children } = createCrashTestHarness();
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    for (let round = 0; round < 3; round += 1) {
+      children[round].crash(1, null);
+      const { turnId } = await session.startTurn(`round ${round}`);
+      await waitForTurnEvent(events, "turn_completed", turnId);
+      expect(children).toHaveLength(round + 2);
+      expect(children[round + 1].agent.loadSession).toHaveBeenCalledTimes(1);
+    }
+    expect(turnFailedEvents(events)).toHaveLength(0);
+  });
+
+  test("crash cancels a pending permission and a late response is rejected", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: [{ prompt: () => new Promise<PromptResponse>(() => {}) }],
+    });
+    await session.initializeNewSession();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.startTurn("work");
+    const permissionPromise = session.requestPermission({
+      sessionId: "session-1",
+      toolCall: {
+        toolCallId: "tool-1",
+        title: "Run command",
+        kind: "execute",
+        status: "pending",
+        content: [],
+        locations: [],
+      },
+      options: [],
+    } as unknown as RequestPermissionRequest);
+
+    children[0].crash(1, null);
+
+    await expect(permissionPromise).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    expect(session.getPendingPermissions()).toEqual([]);
+
+    const requestEvent = events.find((event) => event.type === "permission_requested");
+    const requestId =
+      requestEvent && requestEvent.type === "permission_requested"
+        ? requestEvent.request.id
+        : "missing";
+    await expect(
+      session.respondToPermission(requestId, { behavior: "allow" }),
+    ).rejects.toThrow("No pending permission request");
+  });
+
+  test("setMode after an idle crash lazily resumes the session", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: () => ({
+        sessionState: {
+          modes: {
+            availableModes: [
+              { id: "yolo", name: "Yolo" },
+              { id: "plan", name: "Plan" },
+            ],
+            currentModeId: "yolo",
+          },
+        },
+      }),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await session.setMode("plan");
+
+    expect(children).toHaveLength(2);
+    expect(children[1].agent.loadSession).toHaveBeenCalledTimes(1);
+    expect(children[1].agent.setSessionMode).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      modeId: "plan",
+    });
+    expect(await session.getCurrentMode()).toBe("plan");
+  });
+
+  test("provider without session resume capability does not enter a spawn-kill loop", async () => {
+    const { session, children } = createCrashTestHarness({
+      behaviors: () => ({ agentCapabilities: {} }),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await expect(session.startTurn("revive")).rejects.toThrow(/resume/);
+    expect(children).toHaveLength(2);
+
+    await expect(session.startTurn("again")).rejects.toThrow(/session_resume_unsupported|resume/);
+    expect(children).toHaveLength(2);
+  });
+
+  test("managed process metadata receives sessionId after session/new and session/load", async () => {
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = createCrashTestHarness({ managedProcesses });
+    await session.initializeNewSession();
+
+    await waitForAssertion(() => {
+      expect(managedProcesses.updateMetadata).toHaveBeenCalledWith(
+        "record-1",
+        expect.objectContaining({ sessionId: "session-1" }),
+      );
+    });
+
+    children[0].crash(1, null);
+    await session.startTurn("revive");
+
+    await waitForAssertion(() => {
+      expect(managedProcesses.updateMetadata).toHaveBeenCalledWith(
+        "record-2",
+        expect.objectContaining({ sessionId: "session-1" }),
+      );
+    });
   });
 });
