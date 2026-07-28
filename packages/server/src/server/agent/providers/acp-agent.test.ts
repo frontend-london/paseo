@@ -3452,6 +3452,17 @@ interface FakeACPAgentBehavior {
   failInitialize?: Error;
 }
 
+function applyConfigValue(
+  configOptions: unknown,
+  params: { configId: string; value: string },
+): unknown {
+  return (configOptions as Array<Record<string, unknown>>).map((option) =>
+    option.id === params.configId
+      ? Object.assign({}, option, { currentValue: params.value })
+      : option,
+  );
+}
+
 /**
  * In-memory stand-in for an ACP host process. PassThrough pipes connect the
  * session's real ClientSideConnection to an in-process AgentSideConnection, so
@@ -3486,12 +3497,14 @@ class FakeACPAgentProcess extends EventEmitter {
         };
       }),
       newSession: vi.fn(async () => ({ sessionId, ...sessionState })),
-      loadSession:
-        behavior.loadSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
+      loadSession: behavior.loadSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
       unstable_resumeSession:
         behavior.resumeSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
       setSessionMode: vi.fn(async () => {}),
-      setSessionConfigOption: vi.fn(async () => ({ configOptions: sessionState.configOptions })),
+      setSessionConfigOption: vi.fn(async (params: { configId: string; value: string }) => ({
+        // Mirror the provider contract: the response reports the applied value.
+        configOptions: applyConfigValue(sessionState.configOptions, params),
+      })),
       unstable_setSessionModel: vi.fn(async () => {}),
       prompt: vi.fn(
         behavior.prompt ?? (async () => ({ stopReason: "end_turn" }) as PromptResponse),
@@ -3879,6 +3892,9 @@ describe("ACPAgentSession runtime state across crash respawn", () => {
     });
     await session.initializeNewSession();
 
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
     // yolo (create-time) -> plan (runtime) -> crash -> the new process gets plan.
     await session.setMode("plan");
     children[0].crash(1, null);
@@ -3890,12 +3906,15 @@ describe("ACPAgentSession runtime state across crash respawn", () => {
       modeId: "plan",
     });
     // The runtime state is re-applied before the queued prompt goes out.
+    await waitForAssertion(() => {
+      expect(firstRespawn.prompt).toHaveBeenCalled();
+    });
     const modeCallOrder = (firstRespawn.setSessionMode as ReturnType<typeof vi.fn>).mock
       .invocationCallOrder[0];
     const promptCallOrder = (firstRespawn.prompt as ReturnType<typeof vi.fn>).mock
       .invocationCallOrder[0];
     expect(modeCallOrder).toBeLessThan(promptCallOrder);
-    await waitForTurnEventToCome(session, first.turnId);
+    await waitForTurnEvent(events, "turn_completed", first.turnId);
     expect(await session.getCurrentMode()).toBe("plan");
 
     // plan -> yolo (runtime) -> crash -> the new process must NOT be dragged back to plan.
@@ -3994,19 +4013,8 @@ describe("ACPAgentSession runtime state across crash respawn", () => {
 
     const runtimeInfo = await session.getRuntimeInfo();
     expect(runtimeInfo.thinkingOptionId).toBe("high");
-    expect(session.features).toEqual([
-      expect.objectContaining({ id: "agent", value: "probe" }),
-    ]);
+    expect(session.features).toEqual([expect.objectContaining({ id: "agent", value: "probe" })]);
   });
-
-  async function waitForTurnEventToCome(
-    session: ACPAgentSession,
-    turnId: string,
-  ): Promise<void> {
-    const seen: AgentStreamEvent[] = [];
-    session.subscribe((event) => seen.push(event));
-    await waitForTurnEvent(seen, "turn_completed", turnId);
-  }
 });
 
 describe("ACPAgentSession transport failure without process exit", () => {
@@ -4167,8 +4175,16 @@ describe("ACPAgentSession cancel and close races", () => {
 
   test("cancel followed by a new prompt works normally", async () => {
     const cancelledPrompt = deferredPromise<PromptResponse>();
+    let promptCall = 0;
     const { session, children } = createCrashTestHarness({
-      behaviors: [{ prompt: () => cancelledPrompt.promise }],
+      behaviors: [
+        {
+          prompt: () =>
+            promptCall++ === 0
+              ? cancelledPrompt.promise
+              : Promise.resolve({ stopReason: "end_turn" } as PromptResponse),
+        },
+      ],
     });
     await session.initializeNewSession();
 
@@ -4187,8 +4203,16 @@ describe("ACPAgentSession cancel and close races", () => {
 
   test("cancel from an old turn cannot cancel a newer turn", async () => {
     const oldPrompt = deferredPromise<PromptResponse>();
+    let promptCall = 0;
     const { session, children } = createCrashTestHarness({
-      behaviors: [{ prompt: () => oldPrompt.promise }],
+      behaviors: [
+        {
+          prompt: () =>
+            promptCall++ === 0
+              ? oldPrompt.promise
+              : Promise.resolve({ stopReason: "end_turn" } as PromptResponse),
+        },
+      ],
     });
     await session.initializeNewSession();
 
@@ -4324,9 +4348,9 @@ describe("ACPAgentSession respawn robustness", () => {
       requestEvent && requestEvent.type === "permission_requested"
         ? requestEvent.request.id
         : "missing";
-    await expect(
-      session.respondToPermission(requestId, { behavior: "allow" }),
-    ).rejects.toThrow("No pending permission request");
+    await expect(session.respondToPermission(requestId, { behavior: "allow" })).rejects.toThrow(
+      "No pending permission request",
+    );
   });
 
   test("setMode after an idle crash lazily resumes the session", async () => {
