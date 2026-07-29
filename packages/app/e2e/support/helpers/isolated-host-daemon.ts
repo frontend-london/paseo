@@ -9,8 +9,15 @@ import { withDisabledE2ESpeechEnv } from "./speech-env";
 export interface IsolatedHostDaemon {
   serverId: string;
   port: number;
+  paseoHome: string;
   restart(): Promise<void>;
   close(): Promise<void>;
+}
+
+export interface IsolatedHostDaemonOptions {
+  environment?: NodeJS.ProcessEnv;
+  paseoHome?: string;
+  preserveHome?: boolean;
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -75,7 +82,10 @@ async function stopProcess(child: ChildProcess): Promise<void> {
   }
 }
 
-export async function startIsolatedHostDaemon(serverId: string): Promise<IsolatedHostDaemon> {
+export async function startIsolatedHostDaemon(
+  serverId: string,
+  options: IsolatedHostDaemonOptions = {},
+): Promise<IsolatedHostDaemon> {
   const primaryPort = Number(process.env.E2E_DAEMON_PORT ?? 0);
   let port = await getAvailablePort();
   while (port === 6767 || port === primaryPort) port = await getAvailablePort();
@@ -83,7 +93,8 @@ export async function startIsolatedHostDaemon(serverId: string): Promise<Isolate
   const metroPort = process.env.E2E_METRO_PORT;
   if (!metroPort) throw new Error("E2E_METRO_PORT is required to start an isolated host daemon");
 
-  const paseoHome = await mkdtemp(path.join(tmpdir(), "paseo-e2e-secondary-host-"));
+  const paseoHome =
+    options.paseoHome ?? (await mkdtemp(path.join(tmpdir(), "paseo-e2e-secondary-host-")));
   const serverDir = path.resolve(__dirname, "../../../../server");
   const tsxBin = execSync("which tsx").toString().trim();
   const spawnDaemon = async (): Promise<ChildProcess> => {
@@ -91,6 +102,7 @@ export async function startIsolatedHostDaemon(serverId: string): Promise<Isolate
       cwd: serverDir,
       env: withDisabledE2ESpeechEnv({
         ...process.env,
+        ...options.environment,
         PASEO_HOME: paseoHome,
         PASEO_SERVER_ID: serverId,
         PASEO_LISTEN: `127.0.0.1:${port}`,
@@ -125,7 +137,9 @@ export async function startIsolatedHostDaemon(serverId: string): Promise<Isolate
   try {
     child = await spawnDaemon();
   } catch (error) {
-    await rm(paseoHome, { recursive: true, force: true });
+    if (!options.preserveHome) {
+      await rm(paseoHome, { recursive: true, force: true });
+    }
     throw error;
   }
   let closed = false;
@@ -133,6 +147,7 @@ export async function startIsolatedHostDaemon(serverId: string): Promise<Isolate
   return {
     serverId,
     port,
+    paseoHome,
     restart: async () => {
       if (closed) throw new Error(`Cannot restart closed isolated daemon ${serverId}`);
       await stopProcess(child);
@@ -142,7 +157,9 @@ export async function startIsolatedHostDaemon(serverId: string): Promise<Isolate
       if (closed) return;
       closed = true;
       await stopProcess(child);
-      await rm(paseoHome, { recursive: true, force: true });
+      if (!options.preserveHome) {
+        await rm(paseoHome, { recursive: true, force: true });
+      }
     },
   };
 }
