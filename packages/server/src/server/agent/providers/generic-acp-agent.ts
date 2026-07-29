@@ -46,6 +46,8 @@ interface GenericACPAgentClientOptions {
   providerParams?: unknown;
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
+  /** Bound on the ACP initialize handshake of session worker processes. */
+  initializeTimeoutMs?: number;
   diagnosticPhaseTimeoutMs?: number;
   clientCapabilityMeta?: ACPClientCapabilityMeta;
   configFeatureOptions?: ACPConfigFeatureOption[];
@@ -74,6 +76,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       clientCapabilities: providerParams.clientCapabilities,
       clientCapabilityMeta: options.clientCapabilityMeta,
       configFeatureOptions: options.configFeatureOptions,
+      initializeTimeoutMs: options.initializeTimeoutMs,
       extensionCommandsParser: options.extensionCommandsParser,
       managedProcesses: options.managedProcesses,
     });
