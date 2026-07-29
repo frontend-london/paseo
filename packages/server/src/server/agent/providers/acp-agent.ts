@@ -265,6 +265,14 @@ export function buildACPClientCapabilities(
 const PROBE_ENV: Record<string, string> = { NO_BROWSER: "true" };
 const ACP_CATALOG_TIMEOUT_MS = 60_000;
 const ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS = 20_000;
+/**
+ * Bound on the ACP initialize handshake for a session's worker process. A
+ * hung initialize must not pin the session (or daemon shutdown) forever; the
+ * failed spawn is torn down and the next prompt retries with a fresh process.
+ */
+const DEFAULT_ACP_INITIALIZE_TIMEOUT_MS = 30_000;
+/** How long close() waits for an in-flight respawn to settle before forcing cleanup. */
+const ACP_CLOSE_RESPAWN_SETTLE_TIMEOUT_MS = 5_000;
 
 function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
   return {
@@ -398,6 +406,8 @@ interface ACPAgentClientOptions {
   extensionCommandsParser?: ACPExtensionCommandsParser;
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
+  /** Bound on the ACP initialize handshake of a session worker process. */
+  initializeTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
   managedProcesses?: ManagedProcessRegistry;
 }
@@ -432,6 +442,8 @@ interface ACPAgentSessionOptions {
   launchEnv?: Record<string, string>;
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
+  /** Bound on the ACP initialize handshake; defaults to DEFAULT_ACP_INITIALIZE_TIMEOUT_MS. */
+  initializeTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
   managedProcesses?: ManagedProcessRegistry;
 }
@@ -765,6 +777,7 @@ export class ACPAgentClient implements AgentClient {
   ) => Promise<void>;
   private readonly waitForInitialCommands: boolean;
   private readonly initialCommandsWaitTimeoutMs: number;
+  private readonly initializeTimeoutMs?: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   protected readonly terminateProcess: ProcessTerminator;
   private readonly managedProcesses?: ManagedProcessRegistry;
@@ -793,6 +806,7 @@ export class ACPAgentClient implements AgentClient {
     this.thinkingOptionWriter = options.thinkingOptionWriter;
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
+    this.initializeTimeoutMs = options.initializeTimeoutMs;
     this.extensionCommandsParser = options.extensionCommandsParser;
     this.managedProcesses = options.managedProcesses;
   }
@@ -827,6 +841,7 @@ export class ACPAgentClient implements AgentClient {
         extensionCommandsParser: this.extensionCommandsParser,
         waitForInitialCommands: this.waitForInitialCommands,
         initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+        initializeTimeoutMs: this.initializeTimeoutMs,
         managedProcesses: this.managedProcesses,
       },
     );
@@ -879,6 +894,7 @@ export class ACPAgentClient implements AgentClient {
       extensionCommandsParser: this.extensionCommandsParser,
       waitForInitialCommands: this.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+      initializeTimeoutMs: this.initializeTimeoutMs,
       managedProcesses: this.managedProcesses,
     });
     await session.initializeResumedSession();
@@ -1374,6 +1390,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private processExit: { code: number | null; signal: NodeJS.Signals | null; at: number } | null =
     null;
   private respawnPromise: Promise<void> | null = null;
+  /**
+   * Process spawned but not yet through initialize. Tracked separately from
+   * this.child so close() can abort and reap a hung handshake; owned end to
+   * end by spawnProcess(), which clears it on success and on failure.
+   */
+  private pendingSpawnChild: ChildProcessWithoutNullStreams | null = null;
+  private pendingSpawnAbort: AbortController | null = null;
+  private readonly initializeTimeoutMs: number;
   private resumeUnsupported = false;
   private readonly startingTurnIds = new Set<string>();
   private readonly cancelRequestedTurnIds = new Set<string>();
@@ -1418,6 +1442,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.currentTitle = config.title ?? null;
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
+    this.initializeTimeoutMs = options.initializeTimeoutMs ?? DEFAULT_ACP_INITIALIZE_TIMEOUT_MS;
     this.extensionCommandsParser = options.extensionCommandsParser;
     this.managedProcesses = options.managedProcesses;
     this.featureValues = { ...config.featureValues };
@@ -2232,6 +2257,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.settleCommandsReady();
 
+    // Abort any in-flight spawn first: a hung initialize must not pin the
+    // respawn promise (and with it daemon shutdown) forever. The spawn
+    // teardown itself owns killing the pending child.
+    this.pendingSpawnAbort?.abort();
+
     for (const pending of this.pendingPermissions.values()) {
       pending.resolve({ outcome: { outcome: "cancelled" } });
     }
@@ -2266,14 +2296,34 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
     }
 
-    // Killing the current child unblocks a respawn parked on its transport;
-    // the respawn's closed checks then tear down anything it spawned or
-    // recorded. Wait for it so close() leaves no process and no ledger record.
+    // Killing the current child (and aborting a pending spawn above)
+    // unblocks a respawn parked on its transport or initialize; the respawn's
+    // closed checks then tear down anything it spawned or recorded. Wait for
+    // it — but never forever: if the respawn still has not settled, force the
+    // pending child down and finish close() with a warning instead of hanging.
     if (this.respawnPromise) {
+      let settleTimer: ReturnType<typeof setTimeout> | null = null;
       try {
-        await this.respawnPromise;
-      } catch {}
+        const timedOut = await Promise.race([
+          this.respawnPromise.then(
+            () => false,
+            () => false,
+          ),
+          new Promise<boolean>((resolve) => {
+            settleTimer = setTimeout(() => resolve(true), ACP_CLOSE_RESPAWN_SETTLE_TIMEOUT_MS);
+          }),
+        ]);
+        if (timedOut) {
+          await this.forceTerminatePendingSpawnDuringClose();
+        }
+      } finally {
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+        }
+      }
     }
+    this.pendingSpawnChild = null;
+    this.pendingSpawnAbort = null;
     await this.removeManagedProcessRecord();
 
     this.processState = "dead";
@@ -2281,6 +2331,30 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.connection = null;
     this.child = null;
     this.activeForegroundTurnId = null;
+  }
+
+  /**
+   * Last-resort close() path: the respawn did not settle even after the
+   * pending spawn was aborted, so kill the pending child directly and log
+   * the lifecycle stage instead of hanging shutdown.
+   */
+  private async forceTerminatePendingSpawnDuringClose(): Promise<void> {
+    this.logger.warn(
+      { agentId: this.agentId, provider: this.provider, lifecycle: "close" },
+      "ACP respawn did not settle during close; forcing pending spawn cleanup",
+    );
+    const pendingChild = this.pendingSpawnChild;
+    if (!pendingChild) {
+      return;
+    }
+    try {
+      await this.terminateProcess(pendingChild, {
+        gracefulTimeoutMs: 1_000,
+        forceTimeoutMs: 1_000,
+      });
+    } catch (error) {
+      this.logger.warn({ err: error }, "Failed to terminate pending ACP spawn during close");
+    }
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -2569,39 +2643,135 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       { logger: this.logger, provider: this.provider },
     );
     const connection = new ClientSideConnection(() => this, stream);
-    // Take ownership before initialize so the outer initialization guard can
-    // close the process even when the ACP handshake itself rejects.
-    this.child = child;
-    this.connection = connection;
+
+    // Track the in-flight spawn so close() can abort and reap a process whose
+    // initialize hangs; a close that already happened aborts immediately.
+    const spawnAbort = new AbortController();
+    this.pendingSpawnChild = child;
+    this.pendingSpawnAbort = spawnAbort;
+    if (this.closed) {
+      spawnAbort.abort();
+    }
+
+    // Register the process in the ledger before initialize so it stays
+    // visible to the reaper even if the daemon dies during a hung handshake.
+    const recordPromise = this.recordManagedProcess(child, command, args);
+
     let initialize: InitializeResponse;
     try {
-      initialize = await this.runACPRequest(() =>
-        connection.initialize({
-          protocolVersion: PROTOCOL_VERSION,
-          clientCapabilities: buildACPClientCapabilities(
-            this.clientCapabilityMeta,
-            this.clientCapabilities,
-          ),
-          clientInfo: { name: "Paseo", version: "dev" },
-        }),
-      );
+      initialize = await this.initializeConnection(connection, spawnAbort.signal);
+      await recordPromise;
+      if (spawnAbort.signal.aborted || this.closed) {
+        // close() raced the successful initialize; tear down instead of
+        // handing the process to a closed session.
+        throw new Error(`${this.provider} session is closed`);
+      }
     } catch (error) {
-      await terminateChildProcess(child, 2_000, this.terminateProcess);
+      await this.teardownFailedSpawn(child, spawnAbort, recordPromise);
       throw error;
     }
 
-    await this.recordManagedProcess(child, command, args);
+    this.clearPendingSpawn(child, spawnAbort);
     return { child, connection, initialize };
+  }
+
+  /**
+   * Initialize with a bounded handshake: rejects on the configured timeout
+   * (acp_initialize_timeout), on session close (abort), or when the transport
+   * dies before a response arrives. The SDK never settles a pending request
+   * after the stream closes, so connection.closed must be raced explicitly.
+   */
+  private async initializeConnection(
+    connection: ClientSideConnection,
+    signal: AbortSignal,
+  ): Promise<InitializeResponse> {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let onAbort: (() => void) | null = null;
+    try {
+      return await this.runACPRequest(() =>
+        Promise.race([
+          connection.initialize({
+            protocolVersion: PROTOCOL_VERSION,
+            clientCapabilities: buildACPClientCapabilities(
+              this.clientCapabilityMeta,
+              this.clientCapabilities,
+            ),
+            clientInfo: { name: "Paseo", version: "dev" },
+          }),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              reject(
+                new Error(
+                  `${this.provider} ACP initialize timed out after ${this.initializeTimeoutMs}ms (acp_initialize_timeout)`,
+                ),
+              );
+            }, this.initializeTimeoutMs);
+          }),
+          new Promise<never>((_, reject) => {
+            if (signal.aborted) {
+              reject(new Error(`${this.provider} session is closed`));
+              return;
+            }
+            onAbort = () => reject(new Error(`${this.provider} session is closed`));
+            signal.addEventListener("abort", onAbort, { once: true });
+          }),
+          connection.closed.then(() => {
+            throw new Error(
+              `${this.provider} ACP agent process exited before initialize completed`,
+            );
+          }),
+        ]),
+      );
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+  }
+
+  /**
+   * Single owner of a failed in-flight spawn: kills the process tree, waits
+   * for the early ledger write, and removes the record so no child process
+   * and no ledger entry outlive the failure. Idempotent — a record or child
+   * already taken over by close() is left alone.
+   */
+  private async teardownFailedSpawn(
+    child: ChildProcessWithoutNullStreams,
+    spawnAbort: AbortController,
+    recordPromise: Promise<string | null>,
+  ): Promise<void> {
+    this.clearPendingSpawn(child, spawnAbort);
+    try {
+      await terminateChildProcess(child, 2_000, this.terminateProcess);
+    } catch (error) {
+      this.logger.warn({ err: error }, "Failed to terminate ACP process after failed initialize");
+    }
+    const recordId = await recordPromise;
+    if (recordId && this.managedProcessRecordId === recordId) {
+      await this.removeManagedProcessRecord();
+    }
+  }
+
+  private clearPendingSpawn(child: ChildProcessWithoutNullStreams, spawnAbort: AbortController) {
+    if (this.pendingSpawnChild === child) {
+      this.pendingSpawnChild = null;
+    }
+    if (this.pendingSpawnAbort === spawnAbort) {
+      this.pendingSpawnAbort = null;
+    }
   }
 
   private async recordManagedProcess(
     child: ChildProcessWithoutNullStreams,
     command: string,
     args: string[],
-  ): Promise<void> {
+  ): Promise<string | null> {
     const pid = child.pid;
     if (!this.managedProcesses || typeof pid !== "number" || pid <= 0) {
-      return;
+      return null;
     }
     try {
       const record = await this.managedProcesses.record({
@@ -2613,14 +2783,17 @@ export class ACPAgentSession implements AgentSession, ACPClient {
           agentId: this.agentId ?? null,
           sessionId: this.sessionId ?? null,
           cwd: this.config.cwd,
+          stage: "starting",
         },
       });
       this.managedProcessRecordId = record.id;
+      return record.id;
     } catch (error) {
       this.logger.warn(
         { err: error, pid },
         "Failed to record ACP agent process in the managed process ledger",
       );
+      return null;
     }
   }
 
@@ -2639,9 +2812,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   /**
-   * The ledger record is written right after spawn, before session/new or
-   * session/load produces the session id; backfill it once known so reaping
-   * diagnostics can tie a leftover process to its agent session.
+   * The ledger record is written right after spawn, before initialize and
+   * session/new or session/load produce the session id; backfill it once
+   * known so reaping diagnostics can tie a leftover process to its agent
+   * session and the record no longer reads as "starting".
    */
   private async updateManagedProcessMetadata(): Promise<void> {
     const recordId = this.managedProcessRecordId;
@@ -2656,7 +2830,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     this.managedProcessRecordSessionId = sessionId;
     try {
-      await this.managedProcesses.updateMetadata(recordId, { sessionId });
+      await this.managedProcesses.updateMetadata(recordId, { sessionId, stage: "running" });
     } catch (error) {
       this.logger.warn({ err: error, id: recordId }, "Failed to update ACP agent process record");
     }

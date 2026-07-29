@@ -3439,6 +3439,8 @@ interface ACPCrashRecoveryInternals {
   child: unknown;
   activeForegroundTurnId: string | null;
   processState?: string;
+  pendingSpawnChild?: unknown;
+  respawnPromise?: Promise<void> | null;
 }
 
 interface FakeACPAgentBehavior {
@@ -3450,6 +3452,10 @@ interface FakeACPAgentBehavior {
   loadSession?: ReturnType<typeof vi.fn>;
   resumeSession?: ReturnType<typeof vi.fn>;
   failInitialize?: Error;
+  /** Initialize never responds, simulating an ACP host hung during handshake. */
+  hangInitialize?: boolean;
+  /** When set, initialize responds only after this promise resolves. */
+  initializeGate?: Promise<void>;
 }
 
 function applyConfigValue(
@@ -3487,6 +3493,12 @@ class FakeACPAgentProcess extends EventEmitter {
     const sessionState = { modes: null, models: null, configOptions: [], ...behavior.sessionState };
     this.agent = {
       initialize: vi.fn(async () => {
+        if (behavior.hangInitialize) {
+          await new Promise<void>(() => {});
+        }
+        if (behavior.initializeGate) {
+          await behavior.initializeGate;
+        }
         if (behavior.failInitialize) {
           throw behavior.failInitialize;
         }
@@ -3569,6 +3581,7 @@ function createCrashTestHarness(
     managedProcesses?: ReturnType<typeof createFakeManagedProcessRegistry>;
     terminateProcess?: ProcessTerminator;
     configFeatureOptions?: ACPConfigFeatureOption[];
+    initializeTimeoutMs?: number;
   } = {},
 ) {
   const children: FakeACPAgentProcess[] = [];
@@ -3602,6 +3615,7 @@ function createCrashTestHarness(
     ...(options.managedProcesses ? { managedProcesses: options.managedProcesses } : {}),
     ...(options.terminateProcess ? { terminateProcess: options.terminateProcess } : {}),
     ...(options.configFeatureOptions ? { configFeatureOptions: options.configFeatureOptions } : {}),
+    ...(options.initializeTimeoutMs ? { initializeTimeoutMs: options.initializeTimeoutMs } : {}),
   } as ConstructorParameters<typeof ACPAgentSession>[1]);
 
   return { session, children, spawnSpy };
@@ -4416,5 +4430,214 @@ describe("ACPAgentSession respawn robustness", () => {
         expect.objectContaining({ sessionId: "session-1" }),
       );
     });
+  });
+});
+
+describe("ACPAgentSession hung initialize recovery (NEW-1)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function hungRespawnHarness(options: {
+    terminator: FakeTerminator;
+    managedProcesses?: ReturnType<typeof createFakeManagedProcessRegistry>;
+    initializeTimeoutMs?: number;
+  }) {
+    return createCrashTestHarness({
+      terminateProcess: options.terminator.terminate,
+      ...(options.managedProcesses ? { managedProcesses: options.managedProcesses } : {}),
+      ...(options.initializeTimeoutMs ? { initializeTimeoutMs: options.initializeTimeoutMs } : {}),
+      behaviors: (spawnIndex) => (spawnIndex === 1 ? { hangInitialize: true } : {}),
+    });
+  }
+
+  test("close during a hung initialize completes within timeout and leaves no process", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = hungRespawnHarness({ terminator, managedProcesses });
+    await session.initializeNewSession();
+    expect(managedProcesses.record).toHaveBeenCalledTimes(1);
+
+    children[0].crash(1, null);
+    const startPromise = session.startTurn("revive");
+    startPromise.catch(() => {});
+    await waitForAssertion(() => {
+      expect(children).toHaveLength(2);
+      expect(children[1].agent.initialize).toHaveBeenCalledTimes(1);
+    });
+
+    // initialize never answers: close() must still finish in bounded time.
+    const closeOutcome = await Promise.race([
+      session.close().then(() => "closed" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_500)),
+    ]);
+    expect(closeOutcome).toBe("closed");
+
+    await expect(startPromise).rejects.toThrow("session is closed");
+    expect(terminator.terminated).toContain(children[1]);
+    const internals = internalsOf(session);
+    expect(internals.child).toBeNull();
+    expect(internals.pendingSpawnChild ?? null).toBeNull();
+    expect(internals.processState).toBe("dead");
+    expect(internals.respawnPromise ?? null).toBeNull();
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+    // No late session/load or prompt after close.
+    expect(children[1].agent.loadSession).not.toHaveBeenCalled();
+    expect(children[1].agent.newSession).not.toHaveBeenCalled();
+    expect(children[1].agent.prompt).not.toHaveBeenCalled();
+    await expect(session.startTurn("after close")).rejects.toThrow("session is closed");
+  });
+
+  test("initialize timeout kills the spawned process and clears the ledger", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = hungRespawnHarness({
+      terminator,
+      managedProcesses,
+      initializeTimeoutMs: 200,
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await expect(session.startTurn("revive")).rejects.toThrow("acp_initialize_timeout");
+
+    expect(terminator.terminated).toContain(children[1]);
+    // No fallback to session/new after an initialize timeout.
+    expect(children[1].agent.newSession).not.toHaveBeenCalled();
+    expect(children[1].agent.loadSession).not.toHaveBeenCalled();
+    const internals = internalsOf(session);
+    expect(internals.child).toBeNull();
+    expect(internals.pendingSpawnChild ?? null).toBeNull();
+    expect(internals.processState).toBe("dead");
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test("close racing with initialize success cleans up exactly once", async () => {
+    const terminator = new FakeTerminator();
+    const gate = deferredPromise<void>();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      behaviors: (spawnIndex) => (spawnIndex === 1 ? { initializeGate: gate.promise } : {}),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+    const startPromise = session.startTurn("revive");
+    startPromise.catch(() => {});
+    await waitForAssertion(() => {
+      expect(children[1]?.agent.initialize).toHaveBeenCalledTimes(1);
+    });
+
+    const closePromise = session.close();
+    // initialize succeeds while close() is in flight; exactly one teardown wins.
+    gate.resolve();
+    await closePromise;
+
+    await expect(startPromise).rejects.toThrow("session is closed");
+    expect(terminator.terminated.filter((child) => child === children[1])).toHaveLength(1);
+    const internals = internalsOf(session);
+    expect(internals.child).toBeNull();
+    expect(internals.pendingSpawnChild ?? null).toBeNull();
+    expect(internals.processState).toBe("dead");
+    expect(children[1].agent.loadSession).not.toHaveBeenCalled();
+    expect(children[1].agent.prompt).not.toHaveBeenCalled();
+  });
+
+  test("process exit during initialize does not wait for the initialize timeout", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = hungRespawnHarness({
+      terminator,
+      initializeTimeoutMs: 30_000,
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    const startPromise = session.startTurn("revive");
+    await waitForAssertion(() => {
+      expect(children[1]?.agent.initialize).toHaveBeenCalledTimes(1);
+    });
+
+    const exitedAt = Date.now();
+    children[1].crash(1, null);
+    await expect(startPromise).rejects.toThrow(/exited|closed/i);
+    expect(Date.now() - exitedAt).toBeLessThan(5_000);
+    expect(internalsOf(session).processState).toBe("dead");
+  });
+
+  test("late initialize response after timeout is ignored", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const gate = deferredPromise<void>();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      managedProcesses,
+      initializeTimeoutMs: 200,
+      behaviors: (spawnIndex) => (spawnIndex === 1 ? { initializeGate: gate.promise } : {}),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await expect(session.startTurn("revive")).rejects.toThrow("acp_initialize_timeout");
+    gate.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(children[1].agent.loadSession).not.toHaveBeenCalled();
+    expect(children[1].agent.newSession).not.toHaveBeenCalled();
+    expect(children[1].agent.prompt).not.toHaveBeenCalled();
+    const internals = internalsOf(session);
+    expect(internals.child).toBeNull();
+    expect(internals.pendingSpawnChild ?? null).toBeNull();
+    expect(internals.processState).toBe("dead");
+    expect(managedProcesses.record).toHaveBeenCalledTimes(2);
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test("timeout followed by a new prompt retries with a fresh process", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = hungRespawnHarness({
+      terminator,
+      initializeTimeoutMs: 200,
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await expect(session.startTurn("revive")).rejects.toThrow("acp_initialize_timeout");
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("retry");
+    expect(children).toHaveLength(3);
+    expect(children[2].agent.loadSession).toHaveBeenCalledTimes(1);
+    await waitForTurnEvent(events, "turn_completed", turnId);
+    expect(turnFailedEvents(events)).toHaveLength(0);
+  });
+
+  test("close after an initialize timeout remains idempotent", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = hungRespawnHarness({
+      terminator,
+      managedProcesses,
+      initializeTimeoutMs: 200,
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    await expect(session.startTurn("revive")).rejects.toThrow("acp_initialize_timeout");
+
+    await session.close();
+    await session.close();
+
+    expect(terminator.terminated.filter((child) => child === children[1])).toHaveLength(1);
+    expect(internalsOf(session).processState).toBe("dead");
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+    await expect(session.startTurn("after close")).rejects.toThrow("session is closed");
   });
 });
