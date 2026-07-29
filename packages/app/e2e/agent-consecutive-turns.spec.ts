@@ -62,7 +62,7 @@ async function recordTurnFrames(page: Page, prompt: string): Promise<void> {
       const scroll = findScroll();
       // Re-find the row every frame: reconciliation replaces the node, and a stale
       // reference would keep reporting the position of something already detached.
-      const prompt = Array.from(document.querySelectorAll('[data-testid="user-message"]')).find(
+      const promptRow = Array.from(document.querySelectorAll('[data-testid="user-message"]')).find(
         (candidate) => isVisible(candidate) && candidate.textContent?.includes(promptText),
       );
       state.frames.push({
@@ -70,8 +70,8 @@ async function recordTurnFrames(page: Page, prompt: string): Promise<void> {
         workingVisible: Array.from(
           document.querySelectorAll('[data-testid="turn-working-indicator"]'),
         ).some(isVisible),
-        promptVisible: Boolean(prompt),
-        promptTop: prompt ? prompt.getBoundingClientRect().top : null,
+        promptVisible: Boolean(promptRow),
+        promptTop: promptRow ? promptRow.getBoundingClientRect().top : null,
         assistantVisible: Array.from(
           document.querySelectorAll('[data-testid="assistant-message"]'),
         ).some(isVisible),
