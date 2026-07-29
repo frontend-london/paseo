@@ -26,12 +26,17 @@ const logger = createTestLogger();
  * hangs every later one (tracked via a counter file), or hangs all of them
  * when hangAll is baked in. Everything else gets a canned response.
  */
-function mockACPSource(options: { counterFile: string; hangAll: boolean }): string {
+function mockACPSource(options: {
+  counterFile: string;
+  hangAll: boolean;
+  hangSessionLoad: boolean;
+}): string {
   return `
 const readline = require("node:readline");
 const fs = require("node:fs");
 const COUNTER_FILE = ${JSON.stringify(options.counterFile)};
 const HANG_ALL = ${JSON.stringify(options.hangAll)};
+const HANG_SESSION_LOAD = ${JSON.stringify(options.hangSessionLoad)};
 
 function respond(id, result) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
@@ -68,6 +73,9 @@ rl.on("line", (line) => {
     }
     case "session/new":
     case "session/load":
+      if (msg.method === "session/load" && HANG_SESSION_LOAD) {
+        return; // Hung attach: never respond.
+      }
       respond(msg.id, {
         sessionId: "mock-session-1",
         modes: null,
@@ -95,12 +103,23 @@ interface IntegrationFixture {
   counterFile: string;
 }
 
-async function createFixture(options: { hangAll: boolean }): Promise<IntegrationFixture> {
+async function createFixture(options: {
+  hangAll: boolean;
+  hangSessionLoad?: boolean;
+}): Promise<IntegrationFixture> {
   const workdir = await mkdtemp(path.join(tmpdir(), "paseo-acp-init-hang-"));
   const counterFile = path.join(workdir, "mock-initialize-count");
   await writeFile(counterFile, "0", "utf8");
   const mockPath = path.join(workdir, "mock-acp.cjs");
-  await writeFile(mockPath, mockACPSource({ counterFile, hangAll: options.hangAll }), "utf8");
+  await writeFile(
+    mockPath,
+    mockACPSource({
+      counterFile,
+      hangAll: options.hangAll,
+      hangSessionLoad: options.hangSessionLoad ?? false,
+    }),
+    "utf8",
+  );
   const registry = createManagedProcessRegistry({
     paseoHome: workdir,
     processTable: createSystemManagedProcessTable(),
@@ -112,7 +131,7 @@ async function createFixture(options: { hangAll: boolean }): Promise<Integration
 
 function createClient(
   fixture: IntegrationFixture,
-  options: { initializeTimeoutMs?: number } = {},
+  options: { initializeTimeoutMs?: number; sessionLoadTimeoutMs?: number } = {},
 ): ACPAgentClient {
   return new ACPAgentClient({
     provider: "claude-acp",
@@ -121,6 +140,7 @@ function createClient(
     defaultModes: [],
     managedProcesses: fixture.registry,
     ...(options.initializeTimeoutMs ? { initializeTimeoutMs: options.initializeTimeoutMs } : {}),
+    ...(options.sessionLoadTimeoutMs ? { sessionLoadTimeoutMs: options.sessionLoadTimeoutMs } : {}),
   });
 }
 
@@ -264,6 +284,36 @@ describe("ACP hung initialize integration (NEW-1)", () => {
 
     const startedAt = Date.now();
     await expect(createPromise).rejects.toThrow("acp_initialize_timeout");
+    expect(Date.now() - startedAt).toBeLessThan(15_000);
+
+    await waitForCondition(() => {
+      expect(pidIsAlive(pendingPid)).toBe(false);
+    });
+    expect(await fixture.registry.list()).toHaveLength(0);
+  }, 60_000);
+
+  test("session/load timeout during resume kills the real process and clears the ledger", async () => {
+    const fixture = await createFixture({ hangAll: false, hangSessionLoad: true });
+    fixtures.push(fixture);
+    const client = createClient(fixture, { sessionLoadTimeoutMs: 1_000 });
+
+    // The mock answers initialize but never answers session/load.
+    const resumePromise = client.resumeSession(
+      { provider: "claude-acp", sessionId: "mock-session-1" },
+      { cwd: fixture.workdir },
+    );
+    resumePromise.catch(() => {});
+
+    let pendingPid = 0;
+    await waitForCondition(async () => {
+      const records = await fixture.registry.list();
+      expect(records).toHaveLength(1);
+      pendingPid = records[0]?.pid ?? 0;
+    });
+    expect(pidIsAlive(pendingPid)).toBe(true);
+
+    const startedAt = Date.now();
+    await expect(resumePromise).rejects.toThrow("acp_attach_timeout");
     expect(Date.now() - startedAt).toBeLessThan(15_000);
 
     await waitForCondition(() => {
