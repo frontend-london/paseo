@@ -17,6 +17,7 @@ interface LongTimelineAgentOptions {
 }
 
 interface LongTimelineAgent extends MockAgentWorkspace {
+  firstOlderPagePrompt: string;
   initialTailOldestPrompt: string;
   oldestPrompt: string;
   newestPrompt: string;
@@ -67,6 +68,7 @@ export async function seedLongMockAgentTimeline(
 
   return {
     ...agent,
+    firstOlderPagePrompt: promptForTurn(Math.max(0, options.turns - 40)),
     initialTailOldestPrompt: promptForTurn(Math.max(0, options.turns - 20)),
     oldestPrompt: promptForTurn(0),
     newestPrompt: promptForTurn(options.turns - 1),
@@ -113,6 +115,26 @@ export async function openAgentTimeline(page: Page, agent: LongTimelineAgent): P
 export async function expectTimelinePromptVisible(page: Page, prompt: string): Promise<void> {
   const timeline = page.locator('[data-testid="agent-chat-scroll"]:visible').first();
   await expect(timeline.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 });
+}
+
+export async function expectTimelinePromptCentered(page: Page, prompt: string): Promise<void> {
+  const timeline = page.locator('[data-testid="agent-chat-scroll"]:visible').first();
+  const message = timeline.getByTestId("user-message").filter({ hasText: prompt });
+  await expect(message).toBeVisible();
+  await expect
+    .poll(async () => {
+      const [timelineBox, messageBox] = await Promise.all([
+        timeline.boundingBox(),
+        message.boundingBox(),
+      ]);
+      if (!timelineBox || !messageBox) {
+        return Number.POSITIVE_INFINITY;
+      }
+      const timelineCenter = timelineBox.x + timelineBox.width / 2;
+      const messageCenter = messageBox.x + messageBox.width / 2;
+      return Math.abs(timelineCenter - messageCenter);
+    })
+    .toBeLessThanOrEqual(2);
 }
 
 export async function expectTimelinePromptNotMounted(page: Page, prompt: string): Promise<void> {

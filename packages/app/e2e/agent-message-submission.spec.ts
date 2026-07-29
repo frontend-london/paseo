@@ -13,7 +13,6 @@ import {
   startRunningMockAgent,
 } from "./helpers/composer";
 import { openAgentRoute, seedMockAgentWorkspace } from "./helpers/mock-agent";
-import { readScrollMetrics } from "./helpers/agent-bottom-anchor";
 import { seedWorkspace } from "./helpers/seed-client";
 import { waitForWorkspaceTabsVisible } from "./helpers/workspace-tabs";
 import { getServerId } from "./helpers/server-id";
@@ -21,6 +20,17 @@ import { buildHostWorkspaceRoute } from "@/utils/host-routes";
 import { delayBrowserAgentCreatedStatus } from "./helpers/new-workspace";
 import { installDaemonWebSocketGate } from "./helpers/daemon-websocket-gate";
 import { selectModel } from "./helpers/app";
+import {
+  scrollTimelineToNewestLoadedEdge,
+  scrollTimelineUntilOlderHistoryIsReachable,
+} from "./helpers/timeline-pagination";
+import {
+  appendSettledTimelineTurns,
+  createSettledMockAgent,
+  createSmallAssistantPng,
+  emitSettledAssistantImage,
+  expectAssistantImageRendered,
+} from "./helpers/assistant-images";
 
 const IMAGE = {
   name: "message-submission.png",
@@ -31,15 +41,8 @@ const IMAGE = {
   ),
 };
 
-interface MessageGeometry {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 interface SubmissionScenario {
-  gate: Awaited<ReturnType<typeof gateNextAgentMessage>>;
+  existingPrompt: string;
 }
 
 interface DraftCreateScenario {
@@ -63,17 +66,32 @@ const test = baseTest.extend<{
   unrelatedRunningScenario: UnrelatedRunningScenario;
 }>({
   submissionScenario: async ({ page }, provide, testInfo) => {
-    const gate = await gateNextAgentMessage(page);
-    const agent = await seedMockAgentWorkspace({
-      repoPrefix: `message-submission-${testInfo.workerIndex}-`,
-      title: "Message submission regression",
-      model: "ten-second-stream",
+    await page.setViewportSize({ width: 1280, height: 960 });
+    const workspace = await seedWorkspace({
+      repoPrefix: `message-submission-layout-${testInfo.workerIndex}-`,
     });
-    await openAgentRoute(page, { workspaceId: agent.workspaceId, agentId: agent.agentId });
-    await expectComposerVisible(page);
-    await expectAgentIdle(page);
-    await provide({ gate });
-    await agent.cleanup();
+    try {
+      const agent = await createSettledMockAgent(workspace, "Message submission layout regression");
+      await appendSettledTimelineTurns(workspace.client, agent, 80);
+      const image = await createSmallAssistantPng(workspace, {
+        alt: "Existing timeline image",
+        fileName: "existing-timeline.png",
+      });
+      await emitSettledAssistantImage(workspace.client, agent, image);
+      await openAgentRoute(page, { workspaceId: agent.workspaceId, agentId: agent.id });
+      await expectComposerVisible(page);
+      await expectAgentIdle(page);
+      const oldestPrompt = "image-history-turn-0: emit 1 coalesced agent stream updates";
+      await scrollTimelineUntilOlderHistoryIsReachable(page, oldestPrompt);
+      await scrollTimelineToNewestLoadedEdge(page);
+      await expectAssistantImageRendered(page, image);
+      await provide({
+        existingPrompt:
+          "Emit settled assistant image Markdown: ![Existing timeline image](existing-timeline.png)",
+      });
+    } finally {
+      await workspace.cleanup();
+    }
   },
   draftCreateScenario: async ({ page }, provide, testInfo) => {
     const agentCreatedDelay = await delayBrowserAgentCreatedStatus(page);
@@ -174,53 +192,49 @@ async function expectPendingSubmission(page: Page, userMessage: Locator): Promis
   await expect(userMessage.getByRole("button", { name: "Open image attachment" })).toBeVisible();
 }
 
-async function readMessageGeometry(page: Page, userMessage: Locator): Promise<MessageGeometry> {
-  const box = await userMessage.boundingBox();
-  if (!box) throw new Error("Submitted user message has no browser geometry");
-  const { offsetY } = await readScrollMetrics(page);
-  return { x: box.x, y: box.y + offsetY, width: box.width, height: box.height };
-}
-
-async function beginWorkingFooterContinuityCheck(page: Page): Promise<() => Promise<void>> {
-  await expect(page.getByTestId("turn-working-indicator")).toBeVisible();
-  await page.evaluate(() => {
-    const state = { active: true, sawMissing: false };
+async function beginTimelineRowStabilityCheck(
+  page: Page,
+  timelineRow: Locator,
+): Promise<() => Promise<void>> {
+  await expect(timelineRow).toBeVisible();
+  await timelineRow.evaluate((initialRow) => {
+    const state = {
+      active: true,
+      lastTop: initialRow.getBoundingClientRect().top,
+      largestDownwardShift: 0,
+      sawMissing: false,
+    };
     const windowState = window as unknown as Record<string, unknown>;
-    windowState.__messageSubmissionFooterContinuity = state;
+    windowState.__messageSubmissionTimelineRowStability = state;
     const checkFrame = () => {
       if (!state.active) return;
-      if (!document.querySelector('[data-testid="turn-working-indicator"]')) {
+      if (!initialRow.isConnected) {
         state.sawMissing = true;
+        requestAnimationFrame(checkFrame);
+        return;
       }
+      const top = initialRow.getBoundingClientRect().top;
+      state.largestDownwardShift = Math.max(state.largestDownwardShift, top - state.lastTop);
+      state.lastTop = top;
       requestAnimationFrame(checkFrame);
     };
     requestAnimationFrame(checkFrame);
   });
 
   return async () => {
-    const sawMissing = await page.evaluate(() => {
+    const result = await page.evaluate(() => {
       const windowState = window as unknown as Record<string, unknown>;
-      const state = windowState.__messageSubmissionFooterContinuity as
-        | { active: boolean; sawMissing: boolean }
+      const state = windowState.__messageSubmissionTimelineRowStability as
+        | { active: boolean; largestDownwardShift: number; sawMissing: boolean }
         | undefined;
-      if (!state) throw new Error("Working-footer continuity check was not started");
+      if (!state) throw new Error("Timeline-row stability check was not started");
       state.active = false;
-      delete windowState.__messageSubmissionFooterContinuity;
-      return state.sawMissing;
+      delete windowState.__messageSubmissionTimelineRowStability;
+      return { largestDownwardShift: state.largestDownwardShift, sawMissing: state.sawMissing };
     });
-    expect(sawMissing).toBe(false);
+    expect(result.sawMissing).toBe(false);
+    expect(result.largestDownwardShift).toBeLessThanOrEqual(2);
   };
-}
-
-async function expectAcceptedSubmission(
-  page: Page,
-  userMessage: Locator,
-  submittedGeometry: MessageGeometry,
-): Promise<void> {
-  await expect(page.getByTestId("turn-working-indicator")).toBeVisible();
-  await expect(userMessage).toHaveAttribute("aria-busy", "false", { timeout: 30_000 });
-  await expect(page.getByTestId("turn-working-indicator")).toBeVisible();
-  expect(await readMessageGeometry(page, userMessage)).toEqual(submittedGeometry);
 }
 
 async function submitMessageThatWillBeRejected(page: Page, prompt: string): Promise<void> {
@@ -566,18 +580,33 @@ async function completeDraftCreateSubmission(
 }
 
 test.describe("Agent message submission", () => {
-  test("keeps the submitted row stable when the host accepts", async ({
+  test("keeps layout stable when submitting to an agent with existing history", async ({
     page,
     submissionScenario,
   }) => {
-    const userMessage = await submitMessageWithImage(page, "Hold this submission.");
-    await expectPendingSubmission(page, userMessage);
-    await submissionScenario.gate.waitForRequest();
-    const submittedGeometry = await readMessageGeometry(page, userMessage);
-    const finishFooterContinuityCheck = await beginWorkingFooterContinuityCheck(page);
-    submissionScenario.gate.accept();
-    await expectAcceptedSubmission(page, userMessage, submittedGeometry);
-    await finishFooterContinuityCheck();
+    const prompt = "Hold this submission.";
+    const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
+    await composer.fill(prompt);
+    await expect(composer).toHaveValue(prompt);
+    await expect(
+      page.getByTestId("user-message").filter({ hasText: submissionScenario.existingPrompt }),
+    ).toBeVisible();
+    const finishTimelineRowStabilityCheck = await beginTimelineRowStabilityCheck(
+      page,
+      page.getByTestId("assistant-message").last(),
+    );
+    const assistantMessageCount = await page.getByTestId("assistant-message").count();
+    const toolCallCount = await page.getByTestId("tool-call-badge").count();
+    await composer.press("Enter");
+    const userMessage = page.getByTestId("user-message").filter({ hasText: prompt }).last();
+    await expect(userMessage).toBeVisible();
+    await expect
+      .poll(async () => page.getByTestId("assistant-message").count())
+      .toBeGreaterThan(assistantMessageCount);
+    await expect
+      .poll(async () => page.getByTestId("tool-call-badge").count())
+      .toBeGreaterThan(toolCallCount);
+    await finishTimelineRowStabilityCheck();
   });
 
   test("keeps the submitted row stable through draft create handoff", async ({

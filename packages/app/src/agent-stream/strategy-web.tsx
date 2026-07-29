@@ -73,6 +73,12 @@ const historyStartSlotStyle: CSSProperties = {
   paddingBottom: 8,
 };
 
+const mountedHistoryRowStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  width: "100%",
+};
+
 function isScrollContainerNearBottom(
   scrollContainer: Pick<HTMLElement, "scrollTop" | "clientHeight" | "scrollHeight">,
   thresholdPx = AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
@@ -557,24 +563,23 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     scheduleStickToBottom,
   ]);
 
-  useEffect(() => {
+  // Following output is a layout invariant: rows, footer, and bottom offset must
+  // reach the browser in the same paint.
+  useLayoutEffect(() => {
     if (!followOutputRef.current) {
       return;
     }
-    scheduleStickToBottom();
+    cancelPendingStickToBottom();
+    scrollMessagesToBottom("auto");
   }, [
-    scheduleStickToBottom,
+    cancelPendingStickToBottom,
+    renderLiveAuxiliary,
+    scrollMessagesToBottom,
     segments.historyMounted,
     segments.historyVirtualized,
     segments.liveHead,
+    virtualTotalSize,
   ]);
-
-  useEffect(() => {
-    if (!followOutputRef.current || !shouldUseVirtualizer) {
-      return;
-    }
-    scheduleStickToBottom();
-  }, [scheduleStickToBottom, shouldUseVirtualizer, virtualTotalSize]);
 
   useEffect(() => {
     updateScrollMetrics();
@@ -764,7 +769,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
   );
   const mountedHistoryRows = useMemo(() => {
     return segments.historyMounted.map((item, index) => (
-      <div key={item.id} data-history-row-id={item.id}>
+      <div key={item.id} data-history-row-id={item.id} style={mountedHistoryRowStyle}>
         {renderHistoryMountedRow(item, index, segments.historyMounted)}
       </div>
     ));

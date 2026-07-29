@@ -2,6 +2,7 @@ import { expect, test } from "./fixtures";
 import {
   expectSameOlderHistoryLoadingOperation,
   expectTimelineAtHistoryStart,
+  expectTimelinePromptCentered,
   expectTimelinePromptNotMounted,
   expectTimelinePromptPositionPreserved,
   expectTimelinePromptVisible,
@@ -30,12 +31,14 @@ test.describe("Agent timeline pagination", () => {
       const history = await holdOlderHistoryPages(page, agent);
       await openAgentTimeline(page, agent);
       await expectTimelinePromptVisible(page, agent.newestPrompt);
+      await expectTimelinePromptCentered(page, agent.newestPrompt);
       await expectTimelinePromptNotMounted(page, agent.oldestPrompt);
 
       await userScrollsTimelineToHistoryStart(page);
       await history.expectRequestedPages(1);
       history.releasePage(1);
       await history.expectSettledWithRequestedPages(1);
+      await expectTimelinePromptCentered(page, agent.firstOlderPagePrompt);
 
       await userScrollsTimelineToHistoryStart(page);
       await history.expectRequestedPages(2);
