@@ -6345,6 +6345,7 @@ export class Session {
             agentId,
             accepted: true,
             error: null,
+            outOfBand: true,
           },
         });
         return;
@@ -6372,6 +6373,7 @@ export class Session {
           agentId,
           accepted: true,
           error: null,
+          outOfBand: false,
         },
       });
     } catch (error) {
