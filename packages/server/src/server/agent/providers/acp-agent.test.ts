@@ -3054,8 +3054,9 @@ describe("ACPAgentSession initialization cleanup", () => {
           child,
           connection: {
             newSession: vi.fn().mockRejectedValue(new Error("session/new failed")),
+            closed: new Promise<void>(() => {}),
           } as unknown as ClientSideConnection,
-          initialize: { agentCapabilities: {} },
+          initialize: { protocolVersion: PROTOCOL_VERSION, agentCapabilities: {} },
         };
       }
     }
@@ -3070,6 +3071,10 @@ describe("ACPAgentSession initialization cleanup", () => {
         capabilities: {
           supportsStreaming: true,
           supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
         },
         terminateProcess: terminator.terminate,
       },
@@ -3090,8 +3095,12 @@ describe("ACPAgentSession initialization cleanup", () => {
           child,
           connection: {
             loadSession: vi.fn().mockRejectedValue(new Error("session/load failed")),
+            closed: new Promise<void>(() => {}),
           } as unknown as ClientSideConnection,
-          initialize: { agentCapabilities: { loadSession: true } },
+          initialize: {
+            protocolVersion: PROTOCOL_VERSION,
+            agentCapabilities: { loadSession: true },
+          },
         };
       }
     }
@@ -3106,6 +3115,10 @@ describe("ACPAgentSession initialization cleanup", () => {
         capabilities: {
           supportsStreaming: true,
           supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
         },
         handle: { provider: "cursor", sessionId: "session-1" },
         terminateProcess: terminator.terminate,
@@ -3197,6 +3210,9 @@ describe("ACP session/load invariant — cwd and mcpServers always passed", () =
             prompt: vi.fn(),
             loadSession,
             unstable_resumeSession: unstableResumeSession,
+            // Mirrors the SDK ClientSideConnection: a never-settling closed
+            // promise, since this stubbed transport stays open.
+            closed: new Promise<void>(() => {}),
           } as unknown as ClientSideConnection,
           initialize: { agentCapabilities: args.capabilities ?? {} },
         } as SpawnedACPProcess;
@@ -3456,6 +3472,14 @@ interface FakeACPAgentBehavior {
   hangInitialize?: boolean;
   /** When set, initialize responds only after this promise resolves. */
   initializeGate?: Promise<void>;
+  /** session/load never responds. */
+  hangLoadSession?: boolean;
+  /** unstable_resumeSession never responds. */
+  hangResumeSession?: boolean;
+  /** session/new never responds. */
+  hangNewSession?: boolean;
+  /** session/set_mode never responds. */
+  hangSetSessionMode?: boolean;
 }
 
 function applyConfigValue(
@@ -3508,11 +3532,33 @@ class FakeACPAgentProcess extends EventEmitter {
           authMethods: [],
         };
       }),
-      newSession: vi.fn(async () => ({ sessionId, ...sessionState })),
-      loadSession: behavior.loadSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
+      newSession: vi.fn(async () => {
+        if (behavior.hangNewSession) {
+          await new Promise<void>(() => {});
+        }
+        return { sessionId, ...sessionState };
+      }),
+      loadSession:
+        behavior.loadSession ??
+        vi.fn(async () => {
+          if (behavior.hangLoadSession) {
+            await new Promise<void>(() => {});
+          }
+          return { sessionId, ...sessionState };
+        }),
       unstable_resumeSession:
-        behavior.resumeSession ?? vi.fn(async () => ({ sessionId, ...sessionState })),
-      setSessionMode: vi.fn(async () => {}),
+        behavior.resumeSession ??
+        vi.fn(async () => {
+          if (behavior.hangResumeSession) {
+            await new Promise<void>(() => {});
+          }
+          return { sessionId, ...sessionState };
+        }),
+      setSessionMode: vi.fn(async () => {
+        if (behavior.hangSetSessionMode) {
+          await new Promise<void>(() => {});
+        }
+      }),
       setSessionConfigOption: vi.fn(async (params: { configId: string; value: string }) => ({
         // Mirror the provider contract: the response reports the applied value.
         configOptions: applyConfigValue(sessionState.configOptions, params),
@@ -3582,6 +3628,7 @@ function createCrashTestHarness(
     terminateProcess?: ProcessTerminator;
     configFeatureOptions?: ACPConfigFeatureOption[];
     initializeTimeoutMs?: number;
+    sessionLoadTimeoutMs?: number;
   } = {},
 ) {
   const children: FakeACPAgentProcess[] = [];
@@ -3616,6 +3663,7 @@ function createCrashTestHarness(
     ...(options.terminateProcess ? { terminateProcess: options.terminateProcess } : {}),
     ...(options.configFeatureOptions ? { configFeatureOptions: options.configFeatureOptions } : {}),
     ...(options.initializeTimeoutMs ? { initializeTimeoutMs: options.initializeTimeoutMs } : {}),
+    ...(options.sessionLoadTimeoutMs ? { sessionLoadTimeoutMs: options.sessionLoadTimeoutMs } : {}),
   } as ConstructorParameters<typeof ACPAgentSession>[1]);
 
   return { session, children, spawnSpy };
@@ -4639,5 +4687,223 @@ describe("ACPAgentSession hung initialize recovery (NEW-1)", () => {
       expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
     });
     await expect(session.startTurn("after close")).rejects.toThrow("session is closed");
+  });
+});
+
+describe("ACPAgentSession session-attach hang recovery (Finding 1)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Settles to the resolution value, the rejection error, or "timeout". */
+  function settleOutcome(promise: Promise<unknown>, ms = 2_500): Promise<unknown> {
+    return Promise.race([
+      promise.then(
+        () => "resolved",
+        (error: unknown) => error,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), ms)),
+    ]);
+  }
+
+  test("process crash during session/load rejects the respawn and allows a fresh retry", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      managedProcesses,
+      // Large: the exit path must not wait for the attach timeout.
+      sessionLoadTimeoutMs: 30_000,
+      behaviors: (spawnIndex) => (spawnIndex === 1 ? { hangLoadSession: true } : {}),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    const startPromise = session.startTurn("revive");
+    await waitForAssertion(() => {
+      expect(children[1]?.agent.loadSession).toHaveBeenCalledTimes(1);
+    });
+    // The worker dies mid-load; the pending loadSession RPC must not hang.
+    children[1].crash(1, null);
+
+    const outcome = await settleOutcome(startPromise);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/exited during session\/load/);
+    const internals = internalsOf(session);
+    expect(internals.respawnPromise ?? null).toBeNull();
+    expect(internals.processState).toBe("dead");
+    expect(internals.child).toBeNull();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("retry");
+    expect(children).toHaveLength(3);
+    await waitForTurnEvent(events, "turn_completed", turnId);
+  });
+
+  test("live process that never answers session/load times out and recovers", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      managedProcesses,
+      sessionLoadTimeoutMs: 200,
+      behaviors: (spawnIndex) => (spawnIndex === 1 ? { hangLoadSession: true } : {}),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    const outcome = await settleOutcome(session.startTurn("revive"));
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("acp_attach_timeout");
+
+    // No fallback to session/new after a session/load timeout.
+    expect(children[1].agent.newSession).not.toHaveBeenCalled();
+    expect(terminator.terminated).toContain(children[1]);
+    const internals = internalsOf(session);
+    expect(internals.respawnPromise ?? null).toBeNull();
+    expect(internals.processState).toBe("dead");
+    expect(internals.child).toBeNull();
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("retry");
+    expect(children).toHaveLength(3);
+    await waitForTurnEvent(events, "turn_completed", turnId);
+  });
+
+  test("close during a hung session/load completes and settles respawnPromise", async () => {
+    const terminator = new FakeTerminator();
+    const managedProcesses = createFakeManagedProcessRegistry();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      managedProcesses,
+      // Large: close must abort the attach, not wait for the timeout.
+      sessionLoadTimeoutMs: 30_000,
+      behaviors: (spawnIndex) => (spawnIndex === 1 ? { hangLoadSession: true } : {}),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    const startPromise = session.startTurn("revive");
+    startPromise.catch(() => {});
+    await waitForAssertion(() => {
+      expect(children[1]?.agent.loadSession).toHaveBeenCalledTimes(1);
+    });
+
+    const closeOutcome = await Promise.race([
+      session.close().then(() => "closed" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_500)),
+    ]);
+    expect(closeOutcome).toBe("closed");
+
+    await expect(startPromise).rejects.toThrow("session is closed");
+    const internals = internalsOf(session);
+    expect(internals.respawnPromise ?? null).toBeNull();
+    expect(internals.child).toBeNull();
+    expect(internals.processState).toBe("dead");
+    expect(terminator.terminated).toContain(children[1]);
+    await waitForAssertion(() => {
+      expect(managedProcesses.remove).toHaveBeenCalledTimes(2);
+    });
+    expect(children[1].agent.prompt).not.toHaveBeenCalled();
+  });
+
+  test("hung unstable_resumeSession during respawn is bounded", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      sessionLoadTimeoutMs: 200,
+      behaviors: (spawnIndex) => ({
+        agentCapabilities: { sessionCapabilities: { resume: {} } },
+        ...(spawnIndex === 1 ? { hangResumeSession: true } : {}),
+      }),
+    });
+    await session.initializeNewSession();
+    children[0].crash(1, null);
+
+    const outcome = await settleOutcome(session.startTurn("revive"));
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("acp_attach_timeout");
+
+    const resumedAgent = children[1].agent as unknown as {
+      unstable_resumeSession: ReturnType<typeof vi.fn>;
+      loadSession: ReturnType<typeof vi.fn>;
+    };
+    expect(resumedAgent.unstable_resumeSession).toHaveBeenCalledTimes(1);
+    expect(resumedAgent.loadSession).not.toHaveBeenCalled();
+    expect(terminator.terminated).toContain(children[1]);
+    expect(internalsOf(session).respawnPromise ?? null).toBeNull();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("retry");
+    expect(children).toHaveLength(3);
+    await waitForTurnEvent(events, "turn_completed", turnId);
+  });
+
+  test("hung session/new during initial setup is bounded", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      sessionLoadTimeoutMs: 200,
+      behaviors: [{ hangNewSession: true }],
+    });
+
+    const outcome = await settleOutcome(session.initializeNewSession());
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("acp_attach_timeout");
+    expect(children).toHaveLength(1);
+    expect(children[0].agent.newSession).toHaveBeenCalledTimes(1);
+  });
+
+  test("hung runtime override RPC after respawn is bounded and allows retry", async () => {
+    const terminator = new FakeTerminator();
+    const { session, children } = createCrashTestHarness({
+      terminateProcess: terminator.terminate,
+      sessionLoadTimeoutMs: 200,
+      behaviors: (spawnIndex) => ({
+        sessionState: {
+          modes: {
+            availableModes: [
+              { id: "yolo", name: "Yolo" },
+              { id: "plan", name: "Plan" },
+            ],
+            currentModeId: "yolo",
+          },
+        },
+        ...(spawnIndex === 1 ? { hangSetSessionMode: true } : {}),
+      }),
+    });
+    await session.initializeNewSession();
+    await session.setMode("plan");
+    children[0].crash(1, null);
+
+    // session/load reports mode "yolo"; re-applying the effective mode "plan"
+    // hangs on the respawned worker and must hit the attach timeout.
+    const outcome = await settleOutcome(session.startTurn("revive"));
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("acp_attach_timeout");
+    expect(children[1].agent.setSessionMode).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      modeId: "plan",
+    });
+    expect(terminator.terminated).toContain(children[1]);
+    expect(internalsOf(session).respawnPromise ?? null).toBeNull();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("retry");
+    expect(children).toHaveLength(3);
+    await waitForTurnEvent(events, "turn_completed", turnId);
+    // NOTE: the failed respawn overwrote currentMode with the provider-
+    // reported value before the override hung, so the retry re-applies the
+    // state captured at that point ("yolo"). Restoring the pre-respawn
+    // effective mode after a failed override is a separate follow-up
+    // (runtime-state re-application, see NEW-3) and out of scope here.
+    expect(await session.getCurrentMode()).toBe("yolo");
   });
 });
