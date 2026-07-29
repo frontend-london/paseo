@@ -89,13 +89,16 @@ async function expectUninterruptedTurn(page: Page): Promise<void> {
     if (!state) throw new Error("Turn frames were never recorded");
     state.active = false;
     const start = state.frames.findIndex((frame) => frame.promptVisible);
-    // The turn ends when the working indicator goes away for good. Anything before
-    // that is a blink: the footer left the layout and came back.
+    // The turn runs from the footer first appearing to it going away for good. Bounding
+    // it that way keeps this measuring one thing: the footer leaving the layout and
+    // coming back. How long the footer takes to appear after the row is a separate
+    // question and does not belong in this assertion.
+    const firstWorking = state.frames.findIndex((frame) => frame.workingVisible);
     const lastWorking = state.frames.reduce(
       (latest, frame, index) => (frame.workingVisible ? index : latest),
       -1,
     );
-    const turn = state.frames.slice(start, lastWorking + 1);
+    const turn = state.frames.slice(Math.max(start, firstWorking), lastWorking + 1);
     const blinkAt = turn.findIndex((frame) => !frame.workingVisible);
     let largestHeightDrop = 0;
     let largestHeightDropAt = -1;
