@@ -1,5 +1,7 @@
 import type { Logger } from "pino";
 
+import { isExternalRuntimeAgent } from "@getpaseo/protocol/agent-labels";
+
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
@@ -29,6 +31,15 @@ export interface EnsureAgentLoadedDeps {
   logger: Logger;
 }
 
+export class ExternalRuntimeAgentError extends Error {
+  constructor(agentId: string) {
+    super(
+      `Agent ${agentId} is an externally managed runtime session and cannot be loaded as a provider process`,
+    );
+    this.name = "ExternalRuntimeAgentError";
+  }
+}
+
 export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
@@ -47,6 +58,12 @@ export async function ensureAgentLoaded(
     const record = await deps.agentStorage.get(agentId);
     if (!record) {
       throw new Error(`Agent not found: ${agentId}`);
+    }
+
+    // External runtime agents are visibility/lifecycle projections owned by
+    // agent-manager (or similar). Never spawn/resume a provider process for them.
+    if (isExternalRuntimeAgent(record)) {
+      throw new ExternalRuntimeAgentError(agentId);
     }
 
     const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();

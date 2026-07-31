@@ -1408,6 +1408,36 @@ export const AgentDetachResponseMessageSchema = z.object({
   payload: AgentActionResponsePayloadSchema,
 });
 
+// COMPAT(agentExternalRegister): added for Agents agent-manager lifecycle
+// visibility. External agents are storage-only projections (no provider process).
+export const AgentExternalRegisterRequestMessageSchema = z.object({
+  type: z.literal("agent.external.register.request"),
+  // Stable key for idempotent register/reconcile (e.g. Agents agent_id).
+  externalSessionKey: z.string().min(1),
+  // Display provider id shown in UI (e.g. "devin", "tmux", "agents").
+  provider: AgentProviderSchema,
+  cwd: z.string().min(1),
+  title: z.string().optional(),
+  model: z.string().nullable().optional(),
+  workspaceId: z.string().optional(),
+  labels: z.record(z.string(), z.string()).optional(),
+  // Optional native/external handle mirrored into persistence.sessionId.
+  sessionHandle: z.string().optional(),
+  requestId: z.string(),
+});
+
+export const AgentExternalRegisterResponseMessageSchema = z.object({
+  type: z.literal("agent.external.register.response"),
+  payload: z.object({
+    requestId: z.string(),
+    accepted: z.boolean(),
+    created: z.boolean(),
+    agentId: z.string().nullable(),
+    agent: AgentSnapshotPayloadSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const AgentRewindModeSchema = z.enum(["conversation", "files", "both"]);
 
 export const AgentRewindRequestMessageSchema = z.object({
@@ -2263,6 +2293,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentThinkingRequestMessageSchema,
   SetAgentFeatureRequestMessageSchema,
   AgentDetachRequestMessageSchema,
+  AgentExternalRegisterRequestMessageSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   CheckoutStatusRequestSchema,
@@ -2560,6 +2591,8 @@ export const ServerInfoStatusPayloadSchema = z
         commitsList: z.boolean().optional(),
         // COMPAT(providerRemoval): added in v0.1.105, drop the gate when floor >= v0.1.105.
         providerRemoval: z.boolean().optional(),
+        // COMPAT(agentExternalRegister): Agents external session visibility (no provider process).
+        agentExternalRegister: z.boolean().optional(),
       })
       .optional(),
   })
@@ -4604,6 +4637,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentThinkingResponseMessageSchema,
   SetAgentFeatureResponseMessageSchema,
   AgentDetachResponseMessageSchema,
+  AgentExternalRegisterResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,
@@ -4925,6 +4959,12 @@ export type SetAgentModelRequestMessage = z.infer<typeof SetAgentModelRequestMes
 export type SetAgentThinkingRequestMessage = z.infer<typeof SetAgentThinkingRequestMessageSchema>;
 export type SetAgentFeatureRequestMessage = z.infer<typeof SetAgentFeatureRequestMessageSchema>;
 export type AgentDetachRequestMessage = z.infer<typeof AgentDetachRequestMessageSchema>;
+export type AgentExternalRegisterRequestMessage = z.infer<
+  typeof AgentExternalRegisterRequestMessageSchema
+>;
+export type AgentExternalRegisterResponseMessage = z.infer<
+  typeof AgentExternalRegisterResponseMessageSchema
+>;
 export type AgentPermissionResponseMessage = z.infer<typeof AgentPermissionResponseMessageSchema>;
 export type CheckoutStatusRequest = z.infer<typeof CheckoutStatusRequestSchema>;
 export type CheckoutStatusResponse = z.infer<typeof CheckoutStatusResponseSchema>;

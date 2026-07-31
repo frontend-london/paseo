@@ -36,7 +36,7 @@ import {
   isStoredAgentProviderAvailable,
   toAgentPersistenceHandle,
 } from "./persistence-hooks.js";
-import { ensureAgentLoaded } from "./agent/agent-loading.js";
+import { ensureAgentLoaded, ExternalRuntimeAgentError } from "./agent/agent-loading.js";
 import {
   formatSystemNotificationPrompt,
   sendPromptToAgent,
@@ -59,7 +59,14 @@ import {
 import type { DaemonConfigStore } from "./daemon-config-store.js";
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
-import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getParentAgentIdFromLabels,
+  isExternalRuntimeAgent,
+} from "@getpaseo/protocol/agent-labels";
+import {
+  registerExternalAgent,
+  toExternalAgentSnapshot,
+} from "./agent/external-register.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
 import {
   CLIENT_SHUTDOWN_RPC_REASON,
@@ -231,7 +238,7 @@ import {
   createProjectDirectory,
   ProjectDirectoryRequestError,
 } from "./project-directory-service.js";
-import { type WorktreeConfig, createWorktree } from "../utils/worktree.js";
+import { type WorktreeConfig, createWorktree, readPaseoConfig } from "../utils/worktree.js";
 import { runGitCommand } from "../utils/run-git-command.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 
@@ -1510,6 +1517,8 @@ export class Session {
     switch (msg.type) {
       case "agent.detach.request":
         return this.handleDetachAgentRequest(msg.agentId, msg.requestId);
+      case "agent.external.register.request":
+        return this.handleExternalRegisterRequest(msg);
       default:
         return undefined;
     }
@@ -1993,6 +2002,99 @@ export class Session {
     }
 
     return { agentId, archivedAt };
+  }
+
+  private async handleExternalRegisterRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.external.register.request" }>,
+  ): Promise<void> {
+    const requestId = msg.requestId;
+    this.sessionLogger.info(
+      {
+        requestId,
+        externalSessionKey: msg.externalSessionKey,
+        provider: msg.provider,
+        cwd: msg.cwd,
+      },
+      "session: agent.external.register.request",
+    );
+
+    try {
+      const workspaceId =
+        msg.workspaceId ?? (await this.findWorkspaceIdForCwd(msg.cwd)) ?? undefined;
+
+      const result = await registerExternalAgent(
+        {
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+          validProviders: this.providerSnapshotManager.listRegisteredProviderIds(),
+        },
+        {
+          externalSessionKey: msg.externalSessionKey,
+          provider: msg.provider,
+          cwd: msg.cwd,
+          title: msg.title,
+          model: msg.model,
+          workspaceId,
+          labels: msg.labels,
+          sessionHandle: msg.sessionHandle,
+        },
+      );
+
+      if (!result.accepted || !result.record) {
+        this.emit({
+          type: "agent.external.register.response",
+          payload: {
+            requestId,
+            accepted: false,
+            created: false,
+            agentId: null,
+            agent: null,
+            error: result.error ?? "Failed to register external agent",
+          },
+        });
+        return;
+      }
+
+      const agent = toExternalAgentSnapshot(
+        result.record,
+        this.providerSnapshotManager.listRegisteredProviderIds(),
+      );
+
+      if (this.agentUpdates.hasSubscription()) {
+        const payload = await this.agentUpdates.emitStoredRecord(result.record);
+        if (payload.workspaceId) {
+          await this.emitWorkspaceUpdateForWorkspaceId(payload.workspaceId);
+        }
+      }
+
+      this.emit({
+        type: "agent.external.register.response",
+        payload: {
+          requestId,
+          accepted: true,
+          created: result.created,
+          agentId: result.agentId,
+          agent,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, requestId, externalSessionKey: msg.externalSessionKey },
+        "session: agent.external.register.request error",
+      );
+      this.emit({
+        type: "agent.external.register.response",
+        payload: {
+          requestId,
+          accepted: false,
+          created: false,
+          agentId: null,
+          agent: null,
+          error: getErrorMessageOr(error, "Failed to register external agent"),
+        },
+      });
+    }
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -2609,9 +2711,48 @@ export class Session {
         hasLegacyGitOptions: Boolean(git),
       });
       createdWorktreeForCleanup = createdWorktree;
-      const createAgentConfig: AgentSessionConfig = createdWorktree
-        ? { ...config, cwd: createdWorktree.worktree.worktreePath }
-        : config;
+      const baseCwd = createdWorktree ? createdWorktree.worktree.worktreePath : config.cwd;
+      let projectMcpServers: Record<string, any> | undefined;
+      try {
+        const projectConfig = readPaseoConfig(baseCwd);
+        if (projectConfig.ok && projectConfig.config && (projectConfig.config as any).mcpServers) {
+          projectMcpServers = JSON.parse(JSON.stringify((projectConfig.config as any).mcpServers));
+          if (projectMcpServers) {
+            for (const server of Object.values(projectMcpServers)) {
+              if (server && typeof server === "object" && (server as any).env && typeof (server as any).env === "object") {
+                for (const [envKey, envVal] of Object.entries((server as any).env)) {
+                  if (typeof envVal === "string" && envVal.startsWith("$")) {
+                    const varName = envVal.slice(1);
+                    let resolvedVal = process.env[varName];
+                    if (!resolvedVal && varName === "APIFY_TOKEN") {
+                      try {
+                        const fileToken = require("node:fs").readFileSync(
+                          require("node:path").join(require("node:os").homedir(), ".apify.env"),
+                          "utf8"
+                        ).match(/APIFY_TOKEN=["']?([^"'\n]+)["']?/);
+                        if (fileToken) resolvedVal = fileToken[1];
+                      } catch {}
+                    }
+                    if (resolvedVal) {
+                      (server as any).env[envKey] = resolvedVal;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        this.sessionLogger.warn({ err: e }, "Failed to read project mcpServers");
+      }
+      const createAgentConfig: AgentSessionConfig = {
+        ...config,
+        cwd: baseCwd,
+        mcpServers: {
+          ...projectMcpServers,
+          ...config.mcpServers,
+        },
+      };
       const workspaceId = await this.workspaceProvisioning.resolveOrCreateWorkspaceIdForCreateAgent(
         {
           createdWorktree,
@@ -3405,13 +3546,19 @@ export class Session {
       .filter(
         (record) =>
           filter?.includeUnavailablePersisted === true ||
+          isExternalRuntimeAgent(record) ||
           isStoredAgentProviderAvailable(record, registeredProviderIds),
       )
       .map((record) => this.buildStoredAgentPayload(record, registeredProviderIds));
 
     let agents = [...liveAgents, ...persistedAgents];
 
-    agents = agents.filter((agent) => this.isProviderVisibleToClient(agent.provider));
+    // External runtime projections stay visible even when the display provider
+    // is unknown to a legacy client; they are storage-only lifecycle rows.
+    agents = agents.filter(
+      (agent) =>
+        isExternalRuntimeAgent(agent) || this.isProviderVisibleToClient(agent.provider),
+    );
     if (!includeArchived) {
       agents = agents.filter((agent) => !agent.archivedAt);
     }
@@ -3483,7 +3630,9 @@ export class Session {
     const live = this.agentManager.getAgent(agentId);
     if (live) {
       const payload = await this.buildAgentPayload(live);
-      return this.isProviderVisibleToClient(payload.provider) ? payload : null;
+      return isExternalRuntimeAgent(payload) || this.isProviderVisibleToClient(payload.provider)
+        ? payload
+        : null;
     }
 
     const record = await this.agentStorage.get(agentId);
@@ -3491,7 +3640,9 @@ export class Session {
       return null;
     }
     const payload = this.buildStoredAgentPayload(record);
-    return this.isProviderVisibleToClient(payload.provider) ? payload : null;
+    return isExternalRuntimeAgent(record) || this.isProviderVisibleToClient(payload.provider)
+      ? payload
+      : null;
   }
 
   private async resolveDelegationRootWorkspaceId(agentId: string): Promise<string | null> {
@@ -5555,6 +5706,35 @@ export class Session {
       : undefined;
 
     try {
+      // External runtime agents are storage-only projections — never load a
+      // provider process. Return the stored snapshot with an empty timeline.
+      const storedRecord = await this.agentStorage.get(msg.agentId);
+      if (storedRecord && isExternalRuntimeAgent(storedRecord)) {
+        const agentPayload = this.buildStoredAgentPayload(storedRecord);
+        this.emit({
+          type: "fetch_agent_timeline_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            agent: agentPayload,
+            direction,
+            projection,
+            epoch: "external",
+            reset: true,
+            staleCursor: false,
+            gap: false,
+            window: { minSeq: 0, maxSeq: 0, nextSeq: 1 },
+            startCursor: null,
+            endCursor: null,
+            hasOlder: false,
+            hasNewer: false,
+            entries: [],
+            error: null,
+          },
+        });
+        return;
+      }
+
       const snapshot = await ensureAgentLoaded(msg.agentId, {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
@@ -5638,7 +5818,12 @@ export class Session {
           hasOlder: false,
           hasNewer: false,
           entries: [],
-          error: error instanceof Error ? error.message : String(error),
+          error:
+            error instanceof ExternalRuntimeAgentError
+              ? error.message
+              : error instanceof Error
+                ? error.message
+                : String(error),
         },
       });
     }

@@ -19,4 +19,21 @@ console.log("=== Error Utils ===\n");
   console.log("✓ stringifies non-Error values\n");
 }
 
+{
+  console.log("Test 3: extracts message from plain RPC objects");
+  assert.strictEqual(
+    getErrorMessage({
+      type: "Object",
+      message: '"Method not found": session/set_mode',
+      code: -32601,
+    }),
+    '"Method not found": session/set_mode',
+  );
+  assert.notStrictEqual(
+    getErrorMessage({ message: "rpc failed" }),
+    "[object Object]",
+  );
+  console.log("✓ extracts plain-object message\n");
+}
+
 console.log("=== All error utility tests passed ===");

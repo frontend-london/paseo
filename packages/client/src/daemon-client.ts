@@ -2344,6 +2344,49 @@ export class DaemonClient {
     }
   }
 
+  /**
+   * Register (or update) a storage-only agent that represents an externally
+   * managed session (e.g. agent-manager tmux). Does not start a provider process.
+   */
+  async registerExternalAgent(input: {
+    externalSessionKey: string;
+    provider: string;
+    cwd: string;
+    title?: string;
+    model?: string | null;
+    workspaceId?: string;
+    labels?: Record<string, string>;
+    sessionHandle?: string;
+  }): Promise<{
+    agentId: string;
+    created: boolean;
+    agent: AgentSnapshotPayload;
+  }> {
+    const payload = await this.sendNamespacedCorrelatedSessionRequest<"agent.external.register.response">(
+      {
+        message: {
+          type: "agent.external.register.request",
+          externalSessionKey: input.externalSessionKey,
+          provider: input.provider,
+          cwd: input.cwd,
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
+          ...(input.labels && Object.keys(input.labels).length > 0 ? { labels: input.labels } : {}),
+          ...(input.sessionHandle !== undefined ? { sessionHandle: input.sessionHandle } : {}),
+        },
+      },
+    );
+    if (!payload.accepted || !payload.agentId || !payload.agent) {
+      throw new Error(payload.error ?? "registerExternalAgent rejected");
+    }
+    return {
+      agentId: payload.agentId,
+      created: payload.created,
+      agent: payload.agent,
+    };
+  }
+
   async updateAgent(
     agentId: string,
     updates: { name?: string; labels?: Record<string, string> },

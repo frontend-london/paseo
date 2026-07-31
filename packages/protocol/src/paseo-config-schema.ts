@@ -54,6 +54,7 @@ export const PaseoConfigRawSchema = z
     worktree: PaseoWorktreeConfigRawSchema.optional(),
     scripts: z.record(z.string(), PaseoScriptEntryRawSchema).optional(),
     metadataGeneration: PaseoMetadataGenerationSchema.optional(),
+    mcpServers: z.record(z.string(), z.any()).optional(),
   })
   .passthrough();
 

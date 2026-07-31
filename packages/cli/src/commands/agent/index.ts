@@ -12,6 +12,10 @@ import { addWaitOptions, runWaitCommand } from "./wait.js";
 import { addAttachOptions, runAttachCommand } from "./attach.js";
 import { addReloadOptions, runReloadCommand } from "./reload.js";
 import { addImportOptions, runImportCommand } from "./import.js";
+import {
+  addRegisterExternalOptions,
+  runRegisterExternalCommand,
+} from "./register-external.js";
 import { runUpdateCommand } from "./update.js";
 import { withOutput } from "../../output/index.js";
 import {
@@ -33,6 +37,10 @@ export function createAgentCommand(): Command {
   addJsonAndDaemonHostOptions(addImportOptions(agent.command("import"))).action(
     withOutput(runImportCommand),
   );
+
+  addJsonAndDaemonHostOptions(
+    addRegisterExternalOptions(agent.command("register-external")),
+  ).action(withOutput(runRegisterExternalCommand));
 
   addDaemonHostOption(addAttachOptions(agent.command("attach"))).action(runAttachCommand);
 

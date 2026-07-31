@@ -1266,6 +1266,8 @@ export class VoiceAssistantWebSocketServer {
         commitsList: true,
         // COMPAT(providerRemoval): added in v0.1.105, drop the gate when floor >= v0.1.105.
         providerRemoval: true,
+        // COMPAT(agentExternalRegister): Agents external session visibility (no provider process).
+        agentExternalRegister: true,
       },
     };
   }
