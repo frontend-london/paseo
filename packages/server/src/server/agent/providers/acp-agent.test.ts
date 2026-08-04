@@ -3707,3 +3707,114 @@ describe("ACP session/load invariant — cwd and mcpServers always passed", () =
     });
   });
 });
+
+describe("KimiACPAgentClient", () => {
+  test("maps Paseo yolo mode to Kimi auto mode and reports yolo to Paseo", async () => {
+    const session = new ACPAgentSession(
+      {
+        provider: "kimi",
+        cwd: "/tmp/paseo-acp-test",
+        modeId: "yolo",
+      },
+      {
+        provider: "kimi",
+        logger: createTestLogger(),
+        defaultCommand: ["kimi", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        modeIdTransformer: (modeId) => (modeId === "auto" ? "yolo" : modeId),
+        providerModeWriter: async (context) => {
+          if (context.requestedModeId === "yolo") {
+            await context.connection.setSessionMode({
+              sessionId: context.sessionId,
+              modeId: "auto",
+            });
+            return { handled: true, currentModeId: "yolo" };
+          }
+          return { handled: false };
+        },
+      },
+    );
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [],
+    }));
+    const internals = asInternals<ACPConfiguredOverrideInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode, setSessionConfigOption };
+    internals.availableModes = [
+      { id: "plan", label: "Plan" },
+      { id: "yolo", label: "YOLO" },
+    ];
+    internals.configOptions = [];
+    internals.currentMode = null;
+
+    await internals.applyConfiguredOverrides();
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "auto" });
+    expect(setSessionConfigOption).not.toHaveBeenCalled();
+    await expect(session.getCurrentMode()).resolves.toBe("yolo");
+  });
+
+  test("leaves plan mode unchanged", async () => {
+    const session = new ACPAgentSession(
+      {
+        provider: "kimi",
+        cwd: "/tmp/paseo-acp-test",
+        modeId: "plan",
+      },
+      {
+        provider: "kimi",
+        logger: createTestLogger(),
+        defaultCommand: ["kimi", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        modeIdTransformer: (modeId) => (modeId === "auto" ? "yolo" : modeId),
+        providerModeWriter: async (context) => {
+          if (context.requestedModeId === "yolo") {
+            await context.connection.setSessionMode({
+              sessionId: context.sessionId,
+              modeId: "auto",
+            });
+            return { handled: true, currentModeId: "yolo" };
+          }
+          return { handled: false };
+        },
+      },
+    );
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [],
+    }));
+    const internals = asInternals<ACPConfiguredOverrideInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode, setSessionConfigOption };
+    internals.availableModes = [
+      { id: "plan", label: "Plan" },
+      { id: "yolo", label: "YOLO" },
+    ];
+    internals.configOptions = [];
+    internals.currentMode = null;
+
+    await internals.applyConfiguredOverrides();
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "plan" });
+    await expect(session.getCurrentMode()).resolves.toBe("plan");
+  });
+});

@@ -9,6 +9,8 @@ import {
   type ACPConfigFeatureOption,
   DEFAULT_ACP_CAPABILITIES,
   type ACPExtensionCommandsParser,
+  type ACPProviderModeWriterContext,
+  type ACPProviderModeWriteResult,
 } from "./acp-agent.js";
 import {
   buildBinaryDiagnosticRows,
@@ -49,6 +51,10 @@ interface GenericACPAgentClientOptions {
   clientCapabilityMeta?: ACPClientCapabilityMeta;
   configFeatureOptions?: ACPConfigFeatureOption[];
   extensionCommandsParser?: ACPExtensionCommandsParser;
+  modeIdTransformer?: (modeId: string) => string | null;
+  providerModeWriter?: (
+    context: ACPProviderModeWriterContext,
+  ) => Promise<ACPProviderModeWriteResult>;
 }
 
 export class GenericACPAgentClient extends ACPAgentClient {
@@ -73,6 +79,8 @@ export class GenericACPAgentClient extends ACPAgentClient {
       clientCapabilityMeta: options.clientCapabilityMeta,
       configFeatureOptions: options.configFeatureOptions,
       extensionCommandsParser: options.extensionCommandsParser,
+      modeIdTransformer: options.modeIdTransformer,
+      providerModeWriter: options.providerModeWriter,
     });
 
     this.command = options.command;
