@@ -119,6 +119,11 @@ import {
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import {
+  InventorySnapshotError,
+  InventorySnapshotService,
+  type InventorySessionEntry,
+} from "./agent/inventory-snapshot-service.js";
+import {
   ImportSessionsRequestError,
   importProviderSession,
   listImportableProviderSessions,
@@ -662,6 +667,7 @@ export class Session {
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private readonly inventorySnapshots: InventorySnapshotService;
 
   constructor(options: SessionOptions) {
     const {
@@ -749,6 +755,7 @@ export class Session {
     });
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
+    this.inventorySnapshots = new InventorySnapshotService(() => this.captureInventorySessions());
     this.projectRegistry = projectRegistry;
     this.workspaceRegistry = workspaceRegistry;
     this.filesystem = filesystem ?? nodeSessionFileSystem;
@@ -1954,13 +1961,11 @@ export class Session {
   }
 
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    const directoryOperation = this.dispatchAgentDirectoryMessage(msg);
+    if (directoryOperation) {
+      return directoryOperation;
+    }
     switch (msg.type) {
-      case "fetch_agents_request":
-        return this.handleFetchAgents(msg);
-      case "fetch_agent_history_request":
-        return this.handleFetchAgentHistory(msg);
-      case "fetch_recent_provider_sessions_request":
-        return this.handleFetchRecentProviderSessions(msg);
       case "fetch_agent_request":
         return this.handleFetchAgent(msg.agentId, msg.requestId);
       case "delete_agent_request":
@@ -1993,6 +1998,21 @@ export class Session {
         return this.handleAgentPermissionResponse(msg.agentId, msg.requestId, msg.response);
       case "clear_agent_attention":
         return this.handleClearAgentAttention(msg.agentId, msg.requestId);
+      default:
+        return undefined;
+    }
+  }
+
+  private dispatchAgentDirectoryMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "fetch_agents_request":
+        return this.handleFetchAgents(msg);
+      case "inventory.sessions.request":
+        return this.handleInventorySessions(msg);
+      case "fetch_agent_history_request":
+        return this.handleFetchAgentHistory(msg);
+      case "fetch_recent_provider_sessions_request":
+        return this.handleFetchRecentProviderSessions(msg);
       default:
         return undefined;
     }
@@ -3995,6 +4015,67 @@ export class Session {
   /**
    * Build the current agent list payload (live + persisted), optionally filtered by labels.
    */
+  private captureInventorySessions(): InventorySessionEntry[] {
+    const registry = this.agentStorage.inventoryState();
+    if (registry.issues.length > 0) {
+      throw new SessionRequestError(
+        "inventory_malformed_state",
+        `Paseo registry contains ${registry.issues.length} malformed or duplicate record(s)`,
+      );
+    }
+
+    // This method intentionally performs no await. AgentStorage and AgentManager
+    // are the daemon's two canonical in-memory views; reading both in one event
+    // loop turn gives the materializer a single linearization point before it
+    // freezes pages in InventorySnapshotService.
+    const storedById = new Map(registry.records.map((record) => [record.id, record]));
+    const entriesById = new Map<string, InventorySessionEntry>();
+    for (const record of registry.records) {
+      entriesById.set(record.id, this.inventoryEntryFromStored(record));
+    }
+
+    for (const live of this.agentManager.listAgentsForInventory()) {
+      const stored = storedById.get(live.id);
+      if (stored && stored.provider !== live.provider) {
+        throw new SessionRequestError(
+          "inventory_identity_conflict",
+          `Paseo agent ${live.id} has conflicting live and persisted providers`,
+        );
+      }
+      entriesById.set(live.id, {
+        backend: "paseo",
+        native_id: live.id,
+        provider: live.provider,
+        status_raw: live.lifecycle,
+        archived: Boolean(stored?.archivedAt),
+        archived_at: stored?.archivedAt ?? null,
+        internal: live.internal === true || stored?.internal === true,
+        cwd: live.cwd,
+        created_at: live.createdAt.toISOString(),
+        updated_at: live.updatedAt.toISOString(),
+        persistence_session_id:
+          live.persistence?.sessionId ?? stored?.persistence?.sessionId ?? null,
+      });
+    }
+    return Array.from(entriesById.values());
+  }
+
+  private inventoryEntryFromStored(record: StoredAgentRecord): InventorySessionEntry {
+    return {
+      backend: "paseo",
+      native_id: record.id,
+      provider: record.provider,
+      status_raw: record.lastStatus,
+      archived: Boolean(record.archivedAt),
+      archived_at: record.archivedAt ?? null,
+      internal: record.internal === true,
+      cwd: record.cwd,
+      created_at: record.createdAt,
+      updated_at: record.updatedAt,
+      persistence_session_id: record.persistence?.sessionId ?? null,
+    };
+  }
+
   private async listAgentPayloads(filter?: {
     labels?: Record<string, string>;
     includeArchived?: boolean;
@@ -4972,6 +5053,38 @@ export class Session {
       const code = error instanceof SessionRequestError ? error.code : "fetch_agents_failed";
       const message = error instanceof Error ? error.message : "Failed to fetch agents";
       this.sessionLogger.error({ err: error }, "Failed to handle fetch_agents_request");
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: request.requestId,
+          requestType: request.type,
+          error: message,
+          code,
+        },
+      });
+    }
+  }
+
+  private async handleInventorySessions(
+    request: Extract<SessionInboundMessage, { type: "inventory.sessions.request" }>,
+  ): Promise<void> {
+    try {
+      const page = this.inventorySnapshots.page({
+        snapshot_id: request.snapshot_id,
+        cursor: request.cursor,
+        limit: request.limit,
+      });
+      this.emit({
+        type: "inventory.sessions.response",
+        payload: { requestId: request.requestId, ...page },
+      });
+    } catch (error) {
+      let code = "inventory_snapshot_failed";
+      if (error instanceof InventorySnapshotError || error instanceof SessionRequestError) {
+        code = error.code;
+      }
+      const message = error instanceof Error ? error.message : "Failed to capture Paseo inventory";
+      this.sessionLogger.error({ err: error }, "Failed to handle inventory.sessions.request");
       this.emit({
         type: "rpc_error",
         payload: {

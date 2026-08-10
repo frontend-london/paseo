@@ -84,6 +84,11 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
 
+export interface InventoryRegistryIssue {
+  path: string;
+  reason: "malformed_record" | "duplicate_agent_id";
+}
+
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
@@ -93,6 +98,7 @@ export class AgentStorage {
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
   private loaded = false;
+  private inventoryIssues: InventoryRegistryIssue[] = [];
   private baseDir: string;
   private loadPromise: Promise<StoredAgentRecord[]> | null = null;
   private logger: Logger;
@@ -109,6 +115,23 @@ export class AgentStorage {
   async list(): Promise<StoredAgentRecord[]> {
     await this.load();
     return Array.from(this.cache.values());
+  }
+
+  /**
+   * The inventory RPC reads this synchronous view together with AgentManager's
+   * in-memory map. Once bootstrap has initialized storage, no await occurs
+   * between those reads, giving the materializer one event-loop turn over the
+   * canonical registry state. Invalid or duplicate on-disk records are never
+   * silently omitted from a complete inventory claim.
+   */
+  inventoryState(): { records: StoredAgentRecord[]; issues: InventoryRegistryIssue[] } {
+    if (!this.loaded) {
+      throw new Error("Agent storage is not initialized");
+    }
+    return {
+      records: Array.from(this.cache.values()),
+      issues: this.inventoryIssues.map((issue) => ({ ...issue })),
+    };
   }
 
   async get(agentId: string): Promise<StoredAgentRecord | null> {
@@ -262,6 +285,7 @@ export class AgentStorage {
     this.pathsById.clear();
     this.daemonAgentIdsByExecution.clear();
     this.daemonExecutionKeysByAgentId.clear();
+    this.inventoryIssues = [];
 
     try {
       const records = await this.scanDisk();
@@ -319,9 +343,20 @@ export class AgentStorage {
       }),
     );
 
+    const recordPathById = new Map<string, string>();
     for (const item of loaded) {
       if (!item) continue;
       const { record, filePath } = item;
+      const previousPath = recordPathById.get(record.id);
+      if (previousPath) {
+        this.inventoryIssues.push({ path: filePath, reason: "duplicate_agent_id" });
+        this.inventoryIssues.push({ path: previousPath, reason: "duplicate_agent_id" });
+        // Keep the duplicate path indexed for remove(), even though a complete
+        // inventory correctly fails rather than selecting one arbitrarily.
+        this.addIndexedPath(record.id, filePath);
+        continue;
+      }
+      recordPathById.set(record.id, filePath);
       records.push(record);
       this.cache.set(record.id, record);
       this.indexOwner(record);
@@ -339,6 +374,7 @@ export class AgentStorage {
       return parseStoredAgentRecord(parsed);
     } catch (error) {
       this.logger.error({ err: error, filePath }, "Skipping invalid agent record");
+      this.inventoryIssues.push({ path: filePath, reason: "malformed_record" });
       return null;
     }
   }

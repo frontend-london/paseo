@@ -648,6 +648,20 @@ export type FetchAgentsOptions = Omit<FetchAgentsRequest, "type" | "requestId"> 
 };
 export type FetchAgentsEntry = FetchAgentsPayload["entries"][number];
 export type FetchAgentsPageInfo = FetchAgentsPayload["pageInfo"];
+type InventorySessionsPayload = Extract<
+  SessionOutboundMessage,
+  { type: "inventory.sessions.response" }
+>["payload"];
+type InventorySessionsRequest = Extract<
+  SessionInboundMessage,
+  { type: "inventory.sessions.request" }
+>;
+export type InventorySessionsOptions = Omit<InventorySessionsRequest, "type" | "requestId"> & {
+  requestId?: string;
+  timeout?: number;
+};
+export type InventorySessionsEntry = InventorySessionsPayload["entries"][number];
+export type InventorySessionsPage = Omit<InventorySessionsPayload, "requestId">;
 type FetchAgentHistoryPayload = Extract<
   SessionOutboundMessage,
   { type: "fetch_agent_history_response" }
@@ -2015,6 +2029,31 @@ export class DaemonClient {
       options: { skipQueue: true },
       select: (msg) => {
         if (msg.type !== "fetch_agents_response") {
+          return null;
+        }
+        if (msg.payload.requestId !== resolvedRequestId) {
+          return null;
+        }
+        return msg.payload;
+      },
+    });
+  }
+
+  async inventorySessions(options?: InventorySessionsOptions): Promise<InventorySessionsPayload> {
+    const resolvedRequestId = this.createRequestId(options?.requestId);
+    const message = SessionInboundMessageSchema.parse({
+      type: "inventory.sessions.request",
+      requestId: resolvedRequestId,
+      ...(options?.snapshot_id ? { snapshot_id: options.snapshot_id } : {}),
+      ...(options?.cursor ? { cursor: options.cursor } : {}),
+      ...(options?.limit ? { limit: options.limit } : {}),
+    });
+    return this.sendRequest({
+      requestId: resolvedRequestId,
+      message,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "inventory.sessions.response") {
           return null;
         }
         if (msg.payload.requestId !== resolvedRequestId) {

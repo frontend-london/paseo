@@ -529,4 +529,42 @@ describe("AgentStorage", () => {
     const after = await afterReload.list();
     expect(after.some((r) => r.id === agentId)).toBe(false);
   });
+
+  test("inventoryState reports malformed persisted records instead of silently omitting them", async () => {
+    const projectDir = path.join(storagePath, "tmp-project");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(path.join(projectDir, "broken.json"), "{not json", "utf8");
+
+    await storage.initialize();
+
+    expect(storage.inventoryState()).toEqual({
+      records: [],
+      issues: [{ path: path.join(projectDir, "broken.json"), reason: "malformed_record" }],
+    });
+  });
+
+  test("inventoryState reports duplicate persisted agent identities", async () => {
+    await storage.applySnapshot(
+      createManagedAgent({ id: "duplicate-agent", cwd: "/tmp/project-a" }),
+    );
+    const stored = await storage.get("duplicate-agent");
+    expect(stored).not.toBeNull();
+
+    const projectDir = path.join(storagePath, "tmp-project-b");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, "duplicate-agent.json"),
+      JSON.stringify({ ...stored, cwd: "/tmp/project-b" }),
+      "utf8",
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await reloaded.initialize();
+    expect(reloaded.inventoryState().issues).toEqual(
+      expect.arrayContaining([
+        { path: expect.any(String), reason: "duplicate_agent_id" },
+        { path: expect.any(String), reason: "duplicate_agent_id" },
+      ]),
+    );
+  });
 });
