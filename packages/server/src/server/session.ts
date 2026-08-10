@@ -403,6 +403,79 @@ class SessionRequestError extends Error {
   }
 }
 
+export function captureInventorySessions(
+  agentManager: AgentManager,
+  agentStorage: AgentStorage,
+): InventorySessionEntry[] {
+  const registry = agentStorage.inventoryState();
+  if (registry.issues.length > 0) {
+    throw new SessionRequestError(
+      "inventory_malformed_state",
+      `Paseo registry contains ${registry.issues.length} malformed, duplicate, or unreadable path(s)`,
+    );
+  }
+
+  // No await occurs between these two canonical in-memory reads. The snapshot
+  // service freezes the resulting union before pagination starts.
+  const storedById = new Map(registry.records.map((record) => [record.id, record]));
+  const entriesById = new Map<string, InventorySessionEntry>();
+  for (const record of registry.records) {
+    entriesById.set(record.id, inventoryEntryFromStored(record));
+  }
+  for (const live of agentManager.listAgentsForInventory()) {
+    const stored = storedById.get(live.id);
+    if (stored && stored.provider !== live.provider) {
+      throw new SessionRequestError(
+        "inventory_identity_conflict",
+        `Paseo agent ${live.id} has conflicting live and persisted providers`,
+      );
+    }
+    entriesById.set(live.id, {
+      backend: "paseo",
+      native_id: live.id,
+      provider: live.provider,
+      status_raw: live.lifecycle,
+      archived: Boolean(stored?.archivedAt),
+      archived_at: stored?.archivedAt ?? null,
+      internal: live.internal === true || stored?.internal === true,
+      live: true,
+      cwd: live.cwd,
+      created_at: live.createdAt.toISOString(),
+      updated_at: live.updatedAt.toISOString(),
+      persistence_session_id: live.persistence?.sessionId ?? stored?.persistence?.sessionId ?? null,
+    });
+  }
+  return Array.from(entriesById.values());
+}
+
+function inventoryEntryFromStored(record: StoredAgentRecord): InventorySessionEntry {
+  return {
+    backend: "paseo",
+    native_id: record.id,
+    provider: record.provider,
+    status_raw: record.lastStatus,
+    archived: Boolean(record.archivedAt),
+    archived_at: record.archivedAt ?? null,
+    internal: record.internal === true,
+    live: false,
+    cwd: record.cwd,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+    persistence_session_id: record.persistence?.sessionId ?? null,
+  };
+}
+
+function resolveInventorySnapshotService(
+  inventorySnapshots: InventorySnapshotService | undefined,
+  agentManager: AgentManager,
+  agentStorage: AgentStorage,
+): InventorySnapshotService {
+  return (
+    inventorySnapshots ??
+    new InventorySnapshotService(() => captureInventorySessions(agentManager, agentStorage))
+  );
+}
+
 export interface SessionFileSystem {
   isDirectory(path: string): Promise<boolean>;
 }
@@ -436,6 +509,7 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
+  inventorySnapshots?: InventorySnapshotService;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
   filesystem?: SessionFileSystem;
@@ -689,6 +763,7 @@ export class Session {
       worktreesRoot,
       agentManager,
       agentStorage,
+      inventorySnapshots,
       projectRegistry,
       workspaceRegistry,
       filesystem,
@@ -755,7 +830,11 @@ export class Session {
     });
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
-    this.inventorySnapshots = new InventorySnapshotService(() => this.captureInventorySessions());
+    this.inventorySnapshots = resolveInventorySnapshotService(
+      inventorySnapshots,
+      this.agentManager,
+      this.agentStorage,
+    );
     this.projectRegistry = projectRegistry;
     this.workspaceRegistry = workspaceRegistry;
     this.filesystem = filesystem ?? nodeSessionFileSystem;
@@ -4015,67 +4094,6 @@ export class Session {
   /**
    * Build the current agent list payload (live + persisted), optionally filtered by labels.
    */
-  private captureInventorySessions(): InventorySessionEntry[] {
-    const registry = this.agentStorage.inventoryState();
-    if (registry.issues.length > 0) {
-      throw new SessionRequestError(
-        "inventory_malformed_state",
-        `Paseo registry contains ${registry.issues.length} malformed or duplicate record(s)`,
-      );
-    }
-
-    // This method intentionally performs no await. AgentStorage and AgentManager
-    // are the daemon's two canonical in-memory views; reading both in one event
-    // loop turn gives the materializer a single linearization point before it
-    // freezes pages in InventorySnapshotService.
-    const storedById = new Map(registry.records.map((record) => [record.id, record]));
-    const entriesById = new Map<string, InventorySessionEntry>();
-    for (const record of registry.records) {
-      entriesById.set(record.id, this.inventoryEntryFromStored(record));
-    }
-
-    for (const live of this.agentManager.listAgentsForInventory()) {
-      const stored = storedById.get(live.id);
-      if (stored && stored.provider !== live.provider) {
-        throw new SessionRequestError(
-          "inventory_identity_conflict",
-          `Paseo agent ${live.id} has conflicting live and persisted providers`,
-        );
-      }
-      entriesById.set(live.id, {
-        backend: "paseo",
-        native_id: live.id,
-        provider: live.provider,
-        status_raw: live.lifecycle,
-        archived: Boolean(stored?.archivedAt),
-        archived_at: stored?.archivedAt ?? null,
-        internal: live.internal === true || stored?.internal === true,
-        cwd: live.cwd,
-        created_at: live.createdAt.toISOString(),
-        updated_at: live.updatedAt.toISOString(),
-        persistence_session_id:
-          live.persistence?.sessionId ?? stored?.persistence?.sessionId ?? null,
-      });
-    }
-    return Array.from(entriesById.values());
-  }
-
-  private inventoryEntryFromStored(record: StoredAgentRecord): InventorySessionEntry {
-    return {
-      backend: "paseo",
-      native_id: record.id,
-      provider: record.provider,
-      status_raw: record.lastStatus,
-      archived: Boolean(record.archivedAt),
-      archived_at: record.archivedAt ?? null,
-      internal: record.internal === true,
-      cwd: record.cwd,
-      created_at: record.createdAt,
-      updated_at: record.updatedAt,
-      persistence_session_id: record.persistence?.sessionId ?? null,
-    };
-  }
-
   private async listAgentPayloads(filter?: {
     labels?: Record<string, string>;
     includeArchived?: boolean;
@@ -5069,11 +5087,14 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "inventory.sessions.request" }>,
   ): Promise<void> {
     try {
-      const page = this.inventorySnapshots.page({
-        snapshot_id: request.snapshot_id,
-        cursor: request.cursor,
-        limit: request.limit,
-      });
+      const page = this.inventorySnapshots.page(
+        {
+          snapshot_id: request.snapshot_id,
+          cursor: request.cursor,
+          limit: request.limit,
+        },
+        this.clientId,
+      );
       this.emit({
         type: "inventory.sessions.response",
         payload: { requestId: request.requestId, ...page },

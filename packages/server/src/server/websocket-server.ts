@@ -32,7 +32,13 @@ import { asUint8Array, decodeBinaryFrame } from "@getpaseo/protocol/binary-frame
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
-import { Session, type SessionLifecycleIntent, type SessionRuntimeMetrics } from "./session.js";
+import {
+  captureInventorySessions,
+  Session,
+  type SessionLifecycleIntent,
+  type SessionRuntimeMetrics,
+} from "./session.js";
+import { InventorySnapshotService } from "./agent/inventory-snapshot-service.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
@@ -506,6 +512,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly daemonRuntimeConfig: DaemonRuntimeConfig | undefined;
   private readonly agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
+  private readonly inventorySnapshots: InventorySnapshotService;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly chatService: FileBackedChatService;
@@ -617,6 +624,9 @@ export class VoiceAssistantWebSocketServer {
     this.hubRelationships = hubRelationships ?? null;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
+    this.inventorySnapshots = new InventorySnapshotService(() =>
+      captureInventorySessions(this.agentManager, this.agentStorage),
+    );
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
     const requiredServices = requireWebSocketServices({
@@ -1325,6 +1335,7 @@ export class VoiceAssistantWebSocketServer {
       worktreesRoot: this.worktreesRoot,
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
+      inventorySnapshots: this.inventorySnapshots,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       chatService: this.chatService,
@@ -1601,6 +1612,8 @@ export class VoiceAssistantWebSocketServer {
         workspaceScriptManagement: true,
         // COMPAT(projectCustomIcon): added in v0.2.0, remove after 2027-01-20.
         projectCustomIcon: true,
+        // COMPAT(inventorySessionsSnapshot): added in v0.2.5, remove after 2027-02-10.
+        inventorySessionsSnapshot: true,
       },
     };
   }

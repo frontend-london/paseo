@@ -37,7 +37,7 @@ export function createInventoryCommand(): Command {
       .description("Read one immutable page of the complete Paseo session inventory")
       .option("--snapshot-id <snapshot_id>", "Snapshot id returned by the preceding page")
       .option("--cursor <cursor>", "Cursor returned by the preceding page")
-      .option("--limit <count>", "Page size (1-200)", Number.parseInt),
+      .option("--limit <count>", "Page size (1-200)", Number),
   ).action(withOutput(runInventorySessionsCommand));
   return inventory;
 }
@@ -46,6 +46,16 @@ export async function runInventorySessionsCommand(
   options: InventorySessionsOptions,
   _command: Command,
 ): Promise<SingleResult<InventoryPageOutput>> {
+  if (
+    options.limit !== undefined &&
+    (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 200)
+  ) {
+    const error: CommandError = {
+      code: "INVALID_INVENTORY_LIMIT",
+      message: "--limit must be an integer between 1 and 200",
+    };
+    throw error;
+  }
   const client = await connectToDaemon({ host: options.host });
   try {
     const page = await client.inventorySessions({

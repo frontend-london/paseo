@@ -1,6 +1,7 @@
-import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
 
@@ -46,6 +47,25 @@ function buildManagedAgentConfig(
     config.featureValues = configOverrides.featureValues;
   }
   return config;
+}
+
+async function registryTreeHash(root: string): Promise<string> {
+  const hash = createHash("sha256");
+  async function visit(directory: string, relative = ""): Promise<void> {
+    const children = await fs.readdir(directory, { withFileTypes: true });
+    for (const child of children.sort((left, right) => (left.name < right.name ? -1 : 1))) {
+      const childRelative = path.join(relative, child.name);
+      const childPath = path.join(directory, child.name);
+      hash.update(`${child.isDirectory() ? "d" : "f"}\u0000${childRelative}\u0000`);
+      if (child.isDirectory()) {
+        await visit(childPath, childRelative);
+      } else {
+        hash.update(await fs.readFile(childPath));
+      }
+    }
+  }
+  await visit(root);
+  return hash.digest("hex");
 }
 
 function buildDefaultCapabilities() {
@@ -142,6 +162,7 @@ describe("AgentStorage", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -566,5 +587,75 @@ describe("AgentStorage", () => {
         { path: expect.any(String), reason: "duplicate_agent_id" },
       ]),
     );
+  });
+
+  test("inventoryState reports an unreadable root but tolerates an absent root", async () => {
+    await fs.writeFile(storagePath, "not a directory", "utf8");
+    const unreadable = new AgentStorage(storagePath, logger);
+    await unreadable.initialize();
+    expect(unreadable.inventoryState().issues).toEqual([
+      { path: storagePath, reason: "unreadable_path" },
+    ]);
+
+    const absent = new AgentStorage(path.join(tmpDir, "does-not-exist"), logger);
+    await absent.initialize();
+    expect(absent.inventoryState()).toEqual({ records: [], issues: [] });
+  });
+
+  test("inventoryState reports an unreadable nested registry path", async () => {
+    const projectDir = path.join(storagePath, "tmp-project");
+    await fs.mkdir(projectDir, { recursive: true });
+    const realReaddir = fs.readdir;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (args[0] === projectDir) {
+        const error = new Error("permission denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realReaddir(...args);
+    });
+
+    await storage.initialize();
+
+    expect(storage.inventoryState().issues).toContainEqual({
+      path: projectDir,
+      reason: "unreadable_path",
+    });
+  });
+
+  test("inventoryState reports an unreadable record without modifying it", async () => {
+    const projectDir = path.join(storagePath, "tmp-project");
+    const recordPath = path.join(projectDir, "unreadable.json");
+    await fs.mkdir(projectDir, { recursive: true });
+    const original = JSON.stringify({ invalid: true });
+    await fs.writeFile(recordPath, original, "utf8");
+    const realReadFile = fs.readFile;
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      if (args[0] === recordPath) {
+        const error = new Error("permission denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realReadFile(...args);
+    });
+
+    await storage.initialize();
+
+    expect(storage.inventoryState().issues).toContainEqual({
+      path: recordPath,
+      reason: "unreadable_path",
+    });
+    vi.restoreAllMocks();
+    expect(await fs.readFile(recordPath, "utf8")).toBe(original);
+  });
+
+  test("inventoryState is read-only and preserves the registry tree hash", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "read-only-agent" }));
+    const before = await registryTreeHash(storagePath);
+
+    await storage.initialize();
+    storage.inventoryState();
+
+    expect(await registryTreeHash(storagePath)).toBe(before);
   });
 });

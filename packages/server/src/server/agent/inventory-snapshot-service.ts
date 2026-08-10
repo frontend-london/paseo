@@ -4,6 +4,7 @@ export const INVENTORY_SCHEMA_VERSION = "paseo.inventory_sessions.v1";
 const DEFAULT_PAGE_LIMIT = 200;
 const MAX_PAGE_LIMIT = 200;
 const DEFAULT_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+export const MAX_SNAPSHOTS_PER_DAEMON = 64;
 
 export interface InventorySessionEntry {
   backend: "paseo";
@@ -13,6 +14,8 @@ export interface InventorySessionEntry {
   archived: boolean;
   archived_at: string | null;
   internal: boolean;
+  /** True only when status_raw came from the live AgentManager map. */
+  live: boolean;
   cwd: string;
   created_at: string;
   updated_at: string;
@@ -31,7 +34,6 @@ export class InventorySnapshotError extends Error {
   constructor(
     readonly code:
       | "invalid_inventory_cursor"
-      | "inventory_cursor_snapshot_mismatch"
       | "inventory_snapshot_expired"
       | "inventory_snapshot_not_found"
       | "inventory_snapshot_conflict",
@@ -59,26 +61,41 @@ export interface InventorySnapshotRequest {
   limit?: number;
 }
 
+export interface InventorySnapshotServiceOptions {
+  now?: () => number;
+  ttlMs?: number;
+  maxSnapshots?: number;
+}
+
 /**
  * A daemon-local, immutable materialization of the Paseo registry inventory.
  *
- * The snapshot id is the SHA-256 of the canonical, fully materialized entry
- * list. A cursor is HMAC-bound and names both that id and an
- * absolute offset, so it cannot be moved to another snapshot or forged into a
- * different position. Snapshot entries are cloned before storage: later
- * lifecycle mutations cannot change a page already belonging to this snapshot.
+ * The snapshot id is SHA-256 over canonical JSON. A cursor is HMAC-bound to
+ * that id and absolute offset. Entries are cloned before storage, and the
+ * bounded LRU cache is shared by all sessions in one daemon when injected by
+ * WebSocketServer.
  */
 export class InventorySnapshotService {
   private readonly snapshots = new Map<string, FrozenInventorySnapshot>();
+  private readonly expiredSnapshots = new Set<string>();
   private readonly cursorSecret = randomBytes(32).toString("base64url");
+  private readonly now: () => number;
+  private readonly ttlMs: number;
+  private readonly maxSnapshots: number;
 
   constructor(
     private readonly captureEntries: () => InventorySessionEntry[],
-    private readonly now: () => number = Date.now,
-    private readonly ttlMs = DEFAULT_SNAPSHOT_TTL_MS,
-  ) {}
+    options: InventorySnapshotServiceOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+    this.ttlMs = options.ttlMs ?? DEFAULT_SNAPSHOT_TTL_MS;
+    this.maxSnapshots = options.maxSnapshots ?? MAX_SNAPSHOTS_PER_DAEMON;
+    if (!Number.isInteger(this.maxSnapshots) || this.maxSnapshots <= 0) {
+      throw new Error("maxSnapshots must be a positive integer");
+    }
+  }
 
-  page(request: InventorySnapshotRequest): InventorySnapshotPage {
+  page(request: InventorySnapshotRequest, clientId: string): InventorySnapshotPage {
     this.removeExpiredSnapshots();
     const limit = this.normalizeLimit(request.limit);
     const hasSnapshotId = request.snapshot_id !== undefined;
@@ -93,7 +110,9 @@ export class InventorySnapshotService {
     if (!hasSnapshotId) {
       const entries = this.freezeAndValidate(this.captureEntries());
       const snapshotId = this.snapshotId(entries);
-      this.snapshots.set(snapshotId, { entries, expiresAt: this.now() + this.ttlMs });
+      if (entries.length > limit) {
+        this.storeSnapshot(snapshotId, clientId, entries);
+      }
       return this.buildPage(snapshotId, entries, 0, limit);
     }
 
@@ -101,19 +120,30 @@ export class InventorySnapshotService {
     const cursor = this.decodeCursor(request.cursor!);
     if (cursor.snapshot_id !== snapshotId) {
       throw new InventorySnapshotError(
-        "inventory_cursor_snapshot_mismatch",
+        "invalid_inventory_cursor",
         "inventory cursor belongs to a different snapshot_id",
       );
     }
-    const snapshot = this.snapshots.get(snapshotId);
+
+    const snapshotKey = this.snapshotKey(snapshotId, clientId);
+    const snapshot = this.snapshots.get(snapshotKey);
     if (!snapshot) {
+      if (this.expiredSnapshots.has(snapshotKey)) {
+        throw new InventorySnapshotError(
+          "inventory_snapshot_expired",
+          "inventory snapshot has expired",
+        );
+      }
       throw new InventorySnapshotError(
-        "inventory_snapshot_expired",
-        "inventory snapshot has expired or is unknown",
+        "inventory_snapshot_not_found",
+        "inventory snapshot is unknown, evicted, or owned by another client",
       );
     }
+    if (cursor.proof !== this.cursorProof(cursor.snapshot_id, cursor.offset)) {
+      throw new InventorySnapshotError("invalid_inventory_cursor", "inventory cursor is invalid");
+    }
     if (snapshot.expiresAt <= this.now()) {
-      this.snapshots.delete(snapshotId);
+      this.expireSnapshot(snapshotKey);
       throw new InventorySnapshotError(
         "inventory_snapshot_expired",
         "inventory snapshot has expired",
@@ -125,6 +155,7 @@ export class InventorySnapshotService {
         "inventory cursor offset is invalid",
       );
     }
+    this.touchSnapshot(snapshotKey, snapshot);
     return this.buildPage(snapshotId, snapshot.entries, cursor.offset, limit);
   }
 
@@ -159,9 +190,7 @@ export class InventorySnapshotService {
 
   private freezeAndValidate(entries: InventorySessionEntry[]): InventorySessionEntry[] {
     const byIdentity = new Set<string>();
-    const frozen = entries
-      .map((entry) => structuredClone(entry))
-      .sort((left, right) => left.native_id.localeCompare(right.native_id));
+    const frozen = entries.map((entry) => structuredClone(entry)).sort(compareInventoryIdentity);
     for (const entry of frozen) {
       if (
         !entry.native_id ||
@@ -188,8 +217,33 @@ export class InventorySnapshotService {
   }
 
   private snapshotId(entries: InventorySessionEntry[]): string {
-    const canonical = JSON.stringify({ schema_version: INVENTORY_SCHEMA_VERSION, entries });
+    const canonical = canonicalStringify({ schema_version: INVENTORY_SCHEMA_VERSION, entries });
     return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+  }
+
+  private storeSnapshot(
+    snapshotId: string,
+    clientId: string,
+    entries: InventorySessionEntry[],
+  ): void {
+    const key = this.snapshotKey(snapshotId, clientId);
+    this.snapshots.delete(key);
+    this.expiredSnapshots.delete(key);
+    while (this.snapshots.size >= this.maxSnapshots) {
+      const oldest = this.snapshots.keys().next().value;
+      if (oldest === undefined) break;
+      this.snapshots.delete(oldest);
+    }
+    this.snapshots.set(key, { entries, expiresAt: this.now() + this.ttlMs });
+  }
+
+  private touchSnapshot(key: string, snapshot: FrozenInventorySnapshot): void {
+    this.snapshots.delete(key);
+    this.snapshots.set(key, snapshot);
+  }
+
+  private snapshotKey(snapshotId: string, clientId: string): string {
+    return `${clientId}\u0000${snapshotId}`;
   }
 
   private encodeCursor(snapshotId: string, offset: number): string {
@@ -211,11 +265,7 @@ export class InventorySnapshotService {
       ) {
         throw new Error("invalid shape");
       }
-      const payload = parsed as CursorPayload;
-      if (payload.proof !== this.cursorProof(payload.snapshot_id, payload.offset)) {
-        throw new Error("invalid proof");
-      }
-      return payload;
+      return parsed as CursorPayload;
     } catch {
       throw new InventorySnapshotError("invalid_inventory_cursor", "inventory cursor is invalid");
     }
@@ -229,10 +279,59 @@ export class InventorySnapshotService {
 
   private removeExpiredSnapshots(): void {
     const now = this.now();
-    for (const [snapshotId, snapshot] of this.snapshots) {
+    for (const [snapshotKey, snapshot] of this.snapshots) {
       if (snapshot.expiresAt <= now) {
-        this.snapshots.delete(snapshotId);
+        this.expireSnapshot(snapshotKey);
       }
     }
   }
+
+  private expireSnapshot(snapshotKey: string): void {
+    this.snapshots.delete(snapshotKey);
+    this.expiredSnapshots.delete(snapshotKey);
+    this.expiredSnapshots.add(snapshotKey);
+    while (this.expiredSnapshots.size > this.maxSnapshots) {
+      const oldest = this.expiredSnapshots.values().next().value;
+      if (oldest === undefined) break;
+      this.expiredSnapshots.delete(oldest);
+    }
+  }
+}
+
+function compareInventoryIdentity(
+  left: InventorySessionEntry,
+  right: InventorySessionEntry,
+): number {
+  const backendOrder = compareCodeUnits(left.backend, right.backend);
+  if (backendOrder !== 0) return backendOrder;
+  const nativeIdOrder = compareCodeUnits(left.native_id, right.native_id);
+  if (nativeIdOrder !== 0) return nativeIdOrder;
+  return 0;
+}
+
+function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new InventorySnapshotError("inventory_snapshot_conflict", "non-finite inventory value");
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalStringify).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort(compareCodeUnits);
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalStringify(record[key])}`).join(",")}}`;
+  }
+  throw new InventorySnapshotError("inventory_snapshot_conflict", "unsupported inventory value");
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
