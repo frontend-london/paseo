@@ -883,6 +883,16 @@ export class AgentManager {
       .map((agent) => Object.assign({}, agent));
   }
 
+  /**
+   * Canonical daemon state for the read-only inventory capability. Unlike the
+   * UI list, it deliberately includes internal agents: scope decisions belong
+   * to the inventory consumer and must never be hidden by a presentation
+   * filter.
+   */
+  listAgentsForInventory(): ManagedAgent[] {
+    return Array.from(this.agents.values()).map((agent) => Object.assign({}, agent));
+  }
+
   async listImportableSessions(
     options?: ImportablePersistedAgentQueryOptions,
   ): Promise<ManagedImportableProviderSession[]> {
