@@ -3281,6 +3281,8 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceScriptManagement: z.boolean().optional(),
         // COMPAT(projectCustomIcon): added in v0.2.0, remove after 2027-01-20.
         projectCustomIcon: z.boolean().optional(),
+        // COMPAT(inventorySessionsSnapshot): added in v0.2.5, remove after 2027-02-10.
+        inventorySessionsSnapshot: z.boolean().optional(),
         // COMPAT(fsEntryOps): added in v0.3.0, remove gate after 2027-02-08.
         fsEntryOps: z.boolean().optional(),
         // COMPAT(fsEntryDuplicate): added in v0.3.0, remove gate after 2027-02-09.
@@ -3721,6 +3723,7 @@ const InventorySessionEntrySchema = z.object({
   archived: z.boolean(),
   archived_at: z.string().nullable(),
   internal: z.boolean(),
+  live: z.boolean(),
   cwd: z.string(),
   created_at: z.string(),
   updated_at: z.string(),

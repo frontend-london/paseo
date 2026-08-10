@@ -18,11 +18,12 @@ import {
   FileTransferOpcode,
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
-import { isSessionRpcAllowed, Session } from "./session.js";
+import { captureInventorySessions, isSessionRpcAllowed, Session } from "./session.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
+import { InventorySnapshotService } from "./agent/inventory-snapshot-service.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
-import type { StoredAgentRecord } from "./agent/agent-storage.js";
-import type { AgentManagerEvent } from "./agent/agent-manager.js";
+import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import type { AgentManager, AgentManagerEvent } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { createPersistedProjectRecord } from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
@@ -280,9 +281,11 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 });
 
 interface SessionForTestOptions {
+  clientId?: string;
   scopes?: readonly string[];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
   agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
+  inventorySnapshots?: SessionOptions["inventorySnapshots"];
   github?: Partial<ForgeService & GitHubService>;
   checkoutDiffManager?: { scheduleRefreshForCwd: ReturnType<typeof vi.fn> };
   workspaceGitService?: {
@@ -356,7 +359,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   const messages = options.messages ?? [];
 
   const sessionOptions: SessionOptions = {
-    clientId: "test-client",
+    clientId: options.clientId ?? "test-client",
     onMessage: (message) => messages.push(message),
     ...(options.targetedMessages
       ? {
@@ -380,6 +383,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       list: vi.fn().mockResolvedValue([]),
       ...options.agentStorage,
     }),
+    inventorySnapshots: options.inventorySnapshots,
     projectRegistry: {
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn(),
@@ -489,6 +493,207 @@ test("routes plugin management requests and catalog notifications", async () => 
   });
   await session.cleanup();
   expect(listeners.size).toBe(0);
+});
+
+test("inventory capture marks live lifecycle and persisted lastStatus provenance explicitly", () => {
+  const storedRecords = [
+    {
+      id: "persisted-only",
+      provider: "claude",
+      lastStatus: "running",
+      archivedAt: null,
+      internal: false,
+      cwd: "/tmp/persisted",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+      persistence: { sessionId: "persisted-provider-session" },
+    },
+    {
+      id: "live-and-persisted",
+      provider: "claude",
+      lastStatus: "closed",
+      archivedAt: null,
+      internal: false,
+      cwd: "/tmp/persisted-live",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+      persistence: { sessionId: "persisted-live-provider-session" },
+    },
+  ] as unknown as StoredAgentRecord[];
+  let liveAgents = [
+    {
+      id: "live-and-persisted",
+      provider: "claude",
+      lifecycle: "running",
+      internal: false,
+      cwd: "/tmp/live",
+      createdAt: new Date("2026-08-10T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-10T00:01:00.000Z"),
+      persistence: { sessionId: "live-provider-session" },
+    },
+  ];
+  const agentManager = {
+    listAgentsForInventory: () => liveAgents,
+  } as unknown as AgentManager;
+  const agentStorage = {
+    inventoryState: () => ({ records: storedRecords, issues: [] }),
+  } as unknown as AgentStorage;
+
+  const first = captureInventorySessions(agentManager, agentStorage);
+  expect(first).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        native_id: "persisted-only",
+        status_raw: "running",
+        live: false,
+      }),
+      expect.objectContaining({
+        native_id: "live-and-persisted",
+        status_raw: "running",
+        live: true,
+        cwd: "/tmp/live",
+        persistence_session_id: "live-provider-session",
+      }),
+    ]),
+  );
+
+  const snapshots = new InventorySnapshotService(() =>
+    captureInventorySessions(agentManager, agentStorage),
+  );
+  const liveSnapshot = snapshots.page({}, "client-a").snapshot_id;
+  liveAgents = [];
+  const persistedSnapshot = snapshots.page({}, "client-a").snapshot_id;
+  expect(persistedSnapshot).not.toBe(liveSnapshot);
+  expect(snapshots.page({}, "client-a").entries).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        native_id: "live-and-persisted",
+        status_raw: "closed",
+        live: false,
+      }),
+    ]),
+  );
+});
+
+test("a daemon-shared inventory service survives a session reconnect for the same client", async () => {
+  const snapshots = new InventorySnapshotService(() => [
+    {
+      backend: "paseo" as const,
+      native_id: "agent-1",
+      provider: "claude",
+      status_raw: "idle",
+      archived: false,
+      archived_at: null,
+      internal: false,
+      live: true,
+      cwd: "/tmp/agent-1",
+      created_at: "2026-08-10T00:00:00.000Z",
+      updated_at: "2026-08-10T00:00:00.000Z",
+      persistence_session_id: null,
+    },
+    {
+      backend: "paseo" as const,
+      native_id: "agent-2",
+      provider: "claude",
+      status_raw: "idle",
+      archived: false,
+      archived_at: null,
+      internal: false,
+      live: true,
+      cwd: "/tmp/agent-2",
+      created_at: "2026-08-10T00:00:00.000Z",
+      updated_at: "2026-08-10T00:00:00.000Z",
+      persistence_session_id: null,
+    },
+  ]);
+  const firstMessages: SessionOutboundMessage[] = [];
+  const firstSession = createSessionForTest({
+    clientId: "reconnecting-client",
+    inventorySnapshots: snapshots,
+    messages: firstMessages,
+  });
+  await firstSession.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "page-1",
+    limit: 1,
+  });
+  const firstResponse = firstMessages.find(
+    (
+      message,
+    ): message is Extract<SessionOutboundMessage, { type: "inventory.sessions.response" }> =>
+      message.type === "inventory.sessions.response",
+  );
+  expect(firstResponse?.payload.next_cursor).toEqual(expect.any(String));
+
+  const secondMessages: SessionOutboundMessage[] = [];
+  const reconnectedSession = createSessionForTest({
+    clientId: "reconnecting-client",
+    inventorySnapshots: snapshots,
+    messages: secondMessages,
+  });
+  await reconnectedSession.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "page-2",
+    snapshot_id: firstResponse!.payload.snapshot_id,
+    cursor: firstResponse!.payload.next_cursor!,
+    limit: 1,
+  });
+  expect(secondMessages).toContainEqual(
+    expect.objectContaining({
+      type: "inventory.sessions.response",
+      payload: expect.objectContaining({
+        has_more: false,
+        snapshot_id: firstResponse!.payload.snapshot_id,
+      }),
+    }),
+  );
+
+  const foreignMessages: SessionOutboundMessage[] = [];
+  const foreignSession = createSessionForTest({
+    clientId: "different-client",
+    inventorySnapshots: snapshots,
+    messages: foreignMessages,
+  });
+  await foreignSession.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "foreign-page-2",
+    snapshot_id: firstResponse!.payload.snapshot_id,
+    cursor: firstResponse!.payload.next_cursor!,
+    limit: 1,
+  });
+  expect(foreignMessages).toContainEqual(
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ code: "inventory_snapshot_not_found" }),
+    }),
+  );
+});
+
+test("inventory RPC fails closed before creating a snapshot for an unreadable registry path", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    agentManager: { listAgentsForInventory: vi.fn(() => []) },
+    agentStorage: {
+      inventoryState: vi.fn(() => ({
+        records: [],
+        issues: [{ path: "/tmp/paseo-home/agents/project", reason: "unreadable_path" }],
+      })),
+    },
+  });
+
+  await session.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "unreadable-registry",
+    limit: 1,
+  });
+
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ code: "inventory_malformed_state" }),
+    }),
+  ]);
 });
 
 describe("session authorization scopes", () => {

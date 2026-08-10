@@ -96,7 +96,7 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
 
 export interface InventoryRegistryIssue {
   path: string;
-  reason: "malformed_record" | "duplicate_agent_id";
+  reason: "malformed_record" | "duplicate_agent_id" | "unreadable_path";
 }
 
 export class AgentStorage {
@@ -332,6 +332,7 @@ export class AgentStorage {
         return [];
       }
       this.logger.error({ err: error }, "Failed to load agents");
+      this.inventoryIssues.push({ path: this.baseDir, reason: "unreadable_path" });
       this.loaded = true;
       return [];
     }
@@ -364,7 +365,12 @@ export class AgentStorage {
           return files
             .filter((file) => file.isFile() && file.name.endsWith(".json"))
             .map((file) => path.join(projectDir, file.name));
-        } catch {
+        } catch (error) {
+          // The directory was observed in the root listing. Even ENOENT now
+          // means a record could have vanished during this scan, so inventory
+          // must fail closed rather than assert completeness over a subset.
+          this.logger.error({ err: error, projectDir }, "Failed to scan agent registry directory");
+          this.inventoryIssues.push({ path: projectDir, reason: "unreadable_path" });
           return [];
         }
       }),
@@ -403,8 +409,18 @@ export class AgentStorage {
   }
 
   private async readRecordFile(filePath: string): Promise<StoredAgentRecord | null> {
+    let content: string;
     try {
-      const content = await fs.readFile(filePath, "utf8");
+      content = await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      // This file was observed in a directory listing. Its disappearance is
+      // not equivalent to an absent registry root: it may hide one inventory
+      // identity, so preserve legacy list behavior but fail inventory closed.
+      this.logger.error({ err: error, filePath }, "Failed to read agent record");
+      this.inventoryIssues.push({ path: filePath, reason: "unreadable_path" });
+      return null;
+    }
+    try {
       const parsed = JSON.parse(content);
       return parseStoredAgentRecord(parsed);
     } catch (error) {

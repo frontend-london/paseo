@@ -2048,9 +2048,11 @@ export class DaemonClient {
     const message = SessionInboundMessageSchema.parse({
       type: "inventory.sessions.request",
       requestId: resolvedRequestId,
-      ...(options?.snapshot_id ? { snapshot_id: options.snapshot_id } : {}),
-      ...(options?.cursor ? { cursor: options.cursor } : {}),
-      ...(options?.limit ? { limit: options.limit } : {}),
+      ...(options && Object.hasOwn(options, "snapshot_id")
+        ? { snapshot_id: options.snapshot_id }
+        : {}),
+      ...(options && Object.hasOwn(options, "cursor") ? { cursor: options.cursor } : {}),
+      ...(options && Object.hasOwn(options, "limit") ? { limit: options.limit } : {}),
     });
     return this.sendRequest({
       requestId: resolvedRequestId,
