@@ -1973,6 +1973,16 @@ class ClaudeAgentSession implements AgentSession {
   private claudeSessionId: string | null;
   private persistence: AgentPersistenceHandle | null;
   private currentMode: PermissionMode;
+  // The permission mode the active query was actually launched with. Paseo — not
+  // the SDK's persisted session state — is the source of truth for the user's
+  // permission intent. On resume (after an interrupt/teardown/background-task
+  // stop) Claude Code emits a system/init whose permissionMode reflects the
+  // *persisted* mode (often "default"), not the mode we launched with. Adopting
+  // that echo would silently downgrade an explicit bypassPermissions selection,
+  // resurrecting canUseTool prompts that then resolve to a synthetic deny even
+  // though the user never rejected anything. We remember what we launched with so
+  // handleSystemMessage can refuse a downgrade and re-assert the user's mode.
+  private launchedMode: PermissionMode | null = null;
   private planResumeMode: PermissionMode | null = null;
   private availableModes: AgentMode[] = DEFAULT_MODES;
   private toolUseCache = new Map<string, ToolUseCacheEntry>();
@@ -2911,6 +2921,12 @@ class ClaudeAgentSession implements AgentSession {
 
     const input = createAsyncMessageInput<SDKUserMessage>();
     const options = await this.buildOptions();
+    // Record the mode this query is actually launching with so a stale system/init
+    // echo (e.g. a persisted "default" replayed by --resume) cannot silently
+    // downgrade the user's selection in handleSystemMessage.
+    this.launchedMode = isPermissionMode(options.permissionMode)
+      ? options.permissionMode
+      : this.currentMode;
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
     this.query = claudeQuery(
@@ -4101,10 +4117,7 @@ class ClaudeAgentSession implements AgentSession {
       notice = this.createClaudeSessionChangedNotice(existingSessionId, newSessionId);
     }
     this.availableModes = DEFAULT_MODES;
-    this.currentMode = message.permissionMode;
-    if (this.currentMode !== "plan") {
-      this.planResumeMode = this.currentMode;
-    }
+    this.adoptInitPermissionMode(message.permissionMode);
     this.persistence = null;
     if (message.model) {
       const normalizedRuntimeModel = normalizeClaudeRuntimeModelId(message.model);
@@ -4121,6 +4134,62 @@ class ClaudeAgentSession implements AgentSession {
       this.cachedRuntimeInfo = null;
     }
     return { threadStartedSessionId, notice };
+  }
+
+  /**
+   * Reconcile the permission mode reported by a system/init message against the
+   * mode Paseo actually launched the query with.
+   *
+   * Claude Code echoes a permissionMode on every init. On a fresh launch this
+   * matches what we passed. On a --resume (which happens after an interrupt,
+   * teardown, or a background-task stop that recreated the query) the echo can
+   * instead reflect the *persisted* session mode — typically "default" — even
+   * though we launched with the user's selection (e.g. "bypassPermissions").
+   *
+   * Blindly adopting that echo silently downgrades the user's mode. The next
+   * tool then goes through canUseTool and, with no interactive client to answer,
+   * resolves to a synthetic { behavior: "deny" }, which the SDK renders as
+   * "The user doesn't want to proceed with this tool use" — a false rejection
+   * the user never made. To preserve the invariant that only an explicit user
+   * action can produce a rejection, we never let init downgrade the launched
+   * mode: we keep it and re-assert it onto the live query so the SDK and Paseo
+   * agree again.
+   */
+  private adoptInitPermissionMode(reportedMode: PermissionMode): void {
+    const launchedMode = this.launchedMode;
+    const isDowngradeFromLaunch =
+      launchedMode !== null && launchedMode !== "plan" && reportedMode !== launchedMode;
+
+    if (isDowngradeFromLaunch) {
+      this.logger.warn(
+        { launchedMode, reportedMode },
+        "Claude init reported a permission mode that differs from the launched mode; " +
+          "keeping the launched mode and re-asserting it (stale --resume echo).",
+      );
+      // launchedMode is narrowed to exclude "plan" by isDowngradeFromLaunch, so
+      // it is always a valid planResumeMode.
+      this.currentMode = launchedMode;
+      this.planResumeMode = launchedMode;
+      // Best-effort: bring the SDK's live permission mode back in line with the
+      // user's selection. Failures here are non-fatal — currentMode already
+      // holds the authoritative value and every subsequent query relaunch is
+      // built from it.
+      const query = this.query;
+      if (query) {
+        void query.setPermissionMode(launchedMode).catch((error) => {
+          this.logger.warn(
+            { err: error, launchedMode },
+            "Failed to re-assert launched permission mode after stale init echo",
+          );
+        });
+      }
+      return;
+    }
+
+    this.currentMode = reportedMode;
+    if (this.currentMode !== "plan") {
+      this.planResumeMode = this.currentMode;
+    }
   }
 
   private readMissingResumedConversationError(message: SDKMessage): string | null {
