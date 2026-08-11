@@ -3707,3 +3707,151 @@ describe("ACP session/load invariant — cwd and mcpServers always passed", () =
     });
   });
 });
+
+describe("ACP runtime-originated cancellation vs client-initiated cancellation", () => {
+  test("runtime-originated stopReason 'cancelled' emits turn_completed, not turn_canceled", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    let resolvePrompt!: (value: PromptResponse) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    session.subscribe((event) => {
+      events.push(event);
+    });
+
+    await session.startTurn("run long shell command");
+
+    resolvePrompt({ stopReason: "cancelled" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const turnCanceled = events.find((e) => e.type === "turn_canceled");
+    const turnCompleted = events.find((e) => e.type === "turn_completed");
+    expect(turnCanceled).toBeUndefined();
+    expect(turnCompleted).toBeDefined();
+  });
+
+  test("client-initiated interrupt emits turn_canceled when stopReason is 'cancelled'", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    let resolvePrompt!: (value: PromptResponse) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    const cancel = vi.fn(async () => {});
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    session.subscribe((event) => {
+      events.push(event);
+    });
+
+    await session.startTurn("hello");
+    await session.interrupt();
+
+    resolvePrompt({ stopReason: "cancelled" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const turnCanceled = events.find((e) => e.type === "turn_canceled");
+    expect(turnCanceled).toBeDefined();
+    expect(turnCanceled).toMatchObject({
+      type: "turn_canceled",
+      reason: "Interrupted",
+    });
+  });
+
+  test("cancelRequestedByClient flag is reset on each new turn", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    let resolvePrompt!: (value: PromptResponse) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    const cancel = vi.fn(async () => {});
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    session.subscribe((event) => {
+      events.push(event);
+    });
+
+    await session.startTurn("first turn");
+    await session.interrupt();
+    resolvePrompt({ stopReason: "cancelled" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    events.length = 0;
+
+    await session.startTurn("second turn — runtime self-cancel");
+    resolvePrompt({ stopReason: "cancelled" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const turnCanceled = events.find((e) => e.type === "turn_canceled");
+    const turnCompleted = events.find((e) => e.type === "turn_completed");
+    expect(turnCanceled).toBeUndefined();
+    expect(turnCompleted).toBeDefined();
+  });
+
+  test("runtime-originated cancellation does not synthesize canceled tool calls", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    let resolvePrompt!: (value: PromptResponse) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    session.subscribe((event) => {
+      events.push(event);
+    });
+
+    await session.startTurn("run shell");
+
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      sessionId: "session-1",
+      toolCallId: "tool-1",
+      title: "Shell: npm run test",
+      kind: "shell",
+      status: "in_progress",
+    });
+
+    resolvePrompt({ stopReason: "cancelled" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const canceledToolCalls = events.filter(
+      (e) =>
+        e.type === "timeline" &&
+        "item" in e &&
+        (e as { item: { type: string; status?: string } }).item.type === "tool_call" &&
+        (e as { item: { type: string; status?: string } }).item.status === "canceled",
+    );
+    expect(canceledToolCalls).toHaveLength(0);
+  });
+});
