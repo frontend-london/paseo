@@ -704,4 +704,189 @@ describe("AgentStorage", () => {
 
     expect(await registryTreeHash(storagePath)).toBe(before);
   });
+
+  test.skipIf(process.platform === "win32")(
+    "inventoryState fails closed on a root-level symlink to a JSON record",
+    async () => {
+      await fs.mkdir(storagePath, { recursive: true });
+      const targetRecord = {
+        id: "symlinked-root-agent",
+        provider: "claude",
+        cwd: "/tmp/project",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        updatedAt: "2025-01-01T00:00:00.000Z",
+      };
+      const targetPath = path.join(tmpDir, "symlink-target.json");
+      await fs.writeFile(targetPath, JSON.stringify(targetRecord), "utf8");
+      const linkPath = path.join(storagePath, "root-link.json");
+      await fs.symlink(targetPath, linkPath);
+
+      const reloaded = new AgentStorage(storagePath, logger);
+      await reloaded.initialize();
+
+      expect(reloaded.inventoryState().records).toHaveLength(0);
+      expect(reloaded.inventoryState().issues).toContainEqual({
+        path: linkPath,
+        reason: "unreadable_path",
+      });
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "inventoryState fails closed on a symlinked project directory",
+    async () => {
+      await fs.mkdir(storagePath, { recursive: true });
+      const realProjectDir = path.join(tmpDir, "real-project");
+      await fs.mkdir(realProjectDir, { recursive: true });
+      await fs.writeFile(
+        path.join(realProjectDir, "agent-1.json"),
+        JSON.stringify({
+          id: "agent-in-symlinked-dir",
+          provider: "claude",
+          cwd: "/tmp/project",
+          createdAt: "2025-01-01T00:00:00.000Z",
+          updatedAt: "2025-01-01T00:00:00.000Z",
+        }),
+        "utf8",
+      );
+      const linkPath = path.join(storagePath, "project-link");
+      await fs.symlink(realProjectDir, linkPath, "dir");
+
+      const reloaded = new AgentStorage(storagePath, logger);
+      await reloaded.initialize();
+
+      expect(reloaded.inventoryState().records).toHaveLength(0);
+      expect(reloaded.inventoryState().issues).toContainEqual({
+        path: linkPath,
+        reason: "unreadable_path",
+      });
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "inventoryState fails closed on a symlink inside a project directory",
+    async () => {
+      const projectDir = path.join(storagePath, "tmp-project");
+      await fs.mkdir(projectDir, { recursive: true });
+      const targetPath = path.join(tmpDir, "outside.json");
+      await fs.writeFile(
+        targetPath,
+        JSON.stringify({
+          id: "symlinked-inside-agent",
+          provider: "claude",
+          cwd: "/tmp/project",
+          createdAt: "2025-01-01T00:00:00.000Z",
+          updatedAt: "2025-01-01T00:00:00.000Z",
+        }),
+        "utf8",
+      );
+      const linkPath = path.join(projectDir, "agent-link.json");
+      await fs.symlink(targetPath, linkPath);
+
+      const reloaded = new AgentStorage(storagePath, logger);
+      await reloaded.initialize();
+
+      expect(reloaded.inventoryState().records).toHaveLength(0);
+      expect(reloaded.inventoryState().issues).toContainEqual({
+        path: linkPath,
+        reason: "unreadable_path",
+      });
+    },
+  );
+
+  test("inventoryState fails closed on a nested directory inside a project directory", async () => {
+    const projectDir = path.join(storagePath, "tmp-project");
+    const nestedDir = path.join(projectDir, "nested");
+    await fs.mkdir(nestedDir, { recursive: true });
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await reloaded.initialize();
+
+    expect(reloaded.inventoryState().records).toHaveLength(0);
+    expect(reloaded.inventoryState().issues).toContainEqual({
+      path: nestedDir,
+      reason: "unreadable_path",
+    });
+  });
+
+  test("inventoryState reports unexpected regular files", async () => {
+    const projectDir = path.join(storagePath, "tmp-project");
+    await fs.mkdir(projectDir, { recursive: true });
+    const rootUnexpected = path.join(storagePath, "notes.txt");
+    const projectUnexpected = path.join(projectDir, "notes.txt");
+    await fs.writeFile(rootUnexpected, "not a record", "utf8");
+    await fs.writeFile(projectUnexpected, "not a record", "utf8");
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await reloaded.initialize();
+
+    expect(reloaded.inventoryState().records).toHaveLength(0);
+    expect(reloaded.inventoryState().issues).toContainEqual({
+      path: rootUnexpected,
+      reason: "unreadable_path",
+    });
+    expect(reloaded.inventoryState().issues).toContainEqual({
+      path: projectUnexpected,
+      reason: "unreadable_path",
+    });
+  });
+
+  test("inventoryState loads root-level and project JSON records", async () => {
+    await fs.mkdir(storagePath, { recursive: true });
+    const rootRecord = {
+      id: "root-agent",
+      provider: "claude",
+      cwd: "/tmp/project-a",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      updatedAt: "2025-01-01T00:00:00.000Z",
+    };
+    await fs.writeFile(
+      path.join(storagePath, "root-agent.json"),
+      JSON.stringify(rootRecord),
+      "utf8",
+    );
+
+    const projectDir = path.join(storagePath, "tmp-project-b");
+    await fs.mkdir(projectDir, { recursive: true });
+    const projectRecord = {
+      id: "project-agent",
+      provider: "codex",
+      cwd: "/tmp/project-b",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      updatedAt: "2025-01-01T00:00:00.000Z",
+    };
+    await fs.writeFile(
+      path.join(projectDir, "project-agent.json"),
+      JSON.stringify(projectRecord),
+      "utf8",
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await reloaded.initialize();
+
+    const ids = reloaded
+      .inventoryState()
+      .records.map((record) => record.id)
+      .sort();
+    expect(ids).toEqual(["project-agent", "root-agent"]);
+    expect(reloaded.inventoryState().issues).toEqual([]);
+  });
+
+  test("list still returns valid records when the registry contains anomalies", async () => {
+    const projectDir = path.join(storagePath, "tmp-project");
+    await fs.mkdir(projectDir, { recursive: true });
+    await storage.applySnapshot(createManagedAgent({ id: "valid-agent", cwd: "/tmp/project" }));
+    const extraPath = path.join(projectDir, "extra.txt");
+    await fs.writeFile(extraPath, "not a record", "utf8");
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const records = await reloaded.list();
+    expect(records.map((record) => record.id)).toContain("valid-agent");
+
+    const state = reloaded.inventoryState();
+    expect(state.issues).toContainEqual({
+      path: extraPath,
+      reason: "unreadable_path",
+    });
+  });
 });
