@@ -303,6 +303,37 @@ export class AgentStorage {
     }
   }
 
+  private classifyDirent(
+    entry: Dirent,
+    entryPath: string,
+    context: "root" | "project",
+  ): "directory" | "record" | "rejected" {
+    if (entry.isSymbolicLink()) {
+      this.logger.warn({ path: entryPath, context }, "Symbolic link in agent registry");
+      this.inventoryIssues.push({ path: entryPath, reason: "unreadable_path" });
+      return "rejected";
+    }
+    if (entry.isDirectory()) {
+      if (context === "project") {
+        this.logger.warn({ path: entryPath }, "Nested directory in agent project directory");
+        this.inventoryIssues.push({ path: entryPath, reason: "unreadable_path" });
+        return "rejected";
+      }
+      return "directory";
+    }
+    if (entry.isFile()) {
+      if (entry.name.endsWith(".json")) {
+        return "record";
+      }
+      this.logger.warn({ path: entryPath, context }, "Unexpected file in agent registry");
+      this.inventoryIssues.push({ path: entryPath, reason: "unreadable_path" });
+      return "rejected";
+    }
+    this.logger.warn({ path: entryPath, context }, "Unexpected entry in agent registry");
+    this.inventoryIssues.push({ path: entryPath, reason: "unreadable_path" });
+    return "rejected";
+  }
+
   private async scanDisk(): Promise<StoredAgentRecord[]> {
     const records: StoredAgentRecord[] = [];
     let entries: Dirent[] = [];
@@ -315,21 +346,32 @@ export class AgentStorage {
       throw error;
     }
 
-    const rootRecordPaths = entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .map((entry) => path.join(this.baseDir, entry.name));
+    const rootRecordPaths: string[] = [];
+    const projectDirs: string[] = [];
 
-    const projectDirs = entries
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(this.baseDir, entry.name));
+    for (const entry of entries) {
+      const entryPath = path.join(this.baseDir, entry.name);
+      const kind = this.classifyDirent(entry, entryPath, "root");
+      if (kind === "directory") {
+        projectDirs.push(entryPath);
+      } else if (kind === "record") {
+        rootRecordPaths.push(entryPath);
+      }
+    }
 
     const projectFileLists = await Promise.all(
       projectDirs.map(async (projectDir) => {
         try {
           const files = await fs.readdir(projectDir, { withFileTypes: true });
-          return files
-            .filter((file) => file.isFile() && file.name.endsWith(".json"))
-            .map((file) => path.join(projectDir, file.name));
+          const projectRecordPaths: string[] = [];
+          for (const file of files) {
+            const filePath = path.join(projectDir, file.name);
+            const kind = this.classifyDirent(file, filePath, "project");
+            if (kind === "record") {
+              projectRecordPaths.push(filePath);
+            }
+          }
+          return projectRecordPaths;
         } catch (error) {
           // The directory was observed in the root listing. Even ENOENT now
           // means a record could have vanished during this scan, so inventory
