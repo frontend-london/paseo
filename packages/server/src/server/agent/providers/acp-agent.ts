@@ -2838,9 +2838,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
           });
         } else {
           this.finishTurn({
-            type: "turn_completed",
+            type: "turn_failed",
             provider: this.provider,
-            usage: this.currentTurnUsage,
+            error: "ACP runtime canceled the turn",
+            code: "runtime_cancelled",
             turnId,
           });
         }

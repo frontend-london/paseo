@@ -87,6 +87,7 @@ describe("buildACPClientCapabilities", () => {
 interface ACPSessionInternals {
   sessionId: string | null;
   connection: { prompt: (...args: unknown[]) => Promise<PromptResponse> };
+  agentCapabilities: { sessionCapabilities?: { close?: unknown } } | null;
   activeForegroundTurnId: string | null;
   configOptions: SessionConfigOption[];
   translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
@@ -3135,6 +3136,37 @@ describe("ACPAgentSession", () => {
     expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
   });
 
+  test("transport disconnect/reconnect boundary is a technical failure, not user interrupt", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    let rejectPrompt!: (error: Error) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((_, reject) => {
+          rejectPrompt = reject;
+        }),
+    );
+
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "session-before-disconnect";
+    internals.connection = { prompt };
+    session.subscribe((event) => events.push(event));
+
+    await session.startTurn("wait for shell output");
+    rejectPrompt(new Error("ACP transport disconnected; reconnect required"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "ACP transport disconnected; reconnect required",
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("user interrupt");
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
+  });
+
   test("flushes an image-only provider echo before a rejected turn finishes", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
@@ -3776,7 +3808,7 @@ describe("ACP session/load invariant — cwd and mcpServers always passed", () =
 });
 
 describe("ACP runtime-originated cancellation vs client-initiated cancellation", () => {
-  test("runtime-originated stopReason 'cancelled' emits turn_completed, not turn_canceled", async () => {
+  test("runtime-originated stopReason 'cancelled' emits a technical failure, not user cancellation", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
     let resolvePrompt!: (value: PromptResponse) => void;
@@ -3800,10 +3832,15 @@ describe("ACP runtime-originated cancellation vs client-initiated cancellation",
     await Promise.resolve();
     await Promise.resolve();
 
-    const turnCanceled = events.find((e) => e.type === "turn_canceled");
-    const turnCompleted = events.find((e) => e.type === "turn_completed");
-    expect(turnCanceled).toBeUndefined();
-    expect(turnCompleted).toBeDefined();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_failed",
+        error: "ACP runtime canceled the turn",
+        code: "runtime_cancelled",
+      }),
+    );
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
   });
 
   test("client-initiated interrupt emits turn_canceled when stopReason is 'cancelled'", async () => {
@@ -3872,10 +3909,10 @@ describe("ACP runtime-originated cancellation vs client-initiated cancellation",
     await Promise.resolve();
     await Promise.resolve();
 
-    const turnCanceled = events.find((e) => e.type === "turn_canceled");
-    const turnCompleted = events.find((e) => e.type === "turn_completed");
-    expect(turnCanceled).toBeUndefined();
-    expect(turnCompleted).toBeDefined();
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "turn_failed", code: "runtime_cancelled" }),
+    );
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
   });
 
   test("runtime-originated cancellation does not synthesize canceled tool calls", async () => {
@@ -3898,14 +3935,15 @@ describe("ACP runtime-originated cancellation vs client-initiated cancellation",
 
     await session.startTurn("run shell");
 
-    const internals = asInternals<ACPSessionInternals>(session);
-    internals.translateSessionUpdate({
-      sessionUpdate: "tool_call",
+    await session.sessionUpdate({
       sessionId: "session-1",
-      toolCallId: "tool-1",
-      title: "Shell: npm run test",
-      kind: "shell",
-      status: "in_progress",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-1",
+        title: "Shell: npm run test",
+        kind: "execute",
+        status: "in_progress",
+      },
     });
 
     resolvePrompt({ stopReason: "cancelled" });
@@ -3920,6 +3958,104 @@ describe("ACP runtime-originated cancellation vs client-initiated cancellation",
         (e as { item: { type: string; status?: string } }).item.status === "canceled",
     );
     expect(canceledToolCalls).toHaveLength(0);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "turn_failed", code: "runtime_cancelled" }),
+    );
+  });
+
+  test.each([
+    {
+      name: "poll timeout",
+      title: "Read Shell: get_output",
+      rawOutput: { message: "Timed out waiting for shell output" },
+    },
+    {
+      name: "stale task handle",
+      title: "Read Shell: get_output",
+      rawOutput: { message: "Unknown background shell task 'stale-task'" },
+    },
+    {
+      name: "non-zero command exit",
+      title: "Shell: exit 17",
+      rawOutput: { message: "Command exited with code 17" },
+    },
+    {
+      name: "runtime-killed command",
+      title: "Shell: npm run test:local",
+      rawOutput: { message: "Command terminated by runtime signal SIGTERM" },
+    },
+  ])(
+    "maps $name to a technical tool failure, never user interrupt",
+    async ({ title, rawOutput }) => {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      session.subscribe((event) => events.push(event));
+
+      await session.sessionUpdate({
+        sessionId: "session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-1",
+          title,
+          kind: "execute",
+          status: "failed",
+          rawOutput,
+        },
+      });
+
+      const toolCall = events.find(
+        (event) => event.type === "timeline" && event.item.type === "tool_call",
+      );
+      expect(toolCall).toMatchObject({
+        type: "timeline",
+        item: {
+          type: "tool_call",
+          status: "failed",
+          error: { message: rawOutput.message },
+        },
+      });
+      expect(JSON.stringify(events)).not.toContain("user interrupt");
+      expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
+    },
+  );
+
+  test.each([
+    {
+      name: "backgrounding",
+      title: "Shell: npm run test:local",
+      rawOutput: { message: "Command running in background with ID: shell-1" },
+    },
+    {
+      name: "zero command exit",
+      title: "Shell: exit 0",
+      rawOutput: { exitCode: 0 },
+    },
+  ])("maps $name to normal tool completion", async ({ title, rawOutput }) => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    session.subscribe((event) => events.push(event));
+
+    await session.sessionUpdate({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-1",
+        title,
+        kind: "execute",
+        status: "completed",
+        rawOutput,
+      },
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({ type: "tool_call", status: "completed", error: null }),
+      }),
+    );
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
   });
 });
 
@@ -3940,6 +4076,82 @@ describe("ACP close() must not send session/cancel", () => {
     await session.close();
 
     expect(cancel).not.toHaveBeenCalled();
+  });
+
+  test("shutdown while get_output waits on a background shell does not send user interrupt", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    const cancel = vi.fn(async () => {});
+    const clientToAgent = new TransformStream();
+    const agentToClient = new TransformStream();
+    const agent: Agent = {
+      async initialize() {
+        return {
+          protocolVersion: PROTOCOL_VERSION,
+          agentCapabilities: {
+            loadSession: true,
+            sessionCapabilities: { list: {} },
+          },
+          authMethods: [],
+        };
+      },
+      async newSession() {
+        return { sessionId: "session-1" };
+      },
+      async prompt() {
+        return new Promise<PromptResponse>(() => {});
+      },
+      async authenticate() {},
+      cancel,
+    };
+    const agentConnection = new AgentSideConnection(
+      () => agent,
+      ndJsonStream(agentToClient.writable, clientToAgent.readable),
+    );
+    const connection = new ClientSideConnection(
+      () => session,
+      ndJsonStream(clientToAgent.writable, agentToClient.readable),
+    );
+    const initialize = await connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+      clientInfo: { name: "Paseo regression test", version: "dev" },
+    });
+    const sessionResponse = await connection.newSession({ cwd: "/tmp", mcpServers: [] });
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = sessionResponse.sessionId;
+    internals.connection = connection;
+    internals.agentCapabilities = initialize.agentCapabilities;
+    session.subscribe((event) => events.push(event));
+
+    await session.startTurn("run CLI local tests");
+    await agentConnection.sessionUpdate({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "shell-1",
+        title: "Shell: npm run test:local",
+        kind: "execute",
+        status: "completed",
+        rawOutput: { message: "Command running in background with ID: shell-1" },
+      },
+    });
+    await agentConnection.sessionUpdate({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "poll-1",
+        title: "Read Shell: get_output",
+        kind: "execute",
+        status: "in_progress",
+      },
+    });
+
+    await session.close();
+
+    expect(cancel).not.toHaveBeenCalled();
+    expect(JSON.stringify(events)).not.toContain("user interrupt");
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
   });
 
   test("close() without active foreground turn does NOT send session/cancel", async () => {
