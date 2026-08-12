@@ -1437,6 +1437,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
+  private cancelRequestedByClient = false;
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
@@ -1602,6 +1603,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     const turnId = randomUUID();
     const messageId = options?.clientMessageId ?? randomUUID();
     this.activeForegroundTurnId = turnId;
+    this.cancelRequestedByClient = false;
     this.fallbackAssistantMessageId = null;
     this.submittedUserMessageTurnId = null;
     this.emitBootstrapThreadEvent();
@@ -2126,6 +2128,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     });
 
     if (response.behavior === "deny" && response.interrupt && this.connection && this.sessionId) {
+      this.cancelRequestedByClient = true;
       await this.connection.cancel({ sessionId: this.sessionId });
     }
   }
@@ -2156,6 +2159,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.pendingPermissions.clear();
 
     if (this.activeForegroundTurnId) {
+      this.cancelRequestedByClient = true;
       await this.connection.cancel({ sessionId: this.sessionId });
     }
   }
@@ -2175,12 +2179,6 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.pendingPermissions.clear();
 
     if (this.connection && this.sessionId) {
-      try {
-        if (this.activeForegroundTurnId) {
-          await this.connection.cancel({ sessionId: this.sessionId });
-        }
-      } catch {}
-
       try {
         if (this.agentCapabilities?.sessionCapabilities?.close) {
           await this.connection.unstable_closeSession({ sessionId: this.sessionId });
@@ -2830,13 +2828,22 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     switch (response.stopReason) {
       case "cancelled":
-        this.synthesizeCanceledToolCalls();
-        this.finishTurn({
-          type: "turn_canceled",
-          provider: this.provider,
-          reason: "Interrupted",
-          turnId,
-        });
+        if (this.cancelRequestedByClient) {
+          this.synthesizeCanceledToolCalls();
+          this.finishTurn({
+            type: "turn_canceled",
+            provider: this.provider,
+            reason: "Interrupted",
+            turnId,
+          });
+        } else {
+          this.finishTurn({
+            type: "turn_completed",
+            provider: this.provider,
+            usage: this.currentTurnUsage,
+            turnId,
+          });
+        }
         break;
       case "end_turn":
       case "max_tokens":
