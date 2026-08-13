@@ -1,4 +1,5 @@
-import { promises as fs, type Dirent } from "node:fs";
+import { createHash } from "node:crypto";
+import { promises as fs, type Dirent, type Stats } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { Logger } from "pino";
@@ -86,7 +87,16 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
 
 export interface InventoryRegistryIssue {
   path: string;
-  reason: "malformed_record" | "duplicate_agent_id" | "unreadable_path";
+  reason: "malformed_record" | "duplicate_agent_id" | "unreadable_path" | "registry_changed";
+}
+
+interface InventoryRegistryState {
+  records: StoredAgentRecord[];
+  issues: InventoryRegistryIssue[];
+}
+
+interface InventoryRegistryScan extends InventoryRegistryState {
+  manifest: string[];
 }
 
 export class AgentStorage {
@@ -132,6 +142,31 @@ export class AgentStorage {
       records: Array.from(this.cache.values()),
       issues: this.inventoryIssues.map((issue) => ({ ...issue })),
     };
+  }
+
+  /**
+   * Reads the registry from disk for a new inventory snapshot. This intentionally
+   * bypasses the startup cache used by legacy/UI callers. Two complete manifests
+   * must match, otherwise an external filesystem mutation has invalidated the
+   * materialization point and inventory fails closed.
+   */
+  async inventoryFreshState(): Promise<InventoryRegistryState> {
+    const before = await this.scanInventoryRegistry();
+    if (before.issues.length > 0) {
+      return before;
+    }
+    const after = await this.scanInventoryRegistry();
+    if (after.issues.length > 0) {
+      return after;
+    }
+    if (!sameManifest(before.manifest, after.manifest)) {
+      this.logger.warn("Agent registry changed during inventory scan");
+      return {
+        records: [],
+        issues: [{ path: this.baseDir, reason: "registry_changed" }],
+      };
+    }
+    return { records: after.records, issues: [] };
   }
 
   async get(agentId: string): Promise<StoredAgentRecord | null> {
@@ -334,6 +369,189 @@ export class AgentStorage {
     return "rejected";
   }
 
+  private async scanInventoryRegistry(): Promise<InventoryRegistryScan> {
+    const issues: InventoryRegistryIssue[] = [];
+    const manifest: string[] = [];
+    const root = await this.inspectInventoryPath(this.baseDir, "root", manifest, issues, true);
+    if (root === "absent") {
+      return { records: [], issues, manifest };
+    }
+    if (root !== "directory") {
+      return { records: [], issues, manifest };
+    }
+
+    const rootEntries = await this.readInventoryDirectory(this.baseDir, "root", manifest, issues);
+    const recordPaths: string[] = [];
+    const projectDirs: string[] = [];
+    for (const entry of rootEntries) {
+      const entryPath = path.join(this.baseDir, entry.name);
+      const kind = await this.inspectInventoryPath(entryPath, "root", manifest, issues);
+      if (kind === "directory") {
+        projectDirs.push(entryPath);
+      } else if (kind === "record") {
+        recordPaths.push(entryPath);
+      }
+    }
+
+    for (const projectDir of projectDirs.sort(comparePathCodeUnits)) {
+      const projectEntries = await this.readInventoryDirectory(
+        projectDir,
+        "project",
+        manifest,
+        issues,
+      );
+      for (const entry of projectEntries) {
+        const entryPath = path.join(projectDir, entry.name);
+        if (
+          (await this.inspectInventoryPath(entryPath, "project", manifest, issues)) === "record"
+        ) {
+          recordPaths.push(entryPath);
+        }
+      }
+    }
+
+    const records: StoredAgentRecord[] = [];
+    const recordPathById = new Map<string, string>();
+    for (const recordPath of recordPaths.sort(comparePathCodeUnits)) {
+      const record = await this.readStableInventoryRecord(recordPath, manifest, issues);
+      if (!record) continue;
+      const previousPath = recordPathById.get(record.id);
+      if (previousPath) {
+        issues.push({ path: previousPath, reason: "duplicate_agent_id" });
+        issues.push({ path: recordPath, reason: "duplicate_agent_id" });
+        continue;
+      }
+      recordPathById.set(record.id, recordPath);
+      records.push(record);
+    }
+
+    manifest.sort(comparePathCodeUnits);
+    return { records, issues, manifest };
+  }
+
+  private async readInventoryDirectory(
+    directory: string,
+    context: "root" | "project",
+    manifest: string[],
+    issues: InventoryRegistryIssue[],
+  ): Promise<Dirent[]> {
+    try {
+      const entries = await fs.readdir(directory, { withFileTypes: true });
+      manifest.push(
+        `directory:${directory}:${entries
+          .map((entry) => entry.name)
+          .sort(comparePathCodeUnits)
+          .join("\u0000")}`,
+      );
+      return entries.sort((left, right) => comparePathCodeUnits(left.name, right.name));
+    } catch (error) {
+      this.logger.warn(
+        { err: error, directory, context },
+        "Failed to scan inventory registry directory",
+      );
+      issues.push({
+        path: directory,
+        reason:
+          (error as NodeJS.ErrnoException).code === "ENOENT"
+            ? "registry_changed"
+            : "unreadable_path",
+      });
+      return [];
+    }
+  }
+
+  private async inspectInventoryPath(
+    entryPath: string,
+    context: "root" | "project",
+    manifest: string[],
+    issues: InventoryRegistryIssue[],
+    allowAbsent = false,
+  ): Promise<"absent" | "directory" | "record" | "rejected"> {
+    let stats: Stats;
+    try {
+      stats = await fs.lstat(entryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && allowAbsent) {
+        manifest.push(`absent:${entryPath}`);
+        return "absent";
+      }
+      this.logger.warn(
+        { err: error, entryPath, context },
+        "Failed to inspect inventory registry path",
+      );
+      issues.push({
+        path: entryPath,
+        reason:
+          (error as NodeJS.ErrnoException).code === "ENOENT"
+            ? "registry_changed"
+            : "unreadable_path",
+      });
+      return "rejected";
+    }
+    manifest.push(`path:${entryPath}:${inventoryPathFingerprint(stats)}`);
+    if (stats.isSymbolicLink()) {
+      issues.push({ path: entryPath, reason: "unreadable_path" });
+      return "rejected";
+    }
+    if (stats.isDirectory()) {
+      if (context === "project") {
+        issues.push({ path: entryPath, reason: "unreadable_path" });
+        return "rejected";
+      }
+      return "directory";
+    }
+    if (stats.isFile() && entryPath.endsWith(".json")) {
+      return "record";
+    }
+    issues.push({ path: entryPath, reason: "unreadable_path" });
+    return "rejected";
+  }
+
+  private async readStableInventoryRecord(
+    filePath: string,
+    manifest: string[],
+    issues: InventoryRegistryIssue[],
+  ): Promise<StoredAgentRecord | null> {
+    let before: Stats;
+    let content: string;
+    let after: Stats;
+    try {
+      before = await fs.lstat(filePath);
+      if (!before.isFile() || before.isSymbolicLink()) {
+        issues.push({ path: filePath, reason: "registry_changed" });
+        return null;
+      }
+      content = await fs.readFile(filePath, "utf8");
+      after = await fs.lstat(filePath);
+    } catch (error) {
+      this.logger.warn({ err: error, filePath }, "Failed to read inventory registry record");
+      issues.push({
+        path: filePath,
+        reason:
+          (error as NodeJS.ErrnoException).code === "ENOENT"
+            ? "registry_changed"
+            : "unreadable_path",
+      });
+      return null;
+    }
+    if (
+      !after.isFile() ||
+      after.isSymbolicLink() ||
+      inventoryPathFingerprint(before) !== inventoryPathFingerprint(after)
+    ) {
+      issues.push({ path: filePath, reason: "registry_changed" });
+      return null;
+    }
+    manifest.push(`content:${filePath}:${createHash("sha256").update(content).digest("hex")}`);
+    try {
+      return parseStoredAgentRecord(JSON.parse(content));
+    } catch (error) {
+      this.logger.warn({ err: error, filePath }, "Invalid inventory registry record");
+      issues.push({ path: filePath, reason: "malformed_record" });
+      return null;
+    }
+  }
+
   private async scanDisk(): Promise<StoredAgentRecord[]> {
     const records: StoredAgentRecord[] = [];
     let entries: Dirent[] = [];
@@ -484,6 +702,20 @@ export class AgentStorage {
   private async waitForPendingWrite(agentId: string): Promise<void> {
     await (this.pendingWrites.get(agentId) ?? Promise.resolve()).catch(() => undefined);
   }
+}
+
+function inventoryPathFingerprint(stats: Stats): string {
+  return [stats.dev, stats.ino, stats.mode, stats.size, stats.mtimeMs, stats.ctimeMs].join(":");
+}
+
+function sameManifest(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+function comparePathCodeUnits(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function projectDirNameFromCwd(cwd: string): string {

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestPaseoDaemon, DaemonClient, type TestPaseoDaemon } from "./test-utils/index.js";
@@ -9,6 +12,44 @@ let daemon: TestPaseoDaemon;
 let client: DaemonClient;
 let cwd: string;
 const clientId = "inventory-reconnect-fixture";
+const execFileAsync = promisify(execFile);
+
+async function registryTreeHash(root: string): Promise<string> {
+  const hash = createHash("sha256");
+  async function visit(directory: string, relative = ""): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) => (left.name < right.name ? -1 : 1))) {
+      const entryPath = path.join(directory, entry.name);
+      const entryRelative = path.join(relative, entry.name);
+      hash.update(`${entry.isDirectory() ? "d" : "f"}\u0000${entryRelative}\u0000`);
+      if (entry.isDirectory()) {
+        await visit(entryPath, entryRelative);
+      } else {
+        hash.update(await readFile(entryPath));
+      }
+    }
+  }
+  await visit(root);
+  return hash.digest("hex");
+}
+
+async function inventoryViaCli(
+  daemonPort: number,
+): Promise<{ entries: Array<Record<string, unknown>> }> {
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [
+      path.join(process.cwd(), "packages/cli/bin/paseo"),
+      "inventory",
+      "sessions",
+      "--host",
+      `127.0.0.1:${daemonPort}`,
+      "--json",
+    ],
+    { cwd: process.cwd() },
+  );
+  return JSON.parse(stdout) as { entries: Array<Record<string, unknown>> };
+}
 
 beforeEach(async () => {
   daemon = await createTestPaseoDaemon();
@@ -108,4 +149,36 @@ test("reports a seeded persisted-only running status as non-live", async () => {
     await persistedDaemon.close();
     await rm(homeRoot, { recursive: true, force: true });
   }
+}, 30000);
+
+test("CLI inventory sees post-start persisted state and fails closed for a post-start unknown entry", async () => {
+  expect((await inventoryViaCli(daemon.port)).entries).toEqual([]);
+
+  const registry = path.join(daemon.paseoHome, "agents");
+  const lateDir = path.join(registry, "late-project");
+  await mkdir(lateDir, { recursive: true });
+  await writeFile(
+    path.join(lateDir, "late-agent.json"),
+    JSON.stringify({
+      id: "late-agent",
+      provider: "codex",
+      cwd: "/tmp/late-agent",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      lastStatus: "idle",
+    }),
+    "utf8",
+  );
+  const beforeValidRead = await registryTreeHash(registry);
+  const fresh = await inventoryViaCli(daemon.port);
+  expect(fresh.entries).toContainEqual(
+    expect.objectContaining({ native_id: "late-agent", live: false }),
+  );
+  expect(await registryTreeHash(registry)).toBe(beforeValidRead);
+
+  const unknown = path.join(registry, "unexpected.unknown");
+  await writeFile(unknown, "unexpected", "utf8");
+  const beforeFailure = await registryTreeHash(registry);
+  await expect(inventoryViaCli(daemon.port)).rejects.toThrow("inventory_malformed_state");
+  expect(await registryTreeHash(registry)).toBe(beforeFailure);
 }, 30000);

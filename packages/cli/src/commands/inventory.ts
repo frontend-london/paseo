@@ -57,6 +57,15 @@ export async function runInventorySessionsCommand(
     throw error;
   }
   const client = await connectToDaemon({ host: options.host });
+  if (client.getLastServerInfoMessage()?.features?.inventorySessionsSnapshot !== true) {
+    await client.close().catch(() => {});
+    const error: CommandError = {
+      code: "UNSUPPORTED_BY_HOST",
+      message: "This daemon does not support immutable session inventory snapshots.",
+      details: "Update the host to a newer Paseo version.",
+    };
+    throw error;
+  }
   try {
     const page = await client.inventorySessions({
       ...(options.snapshotId !== undefined ? { snapshot_id: options.snapshotId } : {}),

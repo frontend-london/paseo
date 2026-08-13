@@ -149,6 +149,18 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
   };
 }
 
+function persistedRecord(id: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    provider: "codex",
+    cwd: `/tmp/${id}`,
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+    lastStatus: "idle",
+    ...overrides,
+  };
+}
+
 describe("AgentStorage", () => {
   let tmpDir: string;
   let storagePath: string;
@@ -842,5 +854,225 @@ describe("AgentStorage", () => {
       path: extraPath,
       reason: "unreadable_path",
     });
+  });
+
+  test("inventoryFreshState sees a valid record written after startup and rejects a later unknown entry", async () => {
+    await storage.initialize();
+    const lateDir = path.join(storagePath, "late-project");
+    const latePath = path.join(lateDir, "late-agent.json");
+    await fs.mkdir(lateDir, { recursive: true });
+    await fs.writeFile(latePath, JSON.stringify(persistedRecord("late-agent")), "utf8");
+
+    await expect(storage.inventoryFreshState()).resolves.toMatchObject({
+      records: [expect.objectContaining({ id: "late-agent" })],
+      issues: [],
+    });
+
+    const unexpected = path.join(storagePath, "unexpected.unknown");
+    await fs.writeFile(unexpected, "unexpected", "utf8");
+    await expect(storage.inventoryFreshState()).resolves.toMatchObject({
+      records: expect.any(Array),
+      issues: expect.arrayContaining([
+        expect.objectContaining({ path: unexpected, reason: "unreadable_path" }),
+      ]),
+    });
+  });
+
+  test("inventoryFreshState fails closed when a valid file appears during its verified scan", async () => {
+    const projectDir = path.join(storagePath, "project");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, "existing.json"),
+      JSON.stringify(persistedRecord("existing")),
+      "utf8",
+    );
+    const lateDir = path.join(storagePath, "late-project");
+    const realReaddir = fs.readdir;
+    let rootReads = 0;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (args[0] === storagePath && ++rootReads === 2) {
+        await fs.mkdir(lateDir, { recursive: true });
+        await fs.writeFile(
+          path.join(lateDir, "late.json"),
+          JSON.stringify(persistedRecord("late")),
+          "utf8",
+        );
+      }
+      return realReaddir(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state).toEqual({
+      records: [],
+      issues: [{ path: storagePath, reason: "registry_changed" }],
+    });
+  });
+
+  test("inventoryFreshState fails closed when a listed record disappears during the scan", async () => {
+    const projectDir = path.join(storagePath, "project");
+    const recordPath = path.join(projectDir, "agent.json");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(recordPath, JSON.stringify(persistedRecord("agent")), "utf8");
+    const realReadFile = fs.readFile;
+    let intercepted = false;
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      if (args[0] === recordPath && !intercepted) {
+        intercepted = true;
+        await fs.unlink(recordPath);
+      }
+      return realReadFile(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state.issues).toContainEqual({ path: recordPath, reason: "registry_changed" });
+  });
+
+  test("inventoryFreshState fails closed when record content changes during the scan", async () => {
+    const projectDir = path.join(storagePath, "project");
+    const recordPath = path.join(projectDir, "agent.json");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(recordPath, JSON.stringify(persistedRecord("agent")), "utf8");
+    const realReadFile = fs.readFile;
+    let intercepted = false;
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      if (args[0] === recordPath && !intercepted) {
+        intercepted = true;
+        const original = await realReadFile(...args);
+        await fs.writeFile(
+          recordPath,
+          JSON.stringify(persistedRecord("agent", { lastStatus: "error" })),
+          "utf8",
+        );
+        return original;
+      }
+      return realReadFile(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state.issues).toContainEqual({ path: recordPath, reason: "registry_changed" });
+  });
+
+  test("inventoryFreshState fails closed when a listed record is replaced during the scan", async () => {
+    const projectDir = path.join(storagePath, "project");
+    const recordPath = path.join(projectDir, "agent.json");
+    const replacementPath = path.join(projectDir, "replacement.json");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(recordPath, JSON.stringify(persistedRecord("agent")), "utf8");
+    await fs.writeFile(replacementPath, JSON.stringify(persistedRecord("replacement")), "utf8");
+    const realReadFile = fs.readFile;
+    let intercepted = false;
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      if (args[0] === recordPath && !intercepted) {
+        intercepted = true;
+        await fs.rename(replacementPath, recordPath);
+      }
+      return realReadFile(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state.issues).toContainEqual({ path: recordPath, reason: "registry_changed" });
+  });
+
+  test("inventoryFreshState fails closed when a project directory disappears and reappears", async () => {
+    const projectDir = path.join(storagePath, "project");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, "agent.json"),
+      JSON.stringify(persistedRecord("agent")),
+      "utf8",
+    );
+    const realReaddir = fs.readdir;
+    let intercepted = false;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (args[0] === projectDir && !intercepted) {
+        intercepted = true;
+        await fs.rm(projectDir, { recursive: true, force: true });
+        await fs.mkdir(projectDir, { recursive: true });
+      }
+      return realReaddir(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state).toEqual({
+      records: [],
+      issues: [{ path: storagePath, reason: "registry_changed" }],
+    });
+  });
+
+  test("inventoryFreshState fails closed when a project directory changes type during the scan", async () => {
+    const projectDir = path.join(storagePath, "project");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, "agent.json"),
+      JSON.stringify(persistedRecord("agent")),
+      "utf8",
+    );
+    const realReaddir = fs.readdir;
+    let intercepted = false;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (args[0] === projectDir && !intercepted) {
+        intercepted = true;
+        await fs.rm(projectDir, { recursive: true, force: true });
+        await fs.writeFile(projectDir, "no longer a directory", "utf8");
+      }
+      return realReaddir(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state.issues).toContainEqual({ path: projectDir, reason: "unreadable_path" });
+  });
+
+  test("inventoryFreshState fails closed when an unknown entry appears during the scan", async () => {
+    const projectDir = path.join(storagePath, "project");
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, "agent.json"),
+      JSON.stringify(persistedRecord("agent")),
+      "utf8",
+    );
+    const unexpected = path.join(storagePath, "unexpected.unknown");
+    const realReaddir = fs.readdir;
+    let rootReads = 0;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (args[0] === storagePath && ++rootReads === 2) {
+        await fs.writeFile(unexpected, "unexpected", "utf8");
+      }
+      return realReaddir(...args);
+    });
+
+    const state = await storage.inventoryFreshState();
+    expect(state.issues).toContainEqual({ path: unexpected, reason: "unreadable_path" });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "inventoryFreshState fails closed when a regular record becomes a symlink during the scan",
+    async () => {
+      const projectDir = path.join(storagePath, "project");
+      const recordPath = path.join(projectDir, "agent.json");
+      const targetPath = path.join(tmpDir, "outside.json");
+      await fs.mkdir(projectDir, { recursive: true });
+      await fs.writeFile(recordPath, JSON.stringify(persistedRecord("agent")), "utf8");
+      await fs.writeFile(targetPath, JSON.stringify(persistedRecord("outside")), "utf8");
+      const realReadFile = fs.readFile;
+      let intercepted = false;
+      vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+        if (args[0] === recordPath && !intercepted) {
+          intercepted = true;
+          await fs.unlink(recordPath);
+          await fs.symlink(targetPath, recordPath);
+        }
+        return realReadFile(...args);
+      });
+
+      const state = await storage.inventoryFreshState();
+      expect(state.issues).toContainEqual({ path: recordPath, reason: "registry_changed" });
+    },
+  );
+
+  test("inventoryFreshState is read-only and preserves the registry tree hash", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "fresh-read-only-agent" }));
+    const before = await registryTreeHash(storagePath);
+    await storage.inventoryFreshState();
+    expect(await registryTreeHash(storagePath)).toBe(before);
   });
 });

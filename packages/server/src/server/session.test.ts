@@ -429,7 +429,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   return new Session(sessionOptions);
 }
 
-test("inventory capture marks live lifecycle and persisted lastStatus provenance explicitly", () => {
+test("inventory capture marks live lifecycle and persisted lastStatus provenance explicitly", async () => {
   const storedRecords = [
     {
       id: "persisted-only",
@@ -470,10 +470,10 @@ test("inventory capture marks live lifecycle and persisted lastStatus provenance
     listAgentsForInventory: () => liveAgents,
   } as unknown as AgentManager;
   const agentStorage = {
-    inventoryState: () => ({ records: storedRecords, issues: [] }),
+    inventoryFreshState: async () => ({ records: storedRecords, issues: [] }),
   } as unknown as AgentStorage;
 
-  const first = captureInventorySessions(agentManager, agentStorage);
+  const first = await captureInventorySessions(agentManager, agentStorage);
   expect(first).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
@@ -494,11 +494,11 @@ test("inventory capture marks live lifecycle and persisted lastStatus provenance
   const snapshots = new InventorySnapshotService(() =>
     captureInventorySessions(agentManager, agentStorage),
   );
-  const liveSnapshot = snapshots.page({}, "client-a").snapshot_id;
+  const liveSnapshot = (await snapshots.page({}, "client-a")).snapshot_id;
   liveAgents = [];
-  const persistedSnapshot = snapshots.page({}, "client-a").snapshot_id;
+  const persistedSnapshot = (await snapshots.page({}, "client-a")).snapshot_id;
   expect(persistedSnapshot).not.toBe(liveSnapshot);
-  expect(snapshots.page({}, "client-a").entries).toEqual(
+  expect((await snapshots.page({}, "client-a")).entries).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         native_id: "live-and-persisted",
@@ -609,7 +609,7 @@ test("inventory RPC fails closed before creating a snapshot for an unreadable re
     messages,
     agentManager: { listAgentsForInventory: vi.fn(() => []) },
     agentStorage: {
-      inventoryState: vi.fn(() => ({
+      inventoryFreshState: vi.fn(async () => ({
         records: [],
         issues: [{ path: "/tmp/paseo-home/agents/project", reason: "unreadable_path" }],
       })),

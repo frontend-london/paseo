@@ -32,20 +32,27 @@ delete, or otherwise modify those paths.
 
 ## Snapshot and pagination semantics
 
-The API uses materialized snapshot semantics. At the first page the daemon reads
-the manager and registry synchronously in one event-loop turn, validates the
-union, sorts it by `(backend, native_id)` using Unicode code-unit ordering,
-deep-clones the full entries, and retains that immutable materialization for
-ten minutes. `snapshot_id` is the SHA-256 digest of its schema version and
-canonical complete entry list. Canonical JSON sorts object keys with the same
-code-unit ordering, so insertion order and process locale do not change the
-id. It therefore names a specific enumerated set, not a request time or an
-arbitrary UUID.
+The API uses materialized snapshot semantics. At the first page the daemon
+performs an inventory-only fresh filesystem scan; it never treats the startup
+registry cache as proof of completeness. The scan classifies every root and
+project entry, validates every persisted record, and performs a second complete
+manifest scan. Directory entries, path identity/type/metadata, and record
+content hashes must match across both scans. A creation, deletion, replacement,
+symlink swap, permission failure, or content change during the scan fails the
+request closed. The completed scan is then combined with one synchronous
+`AgentManager` read, sorted by `(backend, native_id)` using Unicode code-unit
+ordering, deep-cloned, and retained for ten minutes.
+
+`snapshot_id` is the SHA-256 digest of its schema version and canonical complete
+entry list. Canonical JSON sorts object keys with the same code-unit ordering,
+so insertion order and process locale do not change the id. It therefore names
+a specific enumerated set, not a request time or an arbitrary UUID.
 
 Every continuation sends both `snapshot_id` and `cursor`. The cursor is
-daemon-secret-bound to that snapshot and its absolute next offset. It cannot be
-used with another snapshot, changed into a different offset, or loop back to
-the first page. Snapshot ownership is bound to `clientId`, but both the HMAC
+daemon-secret-bound to that snapshot, its absolute next offset, and the owner
+`clientId`. It uses strict canonical base64url encoding, so padded or altered
+variants are invalid. It cannot be used with another snapshot or client,
+changed into a different offset, or loop back to the first page. Both the HMAC
 secret and snapshot store belong to the daemon, not a WebSocket `Session`; a
 reconnect with the same client id can therefore continue until TTL expiry. A
 daemon restart naturally loses the store and never rebuilds an old snapshot.
@@ -129,4 +136,5 @@ Clients discover this RPC through
 same one-page contract as `paseo inventory sessions --json` and accepts
 `--snapshot-id`, `--cursor`, and `--limit` for continuation. It rejects every
 non-integer or out-of-range `--limit` locally (including `0`, floats, text, and
-values above 200).
+values above 200). Clients do not probe an old daemon with an unknown RPC: the
+CLI reports `UNSUPPORTED_BY_HOST` when the feature is absent.

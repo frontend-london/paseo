@@ -406,17 +406,24 @@ class SessionRequestError extends Error {
 export function captureInventorySessions(
   agentManager: AgentManager,
   agentStorage: AgentStorage,
-): InventorySessionEntry[] {
-  const registry = agentStorage.inventoryState();
+): Promise<InventorySessionEntry[]> {
+  return captureFreshInventorySessions(agentManager, agentStorage);
+}
+
+async function captureFreshInventorySessions(
+  agentManager: AgentManager,
+  agentStorage: AgentStorage,
+): Promise<InventorySessionEntry[]> {
+  const registry = await agentStorage.inventoryFreshState();
   if (registry.issues.length > 0) {
     throw new SessionRequestError(
       "inventory_malformed_state",
-      `Paseo registry contains ${registry.issues.length} malformed, duplicate, or unreadable path(s)`,
+      `Paseo registry contains ${registry.issues.length} malformed, duplicate, unreadable, or changing path(s)`,
     );
   }
 
-  // No await occurs between these two canonical in-memory reads. The snapshot
-  // service freezes the resulting union before pagination starts.
+  // The fresh scan is complete before this one synchronous AgentManager read.
+  // InventorySnapshotService freezes the resulting union before pagination.
   const storedById = new Map(registry.records.map((record) => [record.id, record]));
   const entriesById = new Map<string, InventorySessionEntry>();
   for (const record of registry.records) {
@@ -5087,7 +5094,7 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "inventory.sessions.request" }>,
   ): Promise<void> {
     try {
-      const page = this.inventorySnapshots.page(
+      const page = await this.inventorySnapshots.page(
         {
           snapshot_id: request.snapshot_id,
           cursor: request.cursor,

@@ -2040,6 +2040,7 @@ export class DaemonClient {
   }
 
   async inventorySessions(options?: InventorySessionsOptions): Promise<InventorySessionsPayload> {
+    this.requireInventorySessionsSnapshotSupport();
     const resolvedRequestId = this.createRequestId(options?.requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "inventory.sessions.request",
@@ -2053,6 +2054,7 @@ export class DaemonClient {
     return this.sendRequest({
       requestId: resolvedRequestId,
       message,
+      timeout: options?.timeout,
       options: { skipQueue: true },
       select: (msg) => {
         if (msg.type !== "inventory.sessions.response") {
@@ -5349,6 +5351,13 @@ export class DaemonClient {
     // COMPAT(hubRelationship): added in v0.1.X, drop the gate when floor >= v0.1.X.
     if (this.lastServerInfoMessage?.features?.hubRelationship !== true) {
       throw new Error("Update the host to use Hub relationship management.");
+    }
+  }
+
+  private requireInventorySessionsSnapshotSupport(): void {
+    // COMPAT(inventorySessionsSnapshot): added in v0.2.5, remove after 2027-02-10.
+    if (this.lastServerInfoMessage?.features?.inventorySessionsSnapshot !== true) {
+      throw new Error("Update the host to use immutable session inventory snapshots.");
     }
   }
 
