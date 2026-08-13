@@ -84,7 +84,9 @@ export class InventorySnapshotService {
   private readonly maxSnapshots: number;
 
   constructor(
-    private readonly captureEntries: () => InventorySessionEntry[],
+    private readonly captureEntries: () =>
+      | InventorySessionEntry[]
+      | Promise<InventorySessionEntry[]>,
     options: InventorySnapshotServiceOptions = {},
   ) {
     this.now = options.now ?? Date.now;
@@ -95,7 +97,7 @@ export class InventorySnapshotService {
     }
   }
 
-  page(request: InventorySnapshotRequest, clientId: string): InventorySnapshotPage {
+  async page(request: InventorySnapshotRequest, clientId: string): Promise<InventorySnapshotPage> {
     this.removeExpiredSnapshots();
     const limit = this.normalizeLimit(request.limit);
     const hasSnapshotId = request.snapshot_id !== undefined;
@@ -108,12 +110,12 @@ export class InventorySnapshotService {
     }
 
     if (!hasSnapshotId) {
-      const entries = this.freezeAndValidate(this.captureEntries());
+      const entries = this.freezeAndValidate(await this.captureEntries());
       const snapshotId = this.snapshotId(entries);
       if (entries.length > limit) {
         this.storeSnapshot(snapshotId, clientId, entries);
       }
-      return this.buildPage(snapshotId, entries, 0, limit);
+      return this.buildPage(snapshotId, entries, 0, limit, clientId);
     }
 
     const snapshotId = request.snapshot_id!;
@@ -139,7 +141,7 @@ export class InventorySnapshotService {
         "inventory snapshot is unknown, evicted, or owned by another client",
       );
     }
-    if (cursor.proof !== this.cursorProof(cursor.snapshot_id, cursor.offset)) {
+    if (cursor.proof !== this.cursorProof(cursor.snapshot_id, cursor.offset, clientId)) {
       throw new InventorySnapshotError("invalid_inventory_cursor", "inventory cursor is invalid");
     }
     if (snapshot.expiresAt <= this.now()) {
@@ -156,7 +158,7 @@ export class InventorySnapshotService {
       );
     }
     this.touchSnapshot(snapshotKey, snapshot);
-    return this.buildPage(snapshotId, snapshot.entries, cursor.offset, limit);
+    return this.buildPage(snapshotId, snapshot.entries, cursor.offset, limit, clientId);
   }
 
   private normalizeLimit(limit: number | undefined): number {
@@ -175,6 +177,7 @@ export class InventorySnapshotService {
     entries: InventorySessionEntry[],
     offset: number,
     limit: number,
+    clientId: string,
   ): InventorySnapshotPage {
     const pageEntries = entries.slice(offset, offset + limit);
     const nextOffset = offset + pageEntries.length;
@@ -183,7 +186,7 @@ export class InventorySnapshotService {
       schema_version: INVENTORY_SCHEMA_VERSION,
       snapshot_id: snapshotId,
       entries: structuredClone(pageEntries),
-      next_cursor: hasMore ? this.encodeCursor(snapshotId, nextOffset) : null,
+      next_cursor: hasMore ? this.encodeCursor(snapshotId, nextOffset, clientId) : null,
       has_more: hasMore,
     };
   }
@@ -246,8 +249,8 @@ export class InventorySnapshotService {
     return `${clientId}\u0000${snapshotId}`;
   }
 
-  private encodeCursor(snapshotId: string, offset: number): string {
-    const proof = this.cursorProof(snapshotId, offset);
+  private encodeCursor(snapshotId: string, offset: number, clientId: string): string {
+    const proof = this.cursorProof(snapshotId, offset, clientId);
     return Buffer.from(JSON.stringify({ snapshot_id: snapshotId, offset, proof })).toString(
       "base64url",
     );
@@ -255,6 +258,9 @@ export class InventorySnapshotService {
 
   private decodeCursor(cursor: string): CursorPayload {
     try {
+      if (!/^[A-Za-z0-9_-]+$/.test(cursor)) {
+        throw new Error("invalid base64url alphabet");
+      }
       const parsed: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
       if (
         typeof parsed !== "object" ||
@@ -265,15 +271,20 @@ export class InventorySnapshotService {
       ) {
         throw new Error("invalid shape");
       }
-      return parsed as CursorPayload;
+      const payload = parsed as CursorPayload;
+      const canonical = Buffer.from(JSON.stringify(payload)).toString("base64url");
+      if (canonical !== cursor) {
+        throw new Error("non-canonical cursor");
+      }
+      return payload;
     } catch {
       throw new InventorySnapshotError("invalid_inventory_cursor", "inventory cursor is invalid");
     }
   }
 
-  private cursorProof(snapshotId: string, offset: number): string {
+  private cursorProof(snapshotId: string, offset: number, clientId: string): string {
     return createHmac("sha256", this.cursorSecret)
-      .update(`${snapshotId}\u0000${offset}`)
+      .update(`${snapshotId}\u0000${offset}\u0000${clientId}`)
       .digest("base64url");
   }
 

@@ -2044,6 +2044,7 @@ export class DaemonClient {
   }
 
   async inventorySessions(options?: InventorySessionsOptions): Promise<InventorySessionsPayload> {
+    this.requireInventorySessionsSnapshotSupport();
     const resolvedRequestId = this.createRequestId(options?.requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "inventory.sessions.request",
@@ -2057,6 +2058,7 @@ export class DaemonClient {
     return this.sendRequest({
       requestId: resolvedRequestId,
       message,
+      timeout: options?.timeout,
       options: { skipQueue: true },
       select: (msg) => {
         if (msg.type !== "inventory.sessions.response") {
@@ -5387,6 +5389,13 @@ export class DaemonClient {
     // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
     if (this.lastServerInfoMessage?.features?.daemonConfigReload !== true) {
       throw new Error("Update the host to reload daemon configuration.");
+    }
+  }
+
+  private requireInventorySessionsSnapshotSupport(): void {
+    // COMPAT(inventorySessionsSnapshot): added in v0.2.5, remove after 2027-02-10.
+    if (this.lastServerInfoMessage?.features?.inventorySessionsSnapshot !== true) {
+      throw new Error("Update the host to use immutable session inventory snapshots.");
     }
   }
 
