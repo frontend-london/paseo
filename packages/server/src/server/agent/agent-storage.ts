@@ -246,8 +246,10 @@ export class AgentStorage {
     const agentId = record.id;
     const nextPath = this.buildRecordPath(record);
     const previousPath = this.pathById.get(agentId);
+    const paseoHome = path.dirname(this.baseDir);
+    const tempDir = path.join(paseoHome, ".tmp", "atomic");
 
-    await writeJsonFileAtomic(nextPath, record);
+    await writeJsonFileAtomic(nextPath, record, tempDir);
     this.addIndexedPath(agentId, nextPath);
 
     if (previousPath && previousPath !== nextPath) {

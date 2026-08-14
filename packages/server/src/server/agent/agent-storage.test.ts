@@ -1121,4 +1121,119 @@ describe("AgentStorage", () => {
     await storage.inventoryFreshState();
     expect(await registryTreeHash(storagePath)).toBe(before);
   });
+
+  test("writeRecord creates atomic temp files outside the registry scope", async () => {
+    await storage.initialize();
+    const paseoHome = path.dirname(storagePath);
+    const atomicTempDir = path.join(paseoHome, ".tmp", "atomic");
+    const realWriteFile = fs.writeFile;
+    const observedTempPaths: string[] = [];
+
+    const writeFileSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      if (typeof args[0] === "string" && args[0].startsWith(atomicTempDir)) {
+        observedTempPaths.push(args[0]);
+      }
+      return realWriteFile(...args);
+    });
+
+    await storage.applySnapshot(createManagedAgent({ id: "temp-location-agent" }));
+    writeFileSpy.mockRestore();
+
+    expect(observedTempPaths.length).toBeGreaterThan(0);
+    for (const tempPath of observedTempPaths) {
+      expect(tempPath.startsWith(atomicTempDir)).toBe(true);
+      expect(tempPath.startsWith(storagePath)).toBe(false);
+    }
+  });
+
+  test("writeRecord cleans up temp files on rename failure", async () => {
+    await storage.initialize();
+    const paseoHome = path.dirname(storagePath);
+    const atomicTempDir = path.join(paseoHome, ".tmp", "atomic");
+    const realRename = fs.rename;
+    let tempFilePath: string | null = null;
+
+    const writeFileSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      if (typeof args[0] === "string" && args[0].startsWith(atomicTempDir)) {
+        tempFilePath = args[0];
+      }
+      return realWriteFile(...args);
+    });
+
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+      if (tempFilePath !== null && args[0] === tempFilePath) {
+        throw new Error("injected rename failure");
+      }
+      return realRename(...args);
+    });
+
+    await expect(
+      storage.applySnapshot(createManagedAgent({ id: "failing-agent" })),
+    ).rejects.toThrow();
+
+    writeFileSpy.mockRestore();
+    renameSpy.mockRestore();
+
+    expect(tempFilePath).not.toBeNull();
+    await expect(fs.access(tempFilePath!)).rejects.toThrow();
+    const registryEntries = await fs.readdir(storagePath, { withFileTypes: true });
+    const tempInRegistry = registryEntries.filter((entry) => entry.name.endsWith(".tmp"));
+    expect(tempInRegistry).toHaveLength(0);
+  });
+
+  test("inventoryFreshState is stable while an applySnapshot atomic write is in progress", async () => {
+    await storage.initialize();
+    type InventoryFreshResult = Awaited<ReturnType<AgentStorage["inventoryFreshState"]>>;
+    const paseoHome = path.dirname(storagePath);
+    const atomicTempDir = path.join(paseoHome, ".tmp", "atomic");
+    const realWriteFile = fs.writeFile;
+    let inventoryResult: InventoryFreshResult | null = null;
+
+    const writeFileSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      const [filePath] = args;
+      if (typeof filePath === "string" && filePath.startsWith(atomicTempDir)) {
+        const result = await realWriteFile(...args);
+        inventoryResult = await storage.inventoryFreshState();
+        return result;
+      }
+      return realWriteFile(...args);
+    });
+
+    await storage.applySnapshot(createManagedAgent({ id: "concurrent-apply-agent" }));
+    writeFileSpy.mockRestore();
+
+    expect(inventoryResult).not.toBeNull();
+    expect(inventoryResult!.issues).toEqual([]);
+
+    const after = await storage.inventoryFreshState();
+    expect(after.issues).toEqual([]);
+    expect(after.records.map((record) => record.id)).toContain("concurrent-apply-agent");
+  });
+
+  test("inventoryFreshState is stable while an upsert atomic write is in progress", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "existing-upsert" }));
+    type InventoryFreshResult = Awaited<ReturnType<AgentStorage["inventoryFreshState"]>>;
+    const paseoHome = path.dirname(storagePath);
+    const atomicTempDir = path.join(paseoHome, ".tmp", "atomic");
+    const realWriteFile = fs.writeFile;
+    let inventoryResult: InventoryFreshResult | null = null;
+
+    const writeFileSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      const [filePath] = args;
+      if (typeof filePath === "string" && filePath.startsWith(atomicTempDir)) {
+        const result = await realWriteFile(...args);
+        inventoryResult = await storage.inventoryFreshState();
+        return result;
+      }
+      return realWriteFile(...args);
+    });
+
+    const existingRecord = await storage.get("existing-upsert");
+    expect(existingRecord).not.toBeNull();
+    await storage.upsert({ ...existingRecord!, title: "Updated title" });
+    writeFileSpy.mockRestore();
+
+    expect(inventoryResult).not.toBeNull();
+    expect(inventoryResult!.issues).toEqual([]);
+  });
 });
