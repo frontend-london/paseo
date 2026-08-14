@@ -422,6 +422,27 @@ export interface AgentMetricsSnapshot {
   };
 }
 
+/**
+ * Immutable projection of the in-memory authority used by inventory capture.
+ * Keep this intentionally narrow: every field here is serialized by the
+ * inventory RPC and therefore protected by AgentManager's inventory epoch.
+ */
+export interface InventoryLiveAgent {
+  id: string;
+  provider: AgentProvider;
+  lifecycle: AgentLifecycleStatus;
+  internal?: boolean;
+  cwd: string;
+  createdAt: Date;
+  updatedAt: Date;
+  persistence: AgentPersistenceHandle | null;
+}
+
+export interface InventoryLiveState {
+  epoch: number;
+  agents: InventoryLiveAgent[];
+}
+
 type ActiveManagedAgent =
   | ManagedAgentInitializing
   | ManagedAgentIdle
@@ -656,6 +677,9 @@ export class AgentManager {
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
+  // Monotonic, daemon-local generation for every inventory-visible live-state
+  // mutation. It is a capture-stability proof, never snapshot identity.
+  private inventoryEpoch = 0;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
   private paseoToolsEnabled = true;
@@ -813,7 +837,12 @@ export class AgentManager {
     const nextMs = nowMs > previousMs ? nowMs : previousMs + 1;
     const next = new Date(nextMs);
     agent.updatedAt = next;
+    this.bumpInventoryEpoch();
     return next;
+  }
+
+  private bumpInventoryEpoch(): void {
+    this.inventoryEpoch += 1;
   }
 
   private nextStoredUpdatedAt(record: StoredAgentRecord): string {
@@ -891,6 +920,27 @@ export class AgentManager {
    */
   listAgentsForInventory(): ManagedAgent[] {
     return Array.from(this.agents.values()).map((agent) => Object.assign({}, agent));
+  }
+
+  /**
+   * Atomically captures the live authority and its generation for an inventory
+   * handshake. The value copies cannot be changed by later live mutations
+   * while an asynchronous registry scan is in progress.
+   */
+  captureInventoryLiveState(): InventoryLiveState {
+    return {
+      epoch: this.inventoryEpoch,
+      agents: Array.from(this.agents.values()).map((agent) => ({
+        id: agent.id,
+        provider: agent.provider,
+        lifecycle: agent.lifecycle,
+        internal: agent.internal,
+        cwd: agent.cwd,
+        createdAt: new Date(agent.createdAt),
+        updatedAt: new Date(agent.updatedAt),
+        persistence: agent.persistence ? { ...agent.persistence } : null,
+      })),
+    };
   }
 
   async listImportableSessions(
@@ -1547,6 +1597,9 @@ export class AgentManager {
 
     const { archivedAt } = await this.markRecordArchived(stored);
     agent.updatedAt = new Date(archivedAt);
+    // archiveAgent awaits before removing the live agent, so this direct
+    // inventory-visible timestamp change must advance the generation itself.
+    this.bumpInventoryEpoch();
     await this.closeAgent(agentId);
     this.discardRetainedAgentState(agentId);
 
@@ -2962,6 +3015,7 @@ export class AgentManager {
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
+      this.bumpInventoryEpoch();
       registered = true;
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
@@ -3145,6 +3199,7 @@ export class AgentManager {
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
+    this.bumpInventoryEpoch();
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
       agent.unsubscribeSession();
@@ -4188,6 +4243,10 @@ export class AgentManager {
   }
 
   private emitState(agent: ManagedAgent, options?: { persist?: boolean }): void {
+    // Some inventory-visible state (notably a newly discovered persistence
+    // handle) is updated by provider callbacks without touchUpdatedAt(). A
+    // conservative bump on every published live state closes that path too.
+    this.bumpInventoryEpoch();
     // Keep attention as an edge-triggered unread signal, not a level signal.
     this.checkAndSetAttention(agent);
     if (options?.persist !== false) {

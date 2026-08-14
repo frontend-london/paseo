@@ -39,9 +39,15 @@ project entry, validates every persisted record, and performs a second complete
 manifest scan. Directory entries, path identity/type/metadata, and record
 content hashes must match across both scans. A creation, deletion, replacement,
 symlink swap, permission failure, or content change during the scan fails the
-request closed. The completed scan is then combined with one synchronous
-`AgentManager` read, sorted by `(backend, native_id)` using Unicode code-unit
-ordering, deep-cloned, and retained for ten minutes.
+request closed. To make the filesystem authority and live `AgentManager`
+authority one logical snapshot, the daemon first captures an immutable live
+projection plus a monotonic live inventory epoch, then performs the verified
+filesystem scan, and finally verifies that the epoch is unchanged. Thus the
+live projection was constant at the filesystem scan's materialization point.
+Any live or registry drift retries the whole capture at most three times and
+then returns `inventory_state_changed`; it never returns a mixed union. The
+result is sorted by `(backend, native_id)` using Unicode code-unit ordering,
+deep-cloned, and retained for ten minutes.
 
 `snapshot_id` is the SHA-256 digest of its schema version and canonical complete
 entry list. Canonical JSON sorts object keys with the same code-unit ordering,

@@ -768,6 +768,35 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 
 const logger = createTestLogger();
 
+test("captures inventory live entries and epoch at one synchronous boundary", async () => {
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000097",
+  });
+  const created = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+
+  const beforeMutation = manager.captureInventoryLiveState();
+  const epochBeforeMutation = beforeMutation.epoch;
+  const started = waitForAgentLifecycle(manager, created.id, "running");
+  client.sessions[0]!.pushEvent({ type: "turn_started", provider: "codex", turnId: "inventory" });
+  await started;
+
+  // captureInventoryLiveState has no await: the captured entry remains the
+  // pre-mutation value and the next capture exposes a strictly newer epoch.
+  expect(beforeMutation.agents).toEqual([
+    expect.objectContaining({ id: created.id, lifecycle: "idle" }),
+  ]);
+  expect(manager.captureInventoryLiveState()).toMatchObject({
+    epoch: expect.any(Number),
+    agents: [expect.objectContaining({ id: created.id, lifecycle: "running" })],
+  });
+  expect(manager.captureInventoryLiveState().epoch).toBeGreaterThan(epochBeforeMutation);
+});
+
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
   const manager = new AgentManager({

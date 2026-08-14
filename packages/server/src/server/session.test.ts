@@ -532,8 +532,9 @@ test("inventory capture marks live lifecycle and persisted lastStatus provenance
       persistence: { sessionId: "live-provider-session" },
     },
   ];
+  let liveEpoch = 0;
   const agentManager = {
-    listAgentsForInventory: () => liveAgents,
+    captureInventoryLiveState: () => ({ epoch: liveEpoch, agents: liveAgents }),
   } as unknown as AgentManager;
   const agentStorage = {
     inventoryFreshState: async () => ({ records: storedRecords, issues: [] }),
@@ -562,6 +563,7 @@ test("inventory capture marks live lifecycle and persisted lastStatus provenance
   );
   const liveSnapshot = (await snapshots.page({}, "client-a")).snapshot_id;
   liveAgents = [];
+  liveEpoch += 1;
   const persistedSnapshot = (await snapshots.page({}, "client-a")).snapshot_id;
   expect(persistedSnapshot).not.toBe(liveSnapshot);
   expect((await snapshots.page({}, "client-a")).entries).toEqual(
@@ -573,6 +575,40 @@ test("inventory capture marks live lifecycle and persisted lastStatus provenance
       }),
     ]),
   );
+});
+
+test("inventory capture retries the whole cross-authority capture after live epoch drift", async () => {
+  let epoch = 0;
+  let scans = 0;
+  const agentManager = {
+    captureInventoryLiveState: () => ({ epoch, agents: [] }),
+  } as unknown as AgentManager;
+  const agentStorage = {
+    inventoryFreshState: async () => {
+      scans += 1;
+      if (scans === 1) {
+        epoch += 1;
+      }
+      return { records: [], issues: [] };
+    },
+  } as unknown as AgentStorage;
+
+  await expect(captureInventorySessions(agentManager, agentStorage)).resolves.toEqual([]);
+  expect(scans).toBe(2);
+});
+
+test("inventory capture fails closed after bounded cross-authority drift retries", async () => {
+  let epoch = 0;
+  const agentManager = {
+    captureInventoryLiveState: () => ({ epoch: epoch++, agents: [] }),
+  } as unknown as AgentManager;
+  const agentStorage = {
+    inventoryFreshState: async () => ({ records: [], issues: [] }),
+  } as unknown as AgentStorage;
+
+  await expect(captureInventorySessions(agentManager, agentStorage)).rejects.toMatchObject({
+    code: "inventory_state_changed",
+  });
 });
 
 test("a daemon-shared inventory service survives a session reconnect for the same client", async () => {
@@ -673,7 +709,7 @@ test("inventory RPC fails closed before creating a snapshot for an unreadable re
   const messages: SessionOutboundMessage[] = [];
   const session = createSessionForTest({
     messages,
-    agentManager: { listAgentsForInventory: vi.fn(() => []) },
+    agentManager: { captureInventoryLiveState: vi.fn(() => ({ epoch: 0, agents: [] })) },
     agentStorage: {
       inventoryFreshState: vi.fn(async () => ({
         records: [],

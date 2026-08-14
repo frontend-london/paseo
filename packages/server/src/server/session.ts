@@ -429,22 +429,48 @@ async function captureFreshInventorySessions(
   agentManager: AgentManager,
   agentStorage: AgentStorage,
 ): Promise<InventorySessionEntry[]> {
-  const registry = await agentStorage.inventoryFreshState();
-  if (registry.issues.length > 0) {
-    throw new SessionRequestError(
-      "inventory_malformed_state",
-      `Paseo registry contains ${registry.issues.length} malformed, duplicate, unreadable, or changing path(s)`,
-    );
+  // The two inventory authorities do not share a filesystem lock. Capture the
+  // live map before the asynchronous verified registry scan, then require its
+  // generation to remain unchanged until the scan has completed. If it did,
+  // the live projection was constant at the registry scan's materialization
+  // point, so their union has a real linearization point.
+  for (let attempt = 0; attempt < INVENTORY_CAPTURE_MAX_ATTEMPTS; attempt += 1) {
+    const live = agentManager.captureInventoryLiveState();
+    const registry = await agentStorage.inventoryFreshState();
+    if (registry.issues.length > 0) {
+      if (registry.issues.every((issue) => issue.reason === "registry_changed")) {
+        continue;
+      }
+      throw new SessionRequestError(
+        "inventory_malformed_state",
+        `Paseo registry contains ${registry.issues.length} malformed, duplicate, or unreadable path(s)`,
+      );
+    }
+    if (agentManager.captureInventoryLiveState().epoch !== live.epoch) {
+      continue;
+    }
+
+    return materializeInventorySessions(registry.records, live.agents);
   }
 
-  // The fresh scan is complete before this one synchronous AgentManager read.
-  // InventorySnapshotService freezes the resulting union before pagination.
-  const storedById = new Map(registry.records.map((record) => [record.id, record]));
+  throw new SessionRequestError(
+    "inventory_state_changed",
+    "Paseo live state or registry changed while inventory was being materialized",
+  );
+}
+
+const INVENTORY_CAPTURE_MAX_ATTEMPTS = 3;
+
+function materializeInventorySessions(
+  records: StoredAgentRecord[],
+  liveAgents: ReturnType<AgentManager["captureInventoryLiveState"]>["agents"],
+): InventorySessionEntry[] {
+  const storedById = new Map(records.map((record) => [record.id, record]));
   const entriesById = new Map<string, InventorySessionEntry>();
-  for (const record of registry.records) {
+  for (const record of records) {
     entriesById.set(record.id, inventoryEntryFromStored(record));
   }
-  for (const live of agentManager.listAgentsForInventory()) {
+  for (const live of liveAgents) {
     const stored = storedById.get(live.id);
     if (stored && stored.provider !== live.provider) {
       throw new SessionRequestError(

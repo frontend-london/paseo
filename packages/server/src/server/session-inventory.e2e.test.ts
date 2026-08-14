@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { promises as fs } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -13,6 +14,14 @@ let client: DaemonClient;
 let cwd: string;
 const clientId = "inventory-reconnect-fixture";
 const execFileAsync = promisify(execFile);
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 async function registryTreeHash(root: string): Promise<string> {
   const hash = createHash("sha256");
@@ -181,4 +190,58 @@ test("CLI inventory sees post-start persisted state and fails closed for a post-
   const beforeFailure = await registryTreeHash(registry);
   await expect(inventoryViaCli(daemon.port)).rejects.toThrow("inventory_malformed_state");
   expect(await registryTreeHash(registry)).toBe(beforeFailure);
+}, 30000);
+
+test("inventory never returns an impossible persisted/live union during cross-authority capture", async () => {
+  const registry = path.join(daemon.paseoHome, "agents");
+  await mkdir(registry, { recursive: true });
+
+  const rootReaddirReached = deferred<void>();
+  const allowFirstRootReaddir = deferred<void>();
+  const originalReaddir = fs.readdir;
+  let heldFirstRootReaddir = false;
+  const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation((async (
+    ...args: Parameters<typeof fs.readdir>
+  ) => {
+    const entries = await originalReaddir(...args);
+    if (!heldFirstRootReaddir && args[0] === registry) {
+      heldFirstRootReaddir = true;
+      rootReaddirReached.resolve();
+      await allowFirstRootReaddir.promise;
+    }
+    return entries;
+  }) as typeof fs.readdir);
+
+  try {
+    const inventory = client.inventorySessions({ limit: 200 });
+    await rootReaddirReached.promise;
+
+    const persistedDir = path.join(registry, "race-project");
+    await mkdir(persistedDir, { recursive: true });
+    await writeFile(
+      path.join(persistedDir, "persisted-race.json"),
+      JSON.stringify({
+        id: "persisted-race",
+        provider: "codex",
+        cwd: "/tmp/persisted-race",
+        createdAt: "2026-08-14T00:00:00.000Z",
+        updatedAt: "2026-08-14T00:00:00.000Z",
+        lastStatus: "idle",
+      }),
+      "utf8",
+    );
+    const live = await client.createAgent({
+      config: { ...getFullAccessConfig("codex"), cwd, title: "live-race" },
+    });
+
+    allowFirstRootReaddir.resolve();
+    const page = await inventory;
+    const identities = page.entries.map((entry) => entry.native_id);
+    expect(identities).toContain("persisted-race");
+    expect(identities).toContain(live.id);
+    expect(identities).not.toEqual([live.id]);
+  } finally {
+    allowFirstRootReaddir.resolve();
+    readdirSpy.mockRestore();
+  }
 }, 30000);
