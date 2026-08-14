@@ -845,6 +845,21 @@ export class AgentManager {
     this.inventoryEpoch += 1;
   }
 
+  private markInventoryVisiblePersistence(
+    agent: ManagedAgent,
+    handle: AgentPersistenceHandle | null,
+    options?: { bump?: boolean },
+  ): boolean {
+    const previousSessionId = agent.persistence?.sessionId ?? null;
+    agent.persistence = attachPersistenceCwd(handle, agent.cwd);
+    const nextSessionId = agent.persistence?.sessionId ?? null;
+    const changed = previousSessionId !== nextSessionId;
+    if (changed && options?.bump !== false) {
+      this.bumpInventoryEpoch();
+    }
+    return changed;
+  }
+
   private nextStoredUpdatedAt(record: StoredAgentRecord): string {
     const previousMs = Date.parse(record.updatedAt);
     const nowMs = Date.now();
@@ -2340,7 +2355,9 @@ export class AgentManager {
         ? { provider: mutableAgent.provider, sessionId: mutableAgent.runtimeInfo.sessionId }
         : null);
     if (persistenceHandle) {
-      mutableAgent.persistence = attachPersistenceCwd(persistenceHandle, mutableAgent.cwd);
+      this.markInventoryVisiblePersistence(mutableAgent, persistenceHandle, {
+        bump: shouldHoldBusyForReplacement,
+      });
     }
     this.logger.trace(
       {
@@ -3447,14 +3464,17 @@ export class AgentManager {
         newInfo.sessionId !== agent.runtimeInfo?.sessionId ||
         newInfo.modeId !== agent.runtimeInfo?.modeId;
       agent.runtimeInfo = newInfo;
-      if (!agent.persistence && newInfo.sessionId) {
-        agent.persistence = attachPersistenceCwd(
-          { provider: agent.provider, sessionId: newInfo.sessionId },
-          agent.cwd,
-        );
+      const persistenceHandle =
+        !agent.persistence && newInfo.sessionId
+          ? { provider: agent.provider, sessionId: newInfo.sessionId }
+          : null;
+      const shouldEmit = changed && options?.emit !== false;
+      if (persistenceHandle) {
+        this.markInventoryVisiblePersistence(agent, persistenceHandle, {
+          bump: !shouldEmit,
+        });
       }
-      // Emit state if runtimeInfo changed so clients get the updated model
-      if (changed && options?.emit !== false) {
+      if (shouldEmit) {
         this.emitState(agent);
       }
     } catch {
@@ -3784,9 +3804,10 @@ export class AgentManager {
       case "model_changed":
         agent.runtimeInfo = event.runtimeInfo;
         if (!agent.persistence && event.runtimeInfo.sessionId) {
-          agent.persistence = attachPersistenceCwd(
+          this.markInventoryVisiblePersistence(
+            agent,
             { provider: agent.provider, sessionId: event.runtimeInfo.sessionId },
-            agent.cwd,
+            { bump: false },
           );
         }
         agent.currentModeId = event.runtimeInfo.modeId ?? agent.currentModeId;
@@ -3849,11 +3870,10 @@ export class AgentManager {
   }
 
   private onStreamThreadStarted(agent: ActiveManagedAgent): void {
-    const previousSessionId = agent.persistence?.sessionId ?? null;
     const handle = agent.session.describePersistence();
     if (handle) {
-      agent.persistence = attachPersistenceCwd(handle, agent.cwd);
-      if (agent.persistence?.sessionId !== previousSessionId) {
+      const changed = this.markInventoryVisiblePersistence(agent, handle, { bump: false });
+      if (changed) {
         this.emitState(agent);
       }
     }
