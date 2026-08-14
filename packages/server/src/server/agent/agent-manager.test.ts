@@ -797,6 +797,37 @@ test("captures inventory live entries and epoch at one synchronous boundary", as
   expect(manager.captureInventoryLiveState().epoch).toBeGreaterThan(epochBeforeMutation);
 });
 
+test("inventory capture observes an epoch bump injected while copying a live entry", async () => {
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000096",
+  });
+  const created = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const agents = (manager as unknown as { agents: Map<string, ManagedAgent> }).agents;
+  const live = agents.get(created.id)!;
+  const epochBeforeBoundaryMutation = manager.captureInventoryLiveState().epoch;
+  let mutateDuringCopy = true;
+  Object.defineProperty(live, "id", {
+    configurable: true,
+    get() {
+      if (mutateDuringCopy) {
+        mutateDuringCopy = false;
+        manager.notifyAgentState(created.id);
+      }
+      return created.id;
+    },
+  });
+
+  manager.captureInventoryLiveState();
+  // Session capture compares this newer epoch after the registry await, so an
+  // entry copy spanning this boundary is retried rather than materialized.
+  expect(manager.captureInventoryLiveState().epoch).toBeGreaterThan(epochBeforeBoundaryMutation);
+});
+
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
   const manager = new AgentManager({
