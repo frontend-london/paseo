@@ -20,7 +20,10 @@ import {
 } from "@getpaseo/protocol/binary-frames/index";
 import { captureInventorySessions, isSessionRpcAllowed, Session } from "./session.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
-import { InventorySnapshotService } from "./agent/inventory-snapshot-service.js";
+import {
+  InventorySnapshotService,
+  type InventorySessionEntry,
+} from "./agent/inventory-snapshot-service.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentManager, AgentManagerEvent } from "./agent/agent-manager.js";
@@ -730,6 +733,86 @@ test("inventory RPC fails closed before creating a snapshot for an unreadable re
       payload: expect.objectContaining({ code: "inventory_malformed_state" }),
     }),
   ]);
+});
+
+test("inventory sessions RPC paginates 401 records into three 200/200/1 pages", async () => {
+  const entries: InventorySessionEntry[] = Array.from({ length: 401 }, (_, index) => ({
+    backend: "paseo",
+    native_id: `session-${String(index).padStart(4, "0")}`,
+    provider: "claude",
+    status_raw: "idle",
+    archived: false,
+    archived_at: null,
+    internal: false,
+    live: false,
+    cwd: `/worktree/${index}`,
+    created_at: "2026-08-10T00:00:00.000Z",
+    updated_at: "2026-08-10T00:00:00.000Z",
+    persistence_session_id: `provider-${index}`,
+  }));
+  const snapshots = new InventorySnapshotService(() => entries);
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    clientId: "client-401",
+    inventorySnapshots: snapshots,
+    messages,
+  });
+
+  await session.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "p1",
+    limit: 200,
+  });
+  const r1 = messages.find(
+    (msg): msg is Extract<SessionOutboundMessage, { type: "inventory.sessions.response" }> =>
+      msg.type === "inventory.sessions.response" && msg.payload.requestId === "p1",
+  );
+  expect(r1).toBeDefined();
+  expect(r1!.payload.entries).toHaveLength(200);
+  expect(r1!.payload.has_more).toBe(true);
+  expect(r1!.payload.next_cursor).toEqual(expect.any(String));
+  const snapshotId = r1!.payload.snapshot_id;
+
+  await session.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "p2",
+    snapshot_id: snapshotId,
+    cursor: r1!.payload.next_cursor!,
+    limit: 200,
+  });
+  const r2 = messages.find(
+    (msg): msg is Extract<SessionOutboundMessage, { type: "inventory.sessions.response" }> =>
+      msg.type === "inventory.sessions.response" && msg.payload.requestId === "p2",
+  );
+  expect(r2).toBeDefined();
+  expect(r2!.payload.entries).toHaveLength(200);
+  expect(r2!.payload.has_more).toBe(true);
+  expect(r2!.payload.next_cursor).toEqual(expect.any(String));
+  expect(r2!.payload.snapshot_id).toBe(snapshotId);
+
+  await session.handleMessage({
+    type: "inventory.sessions.request",
+    requestId: "p3",
+    snapshot_id: snapshotId,
+    cursor: r2!.payload.next_cursor!,
+    limit: 200,
+  });
+  const r3 = messages.find(
+    (msg): msg is Extract<SessionOutboundMessage, { type: "inventory.sessions.response" }> =>
+      msg.type === "inventory.sessions.response" && msg.payload.requestId === "p3",
+  );
+  expect(r3).toBeDefined();
+  expect(r3!.payload.entries).toHaveLength(1);
+  expect(r3!.payload.has_more).toBe(false);
+  expect(r3!.payload.next_cursor).toBeNull();
+  expect(r3!.payload.snapshot_id).toBe(snapshotId);
+
+  const allIds = [...r1!.payload.entries, ...r2!.payload.entries, ...r3!.payload.entries].map(
+    (entry) => entry.native_id,
+  );
+  expect(allIds).toHaveLength(401);
+  expect(new Set(allIds)).toHaveLength(401);
+  expect(allIds).toEqual([...allIds].sort());
 });
 
 describe("session authorization scopes", () => {
