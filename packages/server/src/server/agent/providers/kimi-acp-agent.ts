@@ -96,6 +96,12 @@ const KIMI_PASEO_TO_PROVIDER_MODE: Record<string, string> = {
   plan: "plan",
 };
 
+// Map a Paseo UI mode id to the provider mode id that Kimi will actually
+// receive over ACP. Paseo "yolo" and "auto" both map to Kimi "auto".
+export function mapKimiPaseoToProviderMode(paseoModeId: string): string | null {
+  return KIMI_PASEO_TO_PROVIDER_MODE[paseoModeId] ?? null;
+}
+
 // Map a Kimi-reported mode id back to the Paseo UI mode id.
 //
 // The only non-identity mapping is the auto → yolo echo: when the user
@@ -124,6 +130,7 @@ export class KimiACPAgentClient extends GenericACPAgentClient {
       catalogModelResolver: resolveKimiCatalogModels,
       modeIdTransformer: (providerModeId, currentModeId) =>
         kimiProviderToPaseoMode(providerModeId, currentModeId),
+      providerModeMapper: (paseoModeId) => mapKimiPaseoToProviderMode(paseoModeId),
       providerModeWriter: (context) => writeKimiMode(context),
     });
   }
