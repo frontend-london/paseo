@@ -54,6 +54,7 @@ interface GenericACPAgentClientOptions {
   extensionCommandsParser?: ACPExtensionCommandsParser;
   catalogModelResolver?: ACPCatalogModelResolver;
   modeIdTransformer?: (modeId: string, currentModeId?: string | null) => string | null;
+  providerModeMapper?: (modeId: string) => string | null;
   providerModeWriter?: (
     context: ACPProviderModeWriterContext,
   ) => Promise<ACPProviderModeWriteResult>;
@@ -83,6 +84,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       extensionCommandsParser: options.extensionCommandsParser,
       catalogModelResolver: options.catalogModelResolver,
       modeIdTransformer: options.modeIdTransformer,
+      providerModeMapper: options.providerModeMapper,
       providerModeWriter: options.providerModeWriter,
     });
 

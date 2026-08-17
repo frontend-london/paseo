@@ -42,7 +42,11 @@ import {
   writeCopilotProviderMode,
 } from "./copilot-acp-agent.js";
 import { GenericACPAgentClient } from "./generic-acp-agent.js";
-import { kimiProviderToPaseoMode, writeKimiMode } from "./kimi-acp-agent.js";
+import {
+  kimiProviderToPaseoMode,
+  mapKimiPaseoToProviderMode,
+  writeKimiMode,
+} from "./kimi-acp-agent.js";
 import { parseKiroExtensionCommands } from "./kiro-acp-agent.js";
 import { transformPiModels } from "./pi/agent.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
@@ -3977,5 +3981,108 @@ describe("KimiACPAgentClient", () => {
   test("does not map an unknown provider mode to yolo", () => {
     expect(kimiProviderToPaseoMode("manual", "yolo")).toBe("manual");
     expect(kimiProviderToPaseoMode("unknown", "yolo")).toBe("unknown");
+  });
+
+  test("preserves available modes when selecting Paseo yolo for Kimi", async () => {
+    const session = new ACPAgentSession(
+      {
+        provider: "kimi",
+        cwd: "/tmp/paseo-acp-test",
+      },
+      {
+        provider: "kimi",
+        logger: createTestLogger(),
+        defaultCommand: ["kimi", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        modeIdTransformer: kimiProviderToPaseoMode,
+        providerModeWriter: writeKimiMode,
+      },
+    );
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [],
+    }));
+    const internals = asInternals<ACPConfiguredOverrideInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode, setSessionConfigOption };
+    const initialModes = [
+      { id: "plan", label: "Plan" },
+      { id: "yolo", label: "YOLO" },
+    ];
+    internals.availableModes = initialModes;
+    internals.configOptions = [];
+    internals.currentMode = "plan";
+
+    await session.setMode("yolo");
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "auto" });
+    expect(setSessionConfigOption).not.toHaveBeenCalled();
+    expect(internals.currentMode).toBe("yolo");
+    expect(internals.availableModes).toEqual(initialModes);
+  });
+
+  test("sends auto when Kimi starts in provider yolo but user configured Paseo yolo", async () => {
+    const session = new ACPAgentSession(
+      {
+        provider: "kimi",
+        cwd: "/tmp/paseo-acp-test",
+        modeId: "yolo",
+      },
+      {
+        provider: "kimi",
+        logger: createTestLogger(),
+        defaultCommand: ["kimi", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        modeIdTransformer: kimiProviderToPaseoMode,
+        providerModeMapper: mapKimiPaseoToProviderMode,
+        providerModeWriter: writeKimiMode,
+      },
+    );
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [],
+    }));
+    const internals = asInternals<
+      ACPConfiguredOverrideInternals & { applySessionState(response: SessionStateResponse): void }
+    >(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode, setSessionConfigOption };
+
+    internals.applySessionState({
+      sessionId: "session-1",
+      configOptions: [],
+      modes: {
+        currentModeId: "yolo",
+        availableModes: [
+          { id: "yolo", name: "YOLO" },
+          { id: "auto", name: "Auto" },
+          { id: "plan", name: "Plan" },
+        ],
+      },
+    });
+
+    await internals.applyConfiguredOverrides();
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "auto" });
+    expect(setSessionConfigOption).not.toHaveBeenCalled();
+    expect(internals.currentMode).toBe("yolo");
   });
 });
