@@ -24,23 +24,39 @@ const KIMI_PASEO_TO_PROVIDER_MODE: Record<string, string> = {
   plan: "plan",
 };
 
-const KIMI_PROVIDER_TO_PASEO_MODE: Record<string, string> = {
-  auto: "yolo",
-  yolo: "yolo",
-  plan: "plan",
-};
+// Map a Kimi-reported mode id back to the Paseo UI mode id.
+//
+// The only non-identity mapping is the auto → yolo echo: when the user
+// selects Paseo "yolo" we send Kimi "auto", and Kimi later echoes "auto" in
+// current_mode_update. In that case we keep showing "yolo" to the user. For
+// every other combination we preserve the provider's own id, so a genuine
+// Paseo "auto" selection (which also maps to Kimi "auto") stays "auto" in
+// the UI instead of being falsely renamed to "yolo".
+export function kimiProviderToPaseoMode(
+  providerModeId: string,
+  currentPaseoModeId: string | null | undefined,
+): string | null {
+  if (providerModeId === "auto" && currentPaseoModeId === "yolo") {
+    return "yolo";
+  }
+  if (providerModeId === "yolo" || providerModeId === "auto" || providerModeId === "plan") {
+    return providerModeId;
+  }
+  return providerModeId;
+}
 
 export class KimiACPAgentClient extends GenericACPAgentClient {
   constructor(options: KimiACPAgentClientOptions) {
     super({
       ...options,
-      modeIdTransformer: (modeId) => KIMI_PROVIDER_TO_PASEO_MODE[modeId] ?? modeId,
+      modeIdTransformer: (providerModeId, currentModeId) =>
+        kimiProviderToPaseoMode(providerModeId, currentModeId),
       providerModeWriter: (context) => writeKimiMode(context),
     });
   }
 }
 
-async function writeKimiMode(
+export async function writeKimiMode(
   context: ACPProviderModeWriterContext,
 ): Promise<ACPProviderModeWriteResult> {
   const providerModeId = KIMI_PASEO_TO_PROVIDER_MODE[context.requestedModeId];

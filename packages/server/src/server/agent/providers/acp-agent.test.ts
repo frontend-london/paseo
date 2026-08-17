@@ -42,6 +42,7 @@ import {
   writeCopilotProviderMode,
 } from "./copilot-acp-agent.js";
 import { GenericACPAgentClient } from "./generic-acp-agent.js";
+import { kimiProviderToPaseoMode, writeKimiMode } from "./kimi-acp-agent.js";
 import { parseKiroExtensionCommands } from "./kiro-acp-agent.js";
 import { transformPiModels } from "./pi/agent.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
@@ -3729,17 +3730,8 @@ describe("KimiACPAgentClient", () => {
           supportsReasoningStream: true,
           supportsToolInvocations: true,
         },
-        modeIdTransformer: (modeId) => (modeId === "auto" ? "yolo" : modeId),
-        providerModeWriter: async (context) => {
-          if (context.requestedModeId === "yolo") {
-            await context.connection.setSessionMode({
-              sessionId: context.sessionId,
-              modeId: "auto",
-            });
-            return { handled: true, currentModeId: "yolo" };
-          }
-          return { handled: false };
-        },
+        modeIdTransformer: kimiProviderToPaseoMode,
+        providerModeWriter: writeKimiMode,
       },
     );
 
@@ -3784,17 +3776,8 @@ describe("KimiACPAgentClient", () => {
           supportsReasoningStream: true,
           supportsToolInvocations: true,
         },
-        modeIdTransformer: (modeId) => (modeId === "auto" ? "yolo" : modeId),
-        providerModeWriter: async (context) => {
-          if (context.requestedModeId === "yolo") {
-            await context.connection.setSessionMode({
-              sessionId: context.sessionId,
-              modeId: "auto",
-            });
-            return { handled: true, currentModeId: "yolo" };
-          }
-          return { handled: false };
-        },
+        modeIdTransformer: kimiProviderToPaseoMode,
+        providerModeWriter: writeKimiMode,
       },
     );
 
@@ -3816,5 +3799,116 @@ describe("KimiACPAgentClient", () => {
 
     expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "plan" });
     await expect(session.getCurrentMode()).resolves.toBe("plan");
+  });
+
+  test("keeps a genuine Paseo auto selection as auto when Kimi reports auto", async () => {
+    const session = new ACPAgentSession(
+      {
+        provider: "kimi",
+        cwd: "/tmp/paseo-acp-test",
+        modeId: "auto",
+      },
+      {
+        provider: "kimi",
+        logger: createTestLogger(),
+        defaultCommand: ["kimi", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        modeIdTransformer: kimiProviderToPaseoMode,
+        providerModeWriter: writeKimiMode,
+      },
+    );
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [],
+    }));
+    const internals = asInternals<ACPConfiguredOverrideInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode, setSessionConfigOption };
+    internals.availableModes = [
+      { id: "plan", label: "Plan" },
+      { id: "auto", label: "Auto" },
+      { id: "yolo", label: "YOLO" },
+    ];
+    internals.configOptions = [];
+    internals.currentMode = null;
+
+    await internals.applyConfiguredOverrides();
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "auto" });
+    await expect(session.getCurrentMode()).resolves.toBe("auto");
+
+    // Simulate Kimi echoing the effective mode back in a current_mode_update.
+    await session.sessionUpdate({
+      sessionId: "session-1",
+      update: { sessionUpdate: "current_mode_update", currentModeId: "auto" },
+    });
+
+    await expect(session.getCurrentMode()).resolves.toBe("auto");
+  });
+
+  test("maps provider auto back to yolo only when Paseo requested yolo", async () => {
+    const session = new ACPAgentSession(
+      {
+        provider: "kimi",
+        cwd: "/tmp/paseo-acp-test",
+        modeId: "yolo",
+      },
+      {
+        provider: "kimi",
+        logger: createTestLogger(),
+        defaultCommand: ["kimi", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        modeIdTransformer: kimiProviderToPaseoMode,
+        providerModeWriter: writeKimiMode,
+      },
+    );
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [],
+    }));
+    const internals = asInternals<ACPConfiguredOverrideInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode, setSessionConfigOption };
+    internals.availableModes = [
+      { id: "plan", label: "Plan" },
+      { id: "yolo", label: "YOLO" },
+    ];
+    internals.configOptions = [];
+    internals.currentMode = null;
+
+    await internals.applyConfiguredOverrides();
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "auto" });
+    await expect(session.getCurrentMode()).resolves.toBe("yolo");
+
+    // Kimi confirms the effective auto mode.
+    await session.sessionUpdate({
+      sessionId: "session-1",
+      update: { sessionUpdate: "current_mode_update", currentModeId: "auto" },
+    });
+
+    await expect(session.getCurrentMode()).resolves.toBe("yolo");
+  });
+
+  test("does not map an unknown provider mode to yolo", () => {
+    expect(kimiProviderToPaseoMode("manual", "yolo")).toBe("manual");
+    expect(kimiProviderToPaseoMode("unknown", "yolo")).toBe("unknown");
   });
 });

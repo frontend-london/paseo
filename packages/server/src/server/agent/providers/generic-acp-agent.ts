@@ -51,7 +51,7 @@ interface GenericACPAgentClientOptions {
   clientCapabilityMeta?: ACPClientCapabilityMeta;
   configFeatureOptions?: ACPConfigFeatureOption[];
   extensionCommandsParser?: ACPExtensionCommandsParser;
-  modeIdTransformer?: (modeId: string) => string | null;
+  modeIdTransformer?: (modeId: string, currentModeId?: string | null) => string | null;
   providerModeWriter?: (
     context: ACPProviderModeWriterContext,
   ) => Promise<ACPProviderModeWriteResult>;
