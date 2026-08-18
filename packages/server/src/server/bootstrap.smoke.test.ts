@@ -14,6 +14,8 @@ import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import { isPlatform } from "../test-utils/platform.js";
 import { findFreePort } from "./service-proxy.js";
+import { sendPromptToAgent } from "./agent/agent-prompt.js";
+import { readLifecycleResumeManifest } from "./agent/lifecycle-resume-manifest.js";
 
 interface HeldAgentClose {
   started: Promise<void>;
@@ -645,3 +647,86 @@ function probeWebSocketConnection(url: string): Promise<WebSocketProbeResult> {
     });
   });
 }
+
+describe("daemon lifecycle resume manifest on shutdown", () => {
+  test("stop() captures a genuinely running agent into the manifest and gracefully interrupts it (not a bare kill)", async () => {
+    const logger = pino({ level: "silent" });
+    const daemonHandle = await createTestPaseoDaemon({
+      agentClients: createTestAgentClients(),
+    });
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-lifecycle-manifest-agent-"));
+
+    try {
+      const agent = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: agentCwd },
+        undefined,
+        { workspaceId: undefined },
+      );
+
+      const permissionEvents: unknown[] = [];
+      const unsubscribe = daemonHandle.daemon.agentManager.subscribe(
+        (event) => {
+          if (
+            event.type === "agent_stream" &&
+            (event.event.type === "permission_requested" ||
+              event.event.type === "permission_resolved")
+          ) {
+            permissionEvents.push(event.event);
+          }
+        },
+        { agentId: agent.id, replayState: false },
+      );
+
+      // The fake provider requires permission for a tool call by default (no bypass
+      // mode configured) and suspends the turn awaiting it — this keeps the agent
+      // genuinely `running` until either the operator responds or the session is
+      // interrupted, exactly like a real in-flight tool call.
+      void sendPromptToAgent({
+        agentManager: daemonHandle.daemon.agentManager,
+        agentStorage: daemonHandle.daemon.agentStorage,
+        agentId: agent.id,
+        prompt: 'create a file named "foo.txt" with the content "bar"',
+        unarchive: false,
+        logger,
+      });
+
+      await vi.waitFor(() => {
+        const live = daemonHandle.daemon.agentManager.getAgent(agent.id);
+        if (live?.lifecycle !== "running" || live.pendingPermissions.size === 0) {
+          throw new Error("agent has not reached a suspended running turn yet");
+        }
+      });
+
+      await daemonHandle.daemon.stop({ operationId: "test-lifecycle-op" });
+      unsubscribe();
+
+      const manifest = await readLifecycleResumeManifest(
+        daemonHandle.paseoHome,
+        "test-lifecycle-op",
+      );
+      expect(manifest?.entries).toEqual([
+        expect.objectContaining({
+          agentId: agent.id,
+          priorStatus: "running",
+          status: "pending",
+        }),
+      ]);
+
+      // The provider's permission wait resolved via the interrupt race (see
+      // fake-agent-client.ts resolveToolPermission), not by being torn down mid-air —
+      // proof the graceful AgentManager.cancelAgentRun path ran before closeAllAgents.
+      expect(permissionEvents).toContainEqual(
+        expect.objectContaining({
+          type: "permission_resolved",
+          resolution: expect.objectContaining({ interrupt: true }),
+        }),
+      );
+    } finally {
+      await Promise.all([
+        rm(path.dirname(daemonHandle.paseoHome), { recursive: true, force: true }),
+        rm(daemonHandle.staticDir, { recursive: true, force: true }),
+        rm(agentCwd, { recursive: true, force: true }),
+      ]);
+    }
+  });
+});

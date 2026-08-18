@@ -12,8 +12,11 @@ import {
   RestartRequestedStatusPayloadSchema,
   ShutdownRequestedStatusPayloadSchema,
   DaemonUpdateResponseSchema,
+  DaemonLifecycleApprovalResponseMessageSchema,
   SessionInboundMessageSchema,
   type ServerInfoStatusPayload,
+  type DaemonLifecycleAuthorization,
+  type DaemonLifecycleOperation,
 } from "@getpaseo/protocol/messages";
 import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
 import type {
@@ -294,6 +297,14 @@ export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteRe
 export interface DaemonClientConfig {
   url: string;
   clientId: string;
+  /**
+   * Set when this client is running inside/spawned-from an agent's own process tree
+   * (the caller reads PASEO_AGENT_ID, not this library — kept env-read-free so it stays
+   * usable from the desktop/app too). Stamped onto the hello handshake so the daemon's
+   * lifecycle approval gate can require operator approval for stop/restart RPCs issued
+   * over this connection. See daemon-lifecycle-gate.ts.
+   */
+  agentId?: string;
   clientType?: "mobile" | "browser" | "cli" | "mcp";
   appVersion?: string;
   runtimeGeneration?: number | null;
@@ -619,6 +630,7 @@ type ShutdownRequestedStatusPayload = z.infer<typeof ShutdownRequestedStatusPayl
 export interface ShutdownServerOptions {
   requestId?: string;
   timeout?: number;
+  authorization?: DaemonLifecycleAuthorization;
 }
 export interface DaemonStatusOptions {
   requestId?: string;
@@ -953,6 +965,10 @@ function toTimeoutError(error: unknown, label: string, timeoutMs: number): Error
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 1500;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_SESSION_RPC_TIMEOUT_MS = 60_000;
+// The operator may be away from the keyboard for a long time before approving/denying a
+// daemon lifecycle request — this is a "wait for a human", not a real RPC timeout. 24h is
+// comfortably under setTimeout's ~24.8 day max delay.
+const DEFAULT_LIFECYCLE_APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
 const LIVENESS_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -3089,12 +3105,17 @@ export class DaemonClient {
     return payload.notice ?? null;
   }
 
-  async restartServer(reason?: string, requestId?: string): Promise<RestartRequestedStatusPayload> {
+  async restartServer(
+    reason?: string,
+    requestId?: string,
+    authorization?: DaemonLifecycleAuthorization,
+  ): Promise<RestartRequestedStatusPayload> {
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "restart_server_request",
       ...(reason && reason.trim().length > 0 ? { reason } : {}),
       requestId: resolvedRequestId,
+      ...(authorization ? { authorization } : {}),
     });
     return this.sendRequest({
       requestId: resolvedRequestId,
@@ -3121,6 +3142,7 @@ export class DaemonClient {
     const message = SessionInboundMessageSchema.parse({
       type: "shutdown_server_request",
       requestId: resolvedRequestId,
+      ...(options?.authorization ? { authorization: options.authorization } : {}),
     });
     return this.sendRequest({
       requestId: resolvedRequestId,
@@ -3141,6 +3163,60 @@ export class DaemonClient {
         return shutdown.data;
       },
     });
+  }
+
+  /**
+   * Requests operator approval for an agent-initiated `paseo daemon stop|restart`. Only
+   * meaningful when this client's config carried an `agentId` (stamped onto the hello
+   * handshake) — the daemon rejects the request otherwise. Resolves once the operator
+   * clicks Approve/Deny on the resulting permission-request card, however long that
+   * takes; on approval, the response carries a one-shot token to pass as `authorization`
+   * to `shutdownServer`/`restartServer`.
+   */
+  async requestDaemonLifecycleApproval(params: {
+    agentId: string;
+    operation: DaemonLifecycleOperation;
+    host: string;
+    reason?: string;
+    requestId?: string;
+    timeout?: number;
+  }): Promise<{
+    decision: "approved" | "denied";
+    token?: DaemonLifecycleAuthorization;
+    message?: string;
+  }> {
+    const resolvedRequestId = this.createRequestId(params.requestId);
+    const message = SessionInboundMessageSchema.parse({
+      type: "daemon_lifecycle_approval_request",
+      requestId: resolvedRequestId,
+      agentId: params.agentId,
+      operation: params.operation,
+      host: params.host,
+      ...(params.reason ? { reason: params.reason } : {}),
+    });
+    const payload = await this.sendRequest({
+      requestId: resolvedRequestId,
+      message,
+      timeout: params.timeout ?? DEFAULT_LIFECYCLE_APPROVAL_TIMEOUT_MS,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "daemon_lifecycle_approval_response") {
+          return null;
+        }
+        const parsed = DaemonLifecycleApprovalResponseMessageSchema.safeParse(msg);
+        if (!parsed.success || parsed.data.payload.requestId !== resolvedRequestId) {
+          return null;
+        }
+        return parsed.data.payload;
+      },
+    });
+    return {
+      decision: payload.decision,
+      token: payload.token
+        ? { token: payload.token.token, operationId: payload.token.operationId }
+        : undefined,
+      message: payload.message,
+    };
   }
 
   async updateDaemon(requestId?: string): Promise<DaemonUpdateResponse["payload"]> {
@@ -5283,6 +5359,7 @@ export class DaemonClient {
             ...this.config.capabilities,
           },
           ...(this.config.appVersion ? { appVersion: this.config.appVersion } : {}),
+          ...(this.config.agentId ? { agentId: this.config.agentId } : {}),
         }),
       );
     } catch (error) {

@@ -3,8 +3,12 @@ import chalk from "chalk";
 import {
   startLocalDaemonForeground,
   startLocalDaemonDetached,
+  resolveLocalDaemonState,
+  resolveTcpHostFromListen,
   type DaemonStartOptions as StartOptions,
 } from "./local-daemon.js";
+import { detectCallingAgentId } from "./lifecycle-approval.js";
+import { tryConnectToDaemon } from "../../utils/client.js";
 import { getErrorMessage } from "../../utils/errors.js";
 
 export type { DaemonStartOptions as StartOptions } from "./local-daemon.js";
@@ -39,10 +43,42 @@ export function startCommand(): Command {
     });
 }
 
+/**
+ * Agent-initiated `paseo daemon start` requires a live daemon to attach an approval
+ * request to (there is nowhere to host the pending-permission map/promise for a daemon
+ * that doesn't exist yet). Rather than build a separate always-on control-plane broker
+ * just to gate this one edge case, the architectural choice here is to fail closed:
+ * an agent can't start a fully-down shared daemon at all, and must ask the operator to
+ * do it from a real terminal. When a daemon IS already reachable, `start` is a no-op
+ * that already fails cleanly via the PID lock with no session impact — no gating needed.
+ */
+async function isDaemonReachable(home?: string): Promise<boolean> {
+  const state = resolveLocalDaemonState({ home });
+  const host = resolveTcpHostFromListen(state.listen);
+  if (!host) {
+    return false;
+  }
+  const client = await tryConnectToDaemon({ host, timeout: 3000 });
+  if (!client) {
+    return false;
+  }
+  await client.close().catch(() => undefined);
+  return true;
+}
+
 export async function runStart(options: StartOptions): Promise<void> {
   if (options.listen && options.port) {
     console.error(chalk.red("Cannot use --listen and --port together"));
     process.exit(1);
+  }
+
+  const agentId = detectCallingAgentId();
+  if (agentId && !(await isDaemonReachable(options.home))) {
+    exitWithError(
+      `'paseo daemon start' was invoked from inside an agent session (${agentId}), but no ` +
+        "daemon is currently reachable to attach an approval request to. Ask the operator to " +
+        "start the daemon manually from a real terminal.",
+    );
   }
 
   if (!options.foreground) {

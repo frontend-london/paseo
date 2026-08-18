@@ -128,6 +128,11 @@ import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
+import { resumePendingLifecycleManifests } from "./agent/lifecycle-resume.js";
+import {
+  writeLifecycleResumeManifest,
+  type LifecycleResumeManifestEntry,
+} from "./agent/lifecycle-resume-manifest.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import {
@@ -440,7 +445,7 @@ export interface PaseoDaemon {
   scriptRuntimeStore: WorkspaceScriptRuntimeStore;
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(options?: { operationId?: string }): Promise<void>;
   getListenTarget(): ListenTarget | null;
 }
 
@@ -1209,6 +1214,17 @@ export async function createPaseoDaemon(
     { elapsed: elapsed() },
     `Agent registry loaded (${persistedRecords.length} record${persistedRecords.length === 1 ? "" : "s"}); agents will initialize on demand`,
   );
+  // Drain any daemon-lifecycle resume manifest left by a prior shutdown/restart (see
+  // lifecycle-resume-manifest.ts) in the background — reconnecting a provider session can
+  // be slow and must not delay the daemon becoming ready to serve new connections.
+  void resumePendingLifecycleManifests({
+    paseoHome: config.paseoHome,
+    agentManager,
+    agentStorage,
+    logger,
+  }).catch((error: unknown) => {
+    logger.error({ err: error }, "Lifecycle resume manifest processing failed");
+  });
   logger.info(
     "Voice mode configured for agent-scoped resume flow (no dedicated voice assistant provider)",
   );
@@ -1598,7 +1614,49 @@ export async function createPaseoDaemon(
     }
   };
 
-  const stop = async () => {
+  const stop = async (options?: { operationId?: string }) => {
+    // Snapshot which sessions are genuinely active and gracefully interrupt them
+    // *before* anything else tears down, so they can be auto-resumed once the daemon
+    // comes back. Runs for every shutdown/restart (human, agent-approved, self-update,
+    // OS signal) — the resume mechanism is universal; only the *approval* requirement
+    // upstream of this point is agent-specific. See lifecycle-resume-manifest.ts.
+    const lifecycleOperationId = options?.operationId ?? randomUUID();
+    const activeAgents = agentManager.listAgents().filter((agent) => agent.lifecycle === "running");
+    if (activeAgents.length > 0) {
+      const capturedAt = new Date().toISOString();
+      const entries: LifecycleResumeManifestEntry[] = activeAgents.map((agent) => ({
+        agentId: agent.id,
+        cwd: agent.cwd,
+        workspaceId: agent.workspaceId,
+        priorStatus: "running",
+        capturedAt,
+        status: "pending",
+      }));
+      try {
+        await writeLifecycleResumeManifest(config.paseoHome, {
+          operationId: lifecycleOperationId,
+          createdAt: capturedAt,
+          entries,
+        });
+      } catch (error) {
+        logger.error(
+          { err: error, operationId: lifecycleOperationId },
+          "Failed to write daemon lifecycle resume manifest; affected sessions will not auto-resume",
+        );
+      }
+
+      await Promise.all(
+        activeAgents.map((agent) =>
+          agentManager.cancelAgentRun(agent.id).catch((error: unknown) => {
+            logger.warn(
+              { err: error, agentId: agent.id },
+              "Graceful interrupt before daemon shutdown failed; session will be force-closed",
+            );
+          }),
+        ),
+      );
+    }
+
     await hubRelationships.stop();
     workspaceReconciliation.dispose();
     scriptHealthMonitor.stop();

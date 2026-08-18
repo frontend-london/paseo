@@ -68,6 +68,8 @@ import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
+import { DaemonLifecycleGate, type DaemonLifecycleResolution } from "./daemon-lifecycle-gate.js";
+import type { DaemonLifecycleOperation } from "../messages.js";
 import {
   ProviderSubagentStore,
   type ProviderSubagentDescriptor,
@@ -584,6 +586,7 @@ export class AgentManager {
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private acceptingAgentRegistrations = true;
+  private readonly lifecycleGate = new DaemonLifecycleGate();
 
   constructor(options: AgentManagerOptions) {
     this.idFactory = options?.idFactory ?? (() => randomUUID());
@@ -2223,12 +2226,111 @@ export class AgentManager {
     });
   }
 
+  /**
+   * Synthesizes an operator approval request for an agent-initiated daemon lifecycle
+   * operation (`paseo daemon stop|restart` invoked from that agent's own Shell/tool
+   * process) and attaches it to the initiating agent's pendingPermissions, exactly like
+   * Codex's synthetic plan-approval request — so the operator sees and resolves it
+   * through the normal permission-request UI, with no new popup system. Resolution is
+   * handled by respondToPermission delegating into `lifecycleGate` (above) instead of
+   * the (nonexistent, for this synthetic id) provider-session pending-permission map.
+   */
+  async requestDaemonLifecycleApproval(params: {
+    agentId: string;
+    operation: DaemonLifecycleOperation;
+    host: string;
+    reason?: string;
+  }): Promise<{ requestId: string; wait: () => Promise<DaemonLifecycleResolution> }> {
+    const agent = this.requireAgent(params.agentId);
+    const requestId = this.idFactory();
+
+    const { wait } = this.lifecycleGate.beginApproval({
+      requestId,
+      agentId: params.agentId,
+      operation: params.operation,
+      host: params.host,
+    });
+
+    const activeSessions = this.listAgents().filter((a) => a.lifecycle === "running");
+
+    const request: AgentPermissionRequest = {
+      id: requestId,
+      provider: agent.provider,
+      name: "DaemonLifecycle",
+      kind: "other",
+      title: `Daemon ${params.operation} requested`,
+      description:
+        `Agent ${params.agentId} is requesting to ${params.operation} the shared Paseo daemon ` +
+        `on ${params.host}. ${activeSessions.length} active session(s) will be gracefully ` +
+        "interrupted and automatically resumed if approved.",
+      input: {
+        operation: params.operation,
+        host: params.host,
+        ...(params.reason ? { reason: params.reason } : {}),
+      },
+      actions: [
+        { id: "approve", label: "Approve", behavior: "allow", variant: "primary" },
+        { id: "deny", label: "Deny", behavior: "deny", variant: "danger" },
+      ],
+      metadata: {
+        source: "daemon_lifecycle_gate",
+        operation: params.operation,
+        host: params.host,
+        activeSessionsCount: activeSessions.length,
+        activeSessionIds: activeSessions.map((a) => a.id),
+      },
+    };
+
+    // Route through the same internal pipeline real provider-driven permission events
+    // use (handleStreamEvent -> onStreamPermissionRequested), not just the outward
+    // broadcast — that's what actually populates agent.pendingPermissions and raises the
+    // attention flag; dispatchStream alone only re-broadcasts to subscribers.
+    await this.handleStreamEvent(agent, {
+      type: "permission_requested",
+      provider: agent.provider,
+      request,
+    });
+
+    return { requestId, wait };
+  }
+
+  /**
+   * Server-side (RPC-layer) defense-in-depth check for daemon_stop/restart requests
+   * arriving on a connection whose hello handshake carried an agentId — see session.ts's
+   * handleShutdownServerRequest/handleRestartServerRequest. Independent of whether the
+   * CLI itself asked for approval first: a bypassing script that skips the CLI wrapper
+   * but still opens a connection with an agentId gets rejected here too.
+   */
+  validateDaemonLifecycleAuthorization(
+    token: string,
+    expect: { operationId: string; agentId: string; operation: DaemonLifecycleOperation },
+  ): boolean {
+    return this.lifecycleGate.validateToken(token, expect);
+  }
+
   async respondToPermission(
     agentId: string,
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
     const agent = this.requireAgent(agentId);
+
+    // Daemon-lifecycle approval requests are synthesized by the daemon itself (see
+    // requestDaemonLifecycleApproval below), not by the provider session, so the real
+    // provider has no idea this requestId exists. Resolve them here and return before
+    // ever calling agent.session.respondToPermission for a gate-owned id.
+    const lifecycleResolution = this.lifecycleGate.resolveApproval(requestId, response);
+    if (lifecycleResolution) {
+      await this.handleStreamEvent(agent, {
+        type: "permission_resolved",
+        provider: agent.provider,
+        requestId,
+        resolution: response,
+      });
+      await this.persistSnapshot(agent);
+      return undefined;
+    }
+
     agent.inFlightPermissionResponses.add(requestId);
 
     try {

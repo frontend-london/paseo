@@ -21,6 +21,8 @@ import {
   type ProjectPlacementPayload,
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
+  type DaemonLifecycleAuthorization,
+  type DaemonLifecycleOperation,
 } from "./messages.js";
 import type {
   TerminalManager,
@@ -68,6 +70,10 @@ import {
 } from "./lifecycle-reasons.js";
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
+import {
+  DaemonLifecycleGateBusyError,
+  type DaemonLifecycleResolution,
+} from "./agent/daemon-lifecycle-gate.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
   AgentManagerEvent,
@@ -399,6 +405,13 @@ type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
   clientId: string;
+  /**
+   * Set when this connection's `hello` handshake carried an `agentId` — i.e. the client
+   * descends from an agent's own process tree (see daemon-lifecycle-gate.ts). Used to
+   * require operator approval for stop/restart RPCs on this connection; null/undefined
+   * (human terminal, UI, no agent marker) preserves today's unchanged behavior.
+   */
+  agentId?: string | null;
   scopes: readonly string[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -560,6 +573,7 @@ function describeRegistryTransition(record: ArchivedRecordSnapshot | null): Regi
  */
 export class Session {
   private readonly clientId: string;
+  private readonly callerAgentId: string | null | undefined;
   private scopes: readonly string[];
   private appVersion: string | null;
   private clientCapabilities: ReadonlySet<ClientCapability>;
@@ -644,6 +658,7 @@ export class Session {
   constructor(options: SessionOptions) {
     const {
       clientId,
+      agentId: connectionAgentId,
       scopes,
       appVersion,
       clientCapabilities,
@@ -696,6 +711,7 @@ export class Session {
       getWebSocketRuntimeMetrics,
     } = options;
     this.clientId = clientId;
+    this.callerAgentId = connectionAgentId;
     this.scopes = [...scopes];
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
@@ -1827,9 +1843,11 @@ export class Session {
         this.voiceSession.handleDictationCancel(msg.dictationId);
         return undefined;
       case "restart_server_request":
-        return this.handleRestartServerRequest(msg.requestId, msg.reason);
+        return this.handleRestartServerRequest(msg.requestId, msg.reason, msg.authorization);
       case "shutdown_server_request":
-        return this.handleShutdownServerRequest(msg.requestId);
+        return this.handleShutdownServerRequest(msg.requestId, msg.authorization);
+      case "daemon_lifecycle_approval_request":
+        return this.handleDaemonLifecycleApprovalRequest(msg);
       case "client_heartbeat":
         this.handleClientHeartbeat(msg);
         return undefined;
@@ -2267,7 +2285,63 @@ export class Session {
     this.terminalController.handleBinaryFrame(binaryFrame.frame);
   }
 
-  private async handleRestartServerRequest(requestId: string, reason?: string): Promise<void> {
+  /**
+   * True when this connection must present a valid, unconsumed daemon-lifecycle
+   * authorization token to proceed — i.e. it identified itself as agent-originated at
+   * hello time. A connection with no agentId (human terminal, UI, MCP without an
+   * agent context) is completely unaffected by this gate.
+   */
+  private requireDaemonLifecycleAuthorization(
+    requestId: string,
+    requestType: string,
+    operation: DaemonLifecycleOperation,
+    authorization: DaemonLifecycleAuthorization | undefined,
+  ): boolean {
+    if (!this.callerAgentId) {
+      return true;
+    }
+    const ok =
+      authorization !== undefined &&
+      this.agentManager.validateDaemonLifecycleAuthorization(authorization.token, {
+        operationId: authorization.operationId,
+        agentId: this.callerAgentId,
+        operation,
+      });
+    if (!ok) {
+      this.sessionLogger.warn(
+        { agentId: this.callerAgentId, operation },
+        "Rejected agent-initiated daemon lifecycle RPC without a valid approval authorization",
+      );
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId,
+          requestType,
+          error:
+            "This connection is agent-attributed and requires an approved daemon_lifecycle_approval_request authorization for this operation.",
+          code: "lifecycle_approval_required",
+        },
+      });
+    }
+    return ok;
+  }
+
+  private async handleRestartServerRequest(
+    requestId: string,
+    reason?: string,
+    authorization?: DaemonLifecycleAuthorization,
+  ): Promise<void> {
+    if (
+      !this.requireDaemonLifecycleAuthorization(
+        requestId,
+        "restart_server_request",
+        "restart",
+        authorization,
+      )
+    ) {
+      return;
+    }
+
     const lifecycleReason = normalizeClientRestartRpcReason(reason);
     const payload: { status: string } & Record<string, unknown> = {
       status: "restart_requested",
@@ -2292,7 +2366,21 @@ export class Session {
     });
   }
 
-  private async handleShutdownServerRequest(requestId: string): Promise<void> {
+  private async handleShutdownServerRequest(
+    requestId: string,
+    authorization?: DaemonLifecycleAuthorization,
+  ): Promise<void> {
+    if (
+      !this.requireDaemonLifecycleAuthorization(
+        requestId,
+        "shutdown_server_request",
+        "stop",
+        authorization,
+      )
+    ) {
+      return;
+    }
+
     const reason = CLIENT_SHUTDOWN_RPC_REASON;
     this.sessionLogger.warn({ reason }, "Shutdown requested via websocket");
     this.emit({
@@ -2309,6 +2397,63 @@ export class Session {
       clientId: this.clientId,
       requestId,
       reason,
+    });
+  }
+
+  private async handleDaemonLifecycleApprovalRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon_lifecycle_approval_request" }>,
+  ): Promise<void> {
+    if (!this.callerAgentId || msg.agentId !== this.callerAgentId) {
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: "daemon_lifecycle_approval_request.agentId must match this connection's agentId",
+          code: "lifecycle_agent_id_mismatch",
+        },
+      });
+      return;
+    }
+
+    let approval: { requestId: string; wait: () => Promise<DaemonLifecycleResolution> };
+    try {
+      approval = await this.agentManager.requestDaemonLifecycleApproval({
+        agentId: msg.agentId,
+        operation: msg.operation,
+        host: msg.host,
+        reason: msg.reason,
+      });
+    } catch (error) {
+      const code =
+        error instanceof DaemonLifecycleGateBusyError
+          ? "lifecycle_gate_busy"
+          : "lifecycle_approval_request_failed";
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: getErrorMessage(error),
+          code,
+        },
+      });
+      return;
+    }
+
+    // Deliberately unbounded: the operator may be away from the keyboard for a long
+    // time. This resolves as soon as respondToPermission handles the matching
+    // agent_permission_response (Approve/Deny), however long that takes.
+    const resolution = await approval.wait();
+    this.emit({
+      type: "daemon_lifecycle_approval_response",
+      payload: {
+        requestId: approval.requestId,
+        agentId: msg.agentId,
+        decision: resolution.decision,
+        token: resolution.token,
+        message: resolution.message,
+      },
     });
   }
 

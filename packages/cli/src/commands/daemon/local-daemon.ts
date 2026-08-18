@@ -5,6 +5,7 @@ import path from "node:path";
 import { loadConfig, resolvePaseoHome, spawnProcess } from "@getpaseo/server";
 import treeKill from "tree-kill";
 import { tryConnectToDaemon } from "../../utils/client.js";
+import { requestApprovalIfAgentInvoked } from "./lifecycle-approval.js";
 
 export interface DaemonStartOptions {
   port?: string;
@@ -52,6 +53,8 @@ export interface StopLocalDaemonOptions {
   timeoutMs?: number;
   killTimeoutMs?: number;
   force?: boolean;
+  /** Set when this command was invoked from inside an agent — see detectCallingAgentId. */
+  agentId?: string;
 }
 
 export interface StopLocalDaemonResult {
@@ -494,7 +497,17 @@ async function waitForStopAfterRequest(args: {
   return { stopped, forced: false };
 }
 
-type LifecycleShutdownAttempt = { requested: true } | { requested: false; reason: string };
+type LifecycleShutdownAttempt =
+  | { requested: true }
+  | { requested: false; reason: string }
+  | { denied: true; message?: string };
+
+export class DaemonLifecycleDeniedError extends Error {
+  constructor(message?: string) {
+    super(message ?? "Daemon lifecycle operation was denied by the operator");
+    this.name = "DaemonLifecycleDeniedError";
+  }
+}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -671,6 +684,7 @@ export function startLocalDaemonForeground(
 async function requestLifecycleShutdown(
   state: LocalDaemonState,
   timeoutMs: number,
+  agentId: string | undefined,
 ): Promise<LifecycleShutdownAttempt> {
   const host = resolveTcpHostFromListen(state.listen);
   if (!host) {
@@ -691,7 +705,27 @@ async function requestLifecycleShutdown(
   }
 
   try {
-    await client.shutdownServer({ timeout: Math.min(remainingTimeoutMs(), 5000) });
+    // The underlying RPC is always shutdown_server_request, even for `paseo daemon
+    // restart` (which is stop-then-spawn at the CLI level) — so the approval/token is
+    // always requested for the "stop" operation, matching what session.ts actually
+    // authorizes on the shutdown_server_request path.
+    const approval = await requestApprovalIfAgentInvoked({
+      client,
+      agentId,
+      operation: "stop",
+      host,
+    });
+    if ("denied" in approval) {
+      // Explicitly denied (or approved with no usable token) — this must be a hard
+      // failure, never treated as "couldn't ask, fall back to signaling the PID".
+      return { denied: true, message: approval.message };
+    }
+    const authorization = "approved" in approval ? approval.authorization : undefined;
+
+    await client.shutdownServer({
+      timeout: Math.min(remainingTimeoutMs(), 5000),
+      authorization,
+    });
     return { requested: true };
   } catch (error) {
     return {
@@ -714,7 +748,18 @@ export async function stopLocalDaemon(
   const deadline = Date.now() + timeoutMs;
   const remainingTimeoutMs = () => Math.max(1, deadline - Date.now());
 
-  const shutdownAttempt = await requestLifecycleShutdown(state, remainingTimeoutMs());
+  const shutdownAttempt = await requestLifecycleShutdown(
+    state,
+    remainingTimeoutMs(),
+    options.agentId,
+  );
+
+  if ("denied" in shutdownAttempt) {
+    // Explicitly denied (or approved with no usable token) — must never fall through to
+    // signalDaemonOwnerForStop below; that would silently defeat the approval gate.
+    throw new DaemonLifecycleDeniedError(shutdownAttempt.message);
+  }
+
   const lifecycleRequested = shutdownAttempt.requested;
 
   if (!state.pidInfo || (!state.running && !lifecycleRequested)) {

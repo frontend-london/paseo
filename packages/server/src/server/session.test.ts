@@ -23,6 +23,7 @@ import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentManagerEvent } from "./agent/agent-manager.js";
+import { DaemonLifecycleGateBusyError } from "./agent/daemon-lifecycle-gate.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { createPersistedProjectRecord } from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
@@ -280,6 +281,7 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 
 interface SessionForTestOptions {
   scopes?: readonly string[];
+  agentId?: string | null;
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
   agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
   github?: Partial<ForgeService & GitHubService>;
@@ -317,6 +319,7 @@ interface SessionForTestOptions {
   messages?: unknown[];
   targetedMessages?: Array<{ source: object; message: SessionOutboundMessage }>;
   binaryMessages?: Uint8Array[];
+  onLifecycleIntent?: SessionOptions["onLifecycleIntent"];
 }
 
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
@@ -353,6 +356,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
 
   const sessionOptions: SessionOptions = {
     clientId: "test-client",
+    agentId: options.agentId,
     onMessage: (message) => messages.push(message),
     ...(options.targetedMessages
       ? {
@@ -417,6 +421,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
     scopes: options.scopes ?? ["*"],
+    onLifecycleIntent: options.onLifecycleIntent,
   };
   return new Session(sessionOptions);
 }
@@ -5222,5 +5227,231 @@ describe("agent config setters", () => {
         error: "thinking boom",
       },
     });
+  });
+});
+
+describe("daemon lifecycle approval gate", () => {
+  test("a human-terminal connection (no agentId) can shutdown/restart without any authorization — unchanged behavior", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const intents: unknown[] = [];
+    const requestDaemonLifecycleApproval = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      onLifecycleIntent: (intent) => intents.push(intent),
+      agentManager: { requestDaemonLifecycleApproval },
+    });
+
+    await session.handleMessage({ type: "shutdown_server_request", requestId: "req-1" });
+
+    expect(requestDaemonLifecycleApproval).not.toHaveBeenCalled();
+    expect(intents).toEqual([expect.objectContaining({ type: "shutdown", requestId: "req-1" })]);
+    expect(messages.some((m) => m.type === "rpc_error")).toBe(false);
+  });
+
+  test("an agent-attributed connection is rejected without an authorization token", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const intents: unknown[] = [];
+    const session = createSessionForTest({
+      agentId: "agent-1",
+      messages,
+      onLifecycleIntent: (intent) => intents.push(intent),
+    });
+
+    await session.handleMessage({ type: "shutdown_server_request", requestId: "req-1" });
+
+    expect(intents).toEqual([]);
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "req-1",
+          requestType: "shutdown_server_request",
+          error: expect.stringContaining("approved"),
+          code: "lifecycle_approval_required",
+        },
+      },
+    ]);
+  });
+
+  test("an agent-attributed connection is rejected with a stale/invalid authorization token", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const intents: unknown[] = [];
+    const validateDaemonLifecycleAuthorization = vi.fn(() => false);
+    const session = createSessionForTest({
+      agentId: "agent-1",
+      messages,
+      onLifecycleIntent: (intent) => intents.push(intent),
+      agentManager: { validateDaemonLifecycleAuthorization },
+    });
+
+    await session.handleMessage({
+      type: "shutdown_server_request",
+      requestId: "req-1",
+      authorization: { token: "stale-token", operationId: "op-1" },
+    });
+
+    expect(validateDaemonLifecycleAuthorization).toHaveBeenCalledWith("stale-token", {
+      operationId: "op-1",
+      agentId: "agent-1",
+      operation: "stop",
+    });
+    expect(intents).toEqual([]);
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "rpc_error",
+        payload: expect.objectContaining({ code: "lifecycle_approval_required" }),
+      }),
+    ]);
+  });
+
+  test("an agent-attributed connection proceeds once a valid authorization token is presented", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const intents: unknown[] = [];
+    const validateDaemonLifecycleAuthorization = vi.fn(() => true);
+    const session = createSessionForTest({
+      agentId: "agent-1",
+      messages,
+      onLifecycleIntent: (intent) => intents.push(intent),
+      agentManager: { validateDaemonLifecycleAuthorization },
+    });
+
+    await session.handleMessage({
+      type: "restart_server_request",
+      requestId: "req-2",
+      authorization: { token: "good-token", operationId: "op-2" },
+    });
+
+    expect(validateDaemonLifecycleAuthorization).toHaveBeenCalledWith("good-token", {
+      operationId: "op-2",
+      agentId: "agent-1",
+      operation: "restart",
+    });
+    expect(intents).toEqual([expect.objectContaining({ type: "restart", requestId: "req-2" })]);
+  });
+
+  test("a daemon_lifecycle_approval_request whose payload agentId doesn't match the connection is rejected", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const requestDaemonLifecycleApproval = vi.fn();
+    const session = createSessionForTest({
+      agentId: "agent-1",
+      messages,
+      agentManager: { requestDaemonLifecycleApproval },
+    });
+
+    await session.handleMessage({
+      type: "daemon_lifecycle_approval_request",
+      requestId: "req-3",
+      agentId: "someone-elses-agent-id",
+      operation: "restart",
+      host: "h",
+    });
+
+    expect(requestDaemonLifecycleApproval).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "rpc_error",
+        payload: expect.objectContaining({ code: "lifecycle_agent_id_mismatch" }),
+      }),
+    ]);
+  });
+
+  test("a daemon_lifecycle_approval_request without any agentId on the connection is rejected", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const requestDaemonLifecycleApproval = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      agentManager: { requestDaemonLifecycleApproval },
+    });
+
+    await session.handleMessage({
+      type: "daemon_lifecycle_approval_request",
+      requestId: "req-3",
+      agentId: "agent-1",
+      operation: "restart",
+      host: "h",
+    });
+
+    expect(requestDaemonLifecycleApproval).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "rpc_error",
+        payload: expect.objectContaining({ code: "lifecycle_agent_id_mismatch" }),
+      }),
+    ]);
+  });
+
+  test("a daemon_lifecycle_approval_request resolves with the approval decision from AgentManager", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const token = {
+      token: "tok-1",
+      operationId: "req-4",
+      agentId: "agent-1",
+      operation: "restart" as const,
+      host: "h",
+      expiresAt: new Date().toISOString(),
+    };
+    const requestDaemonLifecycleApproval = vi.fn().mockResolvedValue({
+      requestId: "req-4",
+      wait: () => Promise.resolve({ decision: "approved", token }),
+    });
+    const session = createSessionForTest({
+      agentId: "agent-1",
+      messages,
+      agentManager: { requestDaemonLifecycleApproval },
+    });
+
+    await session.handleMessage({
+      type: "daemon_lifecycle_approval_request",
+      requestId: "req-4",
+      agentId: "agent-1",
+      operation: "restart",
+      host: "h",
+    });
+
+    expect(requestDaemonLifecycleApproval).toHaveBeenCalledWith({
+      agentId: "agent-1",
+      operation: "restart",
+      host: "h",
+      reason: undefined,
+    });
+    expect(messages).toEqual([
+      {
+        type: "daemon_lifecycle_approval_response",
+        payload: {
+          requestId: "req-4",
+          agentId: "agent-1",
+          decision: "approved",
+          token,
+          message: undefined,
+        },
+      },
+    ]);
+  });
+
+  test("a busy gate is surfaced as a distinct rpc_error code, not a generic failure", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const requestDaemonLifecycleApproval = vi
+      .fn()
+      .mockRejectedValue(new DaemonLifecycleGateBusyError("req-in-flight"));
+    const session = createSessionForTest({
+      agentId: "agent-1",
+      messages,
+      agentManager: { requestDaemonLifecycleApproval },
+    });
+
+    await session.handleMessage({
+      type: "daemon_lifecycle_approval_request",
+      requestId: "req-5",
+      agentId: "agent-1",
+      operation: "stop",
+      host: "h",
+    });
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "rpc_error",
+        payload: expect.objectContaining({ code: "lifecycle_gate_busy" }),
+      }),
+    ]);
   });
 });

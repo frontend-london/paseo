@@ -1346,15 +1346,40 @@ export const CancelAgentRequestMessageSchema = z.object({
   requestId: z.string().optional(),
 });
 
+// Daemon lifecycle approval gate: when a `stop`/`restart` lifecycle RPC arrives on a
+// connection whose `hello` handshake carried an `agentId` (i.e. the client descends from
+// an agent's own Shell/tool invocation, not a human terminal), the request must carry a
+// valid, unconsumed authorization token minted by a prior approved
+// `daemon_lifecycle_approval_request`. See daemon-lifecycle-gate.ts.
+export const DaemonLifecycleOperationSchema = z.enum(["stop", "restart"]);
+export type DaemonLifecycleOperation = z.infer<typeof DaemonLifecycleOperationSchema>;
+
+export const DaemonLifecycleAuthorizationSchema = z.object({
+  token: z.string(),
+  operationId: z.string(),
+});
+export type DaemonLifecycleAuthorization = z.infer<typeof DaemonLifecycleAuthorizationSchema>;
+
+export const DaemonLifecycleApprovalRequestMessageSchema = z.object({
+  type: z.literal("daemon_lifecycle_approval_request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  operation: DaemonLifecycleOperationSchema,
+  host: z.string(),
+  reason: z.string().optional(),
+});
+
 export const RestartServerRequestMessageSchema = z.object({
   type: z.literal("restart_server_request"),
   reason: z.string().optional(),
   requestId: z.string(),
+  authorization: DaemonLifecycleAuthorizationSchema.optional(),
 });
 
 export const ShutdownServerRequestMessageSchema = z.object({
   type: z.literal("shutdown_server_request"),
   requestId: z.string(),
+  authorization: DaemonLifecycleAuthorizationSchema.optional(),
 });
 
 export const DaemonUpdateRequestMessageSchema = z.object({
@@ -2495,6 +2520,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ShutdownServerRequestMessageSchema,
   RestartServerRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
+  DaemonLifecycleApprovalRequestMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
@@ -3907,6 +3933,31 @@ export const AgentPermissionResolvedMessageSchema = z.object({
   }),
 });
 
+// Opaque, one-shot, short-lived token scoped to exactly one approved lifecycle
+// operation. Issued and validated in-memory by the same daemon process instance
+// that granted the approval (not a signed JWT — issuer and validator are always
+// the same process, so signing would add no real security margin here).
+export const DaemonLifecycleTokenSchema = z.object({
+  token: z.string(),
+  operationId: z.string(),
+  agentId: z.string(),
+  operation: DaemonLifecycleOperationSchema,
+  host: z.string(),
+  expiresAt: z.string(),
+});
+export type DaemonLifecycleToken = z.infer<typeof DaemonLifecycleTokenSchema>;
+
+export const DaemonLifecycleApprovalResponseMessageSchema = z.object({
+  type: z.literal("daemon_lifecycle_approval_response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    decision: z.enum(["approved", "denied"]),
+    token: DaemonLifecycleTokenSchema.optional(),
+    message: z.string().optional(),
+  }),
+});
+
 export const AgentDeletedMessageSchema = z.object({
   type: z.literal("agent_deleted"),
   payload: z.object({
@@ -5265,6 +5316,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WaitForFinishResponseMessageSchema,
   AgentPermissionRequestMessageSchema,
   AgentPermissionResolvedMessageSchema,
+  DaemonLifecycleApprovalResponseMessageSchema,
   AgentDeletedMessageSchema,
   AgentArchivedMessageSchema,
   CloseItemsResponseSchema,
@@ -5732,6 +5784,12 @@ export type FileUploadRequest = z.infer<typeof FileUploadRequestSchema>;
 export type FileUploadResponse = z.infer<typeof FileUploadResponseSchema>;
 export type RestartServerRequestMessage = z.infer<typeof RestartServerRequestMessageSchema>;
 export type ShutdownServerRequestMessage = z.infer<typeof ShutdownServerRequestMessageSchema>;
+export type DaemonLifecycleApprovalRequestMessage = z.infer<
+  typeof DaemonLifecycleApprovalRequestMessageSchema
+>;
+export type DaemonLifecycleApprovalResponseMessage = z.infer<
+  typeof DaemonLifecycleApprovalResponseMessageSchema
+>;
 export type ClearAgentAttentionMessage = z.infer<typeof ClearAgentAttentionMessageSchema>;
 export type ClearAgentAttentionResponseMessage = z.infer<
   typeof ClearAgentAttentionResponseMessageSchema
@@ -5790,6 +5848,10 @@ export const WSHelloMessageSchema = z.object({
   clientType: z.enum(["mobile", "browser", "cli", "mcp"]),
   protocolVersion: z.number().int(),
   appVersion: z.string().optional(),
+  // Set when this connection was opened by client code running inside/spawned-from an
+  // agent's own process tree (sourced from PASEO_AGENT_ID). Used by the daemon lifecycle
+  // approval gate to require operator approval for stop/restart RPCs on this connection.
+  agentId: z.string().optional(),
   capabilities: z
     .object({
       voice: z.boolean().optional(),

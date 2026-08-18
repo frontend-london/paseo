@@ -275,6 +275,11 @@ async function tryConnectHost(
   const client = new DaemonClient({
     url: target.url,
     clientId,
+    // Any process spawned by/inside an agent (e.g. its own Shell/tool invocations)
+    // inherits PASEO_AGENT_ID from the daemon-injected env, so this is automatic and
+    // not something an agent could "forget" to set. Used by the daemon's lifecycle
+    // approval gate — see daemon-lifecycle-gate.ts.
+    agentId: process.env.PASEO_AGENT_ID?.trim() || undefined,
     clientType: "cli",
     appVersion: resolveCliVersion(),
     password,
