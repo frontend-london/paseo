@@ -2834,7 +2834,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     const nextThinkingOptionId = deriveCurrentConfigValue(this.configOptions, "thought_level");
 
     this.availableModes = modeInfo.modes;
-    this.currentMode = nextMode ?? this.currentMode;
+    this.currentMode = this.transformModeId(nextMode, this.currentMode) ?? this.currentMode;
     this.providerCurrentMode =
       this.currentMode !== null && this.providerModeMapper
         ? this.providerModeMapper(this.currentMode)
