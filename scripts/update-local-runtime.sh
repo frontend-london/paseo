@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 1. Verify the canonical worktree and branch.
-if [[ ! -d "$CANONICAL_WORKTREE/.git" ]]; then
+if ! git -C "$CANONICAL_WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
   red "Canonical worktree does not look like a git repository: $CANONICAL_WORKTREE"
   exit 1
 fi
