@@ -104,7 +104,7 @@ PASEO_HOME="$PASEO_HOME" "$cli_bin" ls -a -g >"$ls_output" 2>&1 || true
 if grep -Eq '(^|[[:space:]])running([[:space:]]|$)' "$ls_output"; then
   red "Active Paseo session(s) are still running. Refusing to update the runtime."
   red "Stop or wait for all agents first:"
-  sed 's/^/  /' "$ls_output" >&2
+  grep -E '(^|[[:space:]])running([[:space:]]|$)' "$ls_output" | sed 's/^/  /' >&2
   exit 1
 fi
 
