@@ -6,6 +6,7 @@ import type {
   ResolveAgentCreateConfigInput,
   ResolveAgentCreateConfigResult,
 } from "./agent-sdk-types.js";
+import { resolvePaseoModeDefault } from "./paseo-yolo-guard.js";
 
 export interface ResolveCreateAgentModeInput {
   requestedMode: string | undefined;
@@ -43,7 +44,12 @@ function formatCreateConfigParentSource(parent: AgentCreateConfigParent): string
 export function resolveAndValidateCreateAgentMode(
   input: ResolveCreateAgentModeInput,
 ): string | undefined {
-  const { requestedMode, targetProvider, parent, availableModes } = input;
+  const { targetProvider, parent, availableModes } = input;
+
+  const requestedMode =
+    parent === null
+      ? resolvePaseoModeDefault(input.requestedMode, availableModes)
+      : input.requestedMode;
 
   if (requestedMode !== undefined) {
     if (availableModes !== undefined && !availableModes.includes(requestedMode)) {

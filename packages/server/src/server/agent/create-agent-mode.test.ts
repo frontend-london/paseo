@@ -210,4 +210,86 @@ describe("resolveAndValidateCreateAgentMode", () => {
     });
     expect(resolved).toBe("auto");
   });
+
+  const YOLO_MODES = ["yolo", "plan", "bypassPermissions"];
+
+  it("defaults top-level missing mode to yolo when provider supports it", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: undefined,
+      targetProvider: "kimi",
+      parent: null,
+      unattended: false,
+      availableModes: YOLO_MODES,
+    });
+    expect(resolved).toBe("yolo");
+  });
+
+  it("normalizes legacy 'default' mode to yolo when provider supports it", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: "default",
+      targetProvider: "kimi",
+      parent: null,
+      unattended: false,
+      availableModes: YOLO_MODES,
+    });
+    expect(resolved).toBe("yolo");
+  });
+
+  it("normalizes legacy 'smart' mode to yolo when provider supports it", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: "smart",
+      targetProvider: "kimi",
+      parent: null,
+      unattended: false,
+      availableModes: YOLO_MODES,
+    });
+    expect(resolved).toBe("yolo");
+  });
+
+  it("preserves explicit non-default mode when provider supports yolo", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: "plan",
+      targetProvider: "kimi",
+      parent: null,
+      unattended: false,
+      availableModes: YOLO_MODES,
+    });
+    expect(resolved).toBe("plan");
+  });
+
+  it("does not default to yolo when provider does not support it", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: undefined,
+      targetProvider: "claude",
+      parent: null,
+      unattended: false,
+      availableModes: CLAUDE_MODES,
+    });
+    expect(resolved).toBeUndefined();
+  });
+
+  it("rejects legacy 'smart' alias when provider does not support it", () => {
+    expect(() =>
+      resolveAndValidateCreateAgentMode({
+        requestedMode: "smart",
+        targetProvider: "claude",
+        parent: null,
+        unattended: false,
+        availableModes: CLAUDE_MODES,
+      }),
+    ).toThrow(
+      "Invalid mode 'smart' for provider 'claude'. Available modes: default, acceptEdits, plan, bypassPermissions",
+    );
+  });
+
+  it("preserves provider-native 'default' mode when yolo is not supported", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: "default",
+      targetProvider: "claude",
+      parent: null,
+      unattended: false,
+      availableModes: CLAUDE_MODES,
+    });
+    expect(resolved).toBe("default");
+  });
 });
