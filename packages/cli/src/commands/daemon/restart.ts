@@ -3,8 +3,10 @@ import {
   startLocalDaemonDetached,
   stopLocalDaemon,
   DEFAULT_STOP_TIMEOUT_MS,
+  DaemonLifecycleDeniedError,
   type DaemonStartOptions,
 } from "./local-daemon.js";
+import { detectCallingAgentId } from "./lifecycle-approval.js";
 import type {
   CommandOptions,
   SingleResult,
@@ -83,6 +85,7 @@ export async function runRestartCommand(
   const timeoutMs = parseTimeoutMs(options.timeout);
   const force = options.force === true;
   const startOptions = toStartOptions(options);
+  const agentId = detectCallingAgentId();
 
   try {
     let stopResult: Awaited<ReturnType<typeof stopLocalDaemon>>;
@@ -91,8 +94,13 @@ export async function runRestartCommand(
         home: startOptions.home,
         timeoutMs,
         force,
+        agentId,
       });
     } catch (err) {
+      if (err instanceof DaemonLifecycleDeniedError) {
+        // A denial is definitive — never retry a denied approval automatically.
+        throw err;
+      }
       const isTimeout =
         err instanceof Error && err.message.includes("Timed out waiting for daemon PID");
       if (!force && isTimeout) {
@@ -100,6 +108,7 @@ export async function runRestartCommand(
           home: startOptions.home,
           timeoutMs,
           force: true,
+          agentId,
         });
       } else {
         throw err;
@@ -121,6 +130,14 @@ export async function runRestartCommand(
       schema: restartResultSchema,
     };
   } catch (err) {
+    if (err instanceof DaemonLifecycleDeniedError) {
+      const error: CommandError = {
+        code: "LIFECYCLE_APPROVAL_DENIED",
+        message: `Daemon restart denied by operator: ${err.message}`,
+        details: "Ask the operator to run 'paseo daemon restart' manually, or retry later.",
+      };
+      throw error;
+    }
     const message = err instanceof Error ? err.message : String(err);
     const error: CommandError = {
       code: "RESTART_FAILED",

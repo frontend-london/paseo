@@ -132,6 +132,7 @@ async function main() {
     options?: {
       reason?: string;
       successExitCode?: number;
+      operationId?: string;
     },
   ) => {
     const reason = options?.reason ?? `worker_received_${signal}`;
@@ -156,7 +157,7 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop();
+          await daemon.stop({ operationId: options?.operationId });
           clearTimeout(forceExit);
           logger.info("Server closed");
           return options?.successExitCode ?? 0;
@@ -198,7 +199,10 @@ async function main() {
       if (sendSupervisorLifecycleMessage({ type: "paseo:shutdown", reason: intent.reason })) {
         return;
       }
-      beginShutdown("shutdown lifecycle intent", { reason: intent.reason });
+      beginShutdown("shutdown lifecycle intent", {
+        reason: intent.reason,
+        operationId: intent.requestId,
+      });
       return;
     }
 
@@ -217,6 +221,7 @@ async function main() {
     beginShutdown("restart lifecycle intent", {
       reason: intent.reason,
       successExitCode: 0,
+      operationId: intent.requestId,
     });
   };
 

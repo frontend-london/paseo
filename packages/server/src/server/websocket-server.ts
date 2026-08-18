@@ -455,6 +455,7 @@ interface BrowserToolsRegistration {
 
 interface SocketSessionOptions {
   clientId: string;
+  agentId?: string | null;
   appVersion: string | null;
   clientCapabilities: Record<string, unknown> | null;
   scopes: readonly string[];
@@ -1243,15 +1244,17 @@ export class VoiceAssistantWebSocketServer {
   private createSessionConnection(params: {
     ws: WebSocketLike;
     clientId: string;
+    agentId?: string | null;
     appVersion: string | null;
     clientCapabilities: Record<string, unknown> | null;
     connectionLogger: pino.Logger;
   }): TrustedSessionConnection {
-    const { ws, clientId, appVersion, clientCapabilities, connectionLogger } = params;
+    const { ws, clientId, agentId, appVersion, clientCapabilities, connectionLogger } = params;
     let connection: TrustedSessionConnection | null = null;
 
     const session = this.createSocketSession({
       clientId,
+      agentId,
       appVersion,
       clientCapabilities,
       scopes: ["*"],
@@ -1319,6 +1322,7 @@ export class VoiceAssistantWebSocketServer {
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
       clientId: options.clientId,
+      agentId: options.agentId,
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
       scopes: options.scopes,
@@ -1500,6 +1504,7 @@ export class VoiceAssistantWebSocketServer {
     const connection = this.createSessionConnection({
       ws,
       clientId,
+      agentId: message.agentId ?? null,
       appVersion: message.appVersion ?? null,
       clientCapabilities: message.capabilities ?? null,
       connectionLogger,

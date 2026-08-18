@@ -3,7 +3,9 @@ import {
   stopLocalDaemon,
   DEFAULT_STOP_TIMEOUT_MS,
   DEFAULT_KILL_TIMEOUT_MS,
+  DaemonLifecycleDeniedError,
 } from "./local-daemon.js";
+import { detectCallingAgentId } from "./lifecycle-approval.js";
 import type {
   CommandOptions,
   SingleResult,
@@ -68,8 +70,10 @@ export async function runStopCommand(
     "kill-timeout",
   );
 
+  const agentId = detectCallingAgentId();
+
   try {
-    const result = await stopLocalDaemon({ home, force, timeoutMs, killTimeoutMs });
+    const result = await stopLocalDaemon({ home, force, timeoutMs, killTimeoutMs, agentId });
     return {
       type: "single",
       data: {
@@ -84,6 +88,14 @@ export async function runStopCommand(
       schema: stopResultSchema,
     };
   } catch (err) {
+    if (err instanceof DaemonLifecycleDeniedError) {
+      const error: CommandError = {
+        code: "LIFECYCLE_APPROVAL_DENIED",
+        message: `Daemon stop denied by operator: ${err.message}`,
+        details: "Ask the operator to run 'paseo daemon stop' manually, or retry later.",
+      };
+      throw error;
+    }
     const message = err instanceof Error ? err.message : String(err);
     const error: CommandError = {
       code: "STOP_FAILED",
