@@ -701,6 +701,8 @@ export async function runRunCommand(
             env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
             mcpServers,
+            backend: "paseo",
+            category: "agent",
           });
         } else {
           await client.sendMessage(structuredAgent.id, structuredPrompt);
@@ -772,6 +774,8 @@ export async function runRunCommand(
       env: requestEnv,
       labels: Object.keys(labels).length > 0 ? labels : undefined,
       mcpServers,
+      backend: "paseo",
+      category: "agent",
     });
 
     // Default run behavior is foreground: wait for completion unless background execution is set.

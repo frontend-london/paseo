@@ -214,6 +214,8 @@ export class DaemonExecutions implements HubExecutionAgents {
         onCreated: (created) => {
           createdAgentId = created.agentId;
         },
+        backend: "paseo",
+        category: "agent",
       });
       this.requireAuthority(authorityGeneration);
       requireExecutionWorkspaceId(result.liveSnapshot);

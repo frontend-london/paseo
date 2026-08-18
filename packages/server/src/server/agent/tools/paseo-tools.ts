@@ -1467,6 +1467,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           callerAgentId,
           callerContext,
           worktree,
+          backend: "paseo",
+          category: "agent",
         },
       );
 

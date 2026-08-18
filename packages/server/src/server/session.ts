@@ -3115,6 +3115,8 @@ export class Session {
       images,
       attachments,
       env,
+      backend,
+      category,
     } = msg;
     this.sessionLogger.info(
       { cwd: config.cwd, provider: config.provider, worktreeName },
@@ -3186,6 +3188,8 @@ export class Session {
           firstAgentContext,
           buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
             this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
+          backend,
+          category,
         },
       );
       createdAgentId = snapshot.id;

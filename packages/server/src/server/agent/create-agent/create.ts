@@ -26,6 +26,11 @@ import {
   emitLiveTimelineItemIfAgentKnown,
 } from "../timeline-append.js";
 import { resolveCreateAgentIntent } from "./intent.js";
+import {
+  assertPaseoOnlySession,
+  PASEO_BACKEND,
+  type PaseoOnlyCategory,
+} from "../paseo-only-guard.js";
 
 export interface CreateAgentSessionWorktreeResult {
   sessionConfig: AgentSessionConfig;
@@ -74,6 +79,10 @@ export interface CreateAgentFromSessionInput {
     legacyWorktreeName?: string,
     firstAgentContext?: FirstAgentContext,
   ) => Promise<CreateAgentSessionWorktreeResult>;
+  /** Runtime backend that owns this session. Defaults to Paseo. */
+  backend?: string;
+  /** Session category for the Paseo-only guard. */
+  category?: PaseoOnlyCategory;
 }
 
 export interface CreateAgentFromMcpInput {
@@ -107,6 +116,10 @@ export interface CreateAgentFromMcpInput {
     allowCustomCwd?: boolean;
     childAgentDefaultLabels?: Record<string, string>;
   } | null;
+  /** Runtime backend that owns this session. Defaults to Paseo. */
+  backend?: string;
+  /** Session category for the Paseo-only guard. */
+  category?: PaseoOnlyCategory;
   worktree?: {
     worktreeName?: string;
     branchName?: string;
@@ -174,6 +187,8 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
+  assertPaseoOnlySession(input.backend ?? PASEO_BACKEND, input.category ?? "agent");
+
   const resolved =
     input.kind === "session"
       ? await resolveSessionCreateAgent(dependencies, input)

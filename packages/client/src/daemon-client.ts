@@ -367,6 +367,10 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   worktreeName?: string;
   requestId?: string;
   labels?: Record<string, string>;
+  /** Runtime backend. Defaults to Paseo. */
+  backend?: "paseo" | "tmux";
+  /** Session category for the Paseo-only guard. */
+  category?: "agent" | "delivery" | "delegate" | "mission";
 }
 
 export interface CreatePaseoWorktreeInput extends Pick<
@@ -2393,6 +2397,8 @@ export class DaemonClient {
       ...(options.labels && Object.keys(options.labels).length > 0
         ? { labels: options.labels }
         : {}),
+      backend: options.backend ?? "paseo",
+      category: options.category ?? "agent",
     });
 
     const status = await this.sendRequest({

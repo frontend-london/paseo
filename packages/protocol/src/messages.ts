@@ -1374,6 +1374,14 @@ export const CreateAgentRequestMessageSchema = z.object({
   autoArchive: z.boolean().optional(),
   labels: z.record(z.string(), z.string()).default({}),
   requestId: z.string(),
+  // Runtime backend that owns this session. Paseo-only runtime rejects anything else.
+  // COMPAT(paseoOnlyGuard): added in v0.4.1, remove default when floor >= v0.4.1.
+  backend: z.union([z.literal("paseo"), z.literal("tmux")]).default("paseo"),
+  // Session category for the Paseo-only guard (agent, delivery, delegate, mission).
+  // COMPAT(paseoOnlyGuard): added in v0.4.1, remove default when floor >= v0.4.1.
+  category: z
+    .union([z.literal("agent"), z.literal("delivery"), z.literal("delegate"), z.literal("mission")])
+    .default("agent"),
 });
 
 export const ListProviderModelsRequestMessageSchema = z.object({
