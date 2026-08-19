@@ -15,6 +15,13 @@ vi.mock("../../utils/client.js", () => ({
   })),
 }));
 
+const spawnProcess = vi.fn(() => ({ pid: 999999, unref: vi.fn() }));
+
+vi.mock("@getpaseo/server", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@getpaseo/server")>();
+  return { ...actual, spawnProcess };
+});
+
 const { stopLocalDaemon, DaemonLifecycleDeniedError } = await import("./local-daemon.js");
 
 const tempRoots: string[] = [];
@@ -40,6 +47,7 @@ describe("stopLocalDaemon lifecycle approval gate", () => {
     requestDaemonLifecycleApproval.mockReset();
     shutdownServer.mockReset();
     close.mockClear();
+    spawnProcess.mockClear();
   });
 
   afterEach(async () => {
@@ -75,19 +83,60 @@ describe("stopLocalDaemon lifecycle approval gate", () => {
     expect(shutdownServer).not.toHaveBeenCalled();
   });
 
-  test("an approved request calls shutdownServer with the granted authorization token", async () => {
+  test("an approved agent-context request hands off to a detached clone instead of calling shutdownServer in-process", async () => {
+    // This is the fix for a real-process E2E finding: the initiating agent's own CLI
+    // subprocess is a descendant of the very daemon session about to die, so the kernel
+    // SIGHUPs it before it can finish. The approved request must therefore be handed to
+    // a detached (setsid) clone rather than continuing synchronously in this process.
     requestDaemonLifecycleApproval.mockResolvedValue({
       decision: "approved",
       token: { token: "tok-abc", operationId: "op-abc" },
     });
-    shutdownServer.mockResolvedValue({ status: "shutdown_requested" });
     const home = await createPaseoHomeWithRunningDaemon();
 
-    // We only assert on the RPC call shape here; waiting for the (fake, never-exiting)
-    // PID to disappear would hang, so a short timeout + tolerating the resulting
-    // stop-timeout error is fine — the thing under test already happened by then.
-    await stopLocalDaemon({ home, agentId: "agent-123", timeoutMs: 50 }).catch(() => undefined);
+    const result = await stopLocalDaemon({ home, agentId: "agent-123", timeoutMs: 2000 });
 
+    expect(result.action).toBe("handed_off");
+    expect(result.pid).toBe(999999);
+    // The actual RPC that tears the daemon down must happen in the clone, not here.
+    expect(shutdownServer).not.toHaveBeenCalled();
+
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
+    const [, , spawnOptions] = spawnProcess.mock.calls[0] as [
+      string,
+      string[],
+      { detached?: boolean; envOverlay?: Record<string, string> },
+    ];
+    expect(spawnOptions.detached).toBe(true);
+    const grantedRaw = spawnOptions.envOverlay?.PASEO_LIFECYCLE_AUTHORIZATION;
+    expect(grantedRaw ? JSON.parse(grantedRaw) : null).toEqual({
+      token: "tok-abc",
+      operationId: "op-abc",
+    });
+  });
+
+  test("the detached clone (authorization already granted via env) proceeds straight to shutdownServer, without spawning another clone", async () => {
+    const home = await createPaseoHomeWithRunningDaemon();
+    shutdownServer.mockResolvedValue({ status: "shutdown_requested" });
+    const priorEnv = process.env.PASEO_LIFECYCLE_AUTHORIZATION;
+    process.env.PASEO_LIFECYCLE_AUTHORIZATION = JSON.stringify({
+      token: "tok-abc",
+      operationId: "op-abc",
+    });
+
+    try {
+      await stopLocalDaemon({ home, agentId: "agent-123", timeoutMs: 50 }).catch(() => undefined);
+    } finally {
+      if (priorEnv === undefined) {
+        delete process.env.PASEO_LIFECYCLE_AUTHORIZATION;
+      } else {
+        process.env.PASEO_LIFECYCLE_AUTHORIZATION = priorEnv;
+      }
+    }
+
+    // Pre-granted authorization is read from the environment — no RPC round trip.
+    expect(requestDaemonLifecycleApproval).not.toHaveBeenCalled();
+    expect(spawnProcess).not.toHaveBeenCalled();
     expect(shutdownServer).toHaveBeenCalledWith(
       expect.objectContaining({ authorization: { token: "tok-abc", operationId: "op-abc" } }),
     );

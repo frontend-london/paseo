@@ -730,3 +730,63 @@ describe("daemon lifecycle resume manifest on shutdown", () => {
     }
   });
 });
+
+describe("daemon lifecycle: initiating agent survives its own approved shutdown", () => {
+  test("stop() closes an unrelated running agent but leaves the agent whose RPC was just authorized untouched, so its own subprocess can finish", async () => {
+    const daemonHandle = await createTestPaseoDaemon({
+      cleanup: false,
+      agentClients: createTestAgentClients(),
+    });
+    const otherCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-lifecycle-other-"));
+    const initiatorCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-lifecycle-initiator-"));
+
+    try {
+      const other = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: otherCwd },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const initiator = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: initiatorCwd },
+        undefined,
+        { workspaceId: undefined },
+      );
+
+      // Simulate what session.ts does before emitting the shutdown lifecycle intent:
+      // request + approve a lifecycle operation for `initiator`, then validate its
+      // token exactly like handleShutdownServerRequest does.
+      const approval = await daemonHandle.daemon.agentManager.requestDaemonLifecycleApproval({
+        agentId: initiator.id,
+        operation: "restart",
+        host: "127.0.0.1:0",
+      });
+      const [resolution] = await Promise.all([
+        approval.wait(),
+        daemonHandle.daemon.agentManager.respondToPermission(initiator.id, approval.requestId, {
+          behavior: "allow",
+        }),
+      ]);
+      const token = resolution.token;
+      if (!token) throw new Error("expected an approval token");
+      const authorized = daemonHandle.daemon.agentManager.validateDaemonLifecycleAuthorization(
+        token.token,
+        { operationId: token.operationId, agentId: initiator.id, operation: "restart" },
+      );
+      expect(authorized).toBe(true);
+
+      await daemonHandle.daemon.stop({ operationId: "test-initiator-survives-op" });
+
+      expect(daemonHandle.daemon.agentManager.getAgent(other.id)).toBeNull();
+      const survivingInitiator = daemonHandle.daemon.agentManager.getAgent(initiator.id);
+      expect(survivingInitiator).toBeDefined();
+      expect(survivingInitiator?.lifecycle).not.toBe("closed");
+    } finally {
+      await Promise.all([
+        rm(path.dirname(daemonHandle.paseoHome), { recursive: true, force: true }),
+        rm(daemonHandle.staticDir, { recursive: true, force: true }),
+        rm(otherCwd, { recursive: true, force: true }),
+        rm(initiatorCwd, { recursive: true, force: true }),
+      ]);
+    }
+  });
+});

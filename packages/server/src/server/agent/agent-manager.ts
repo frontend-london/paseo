@@ -2308,6 +2308,15 @@ export class AgentManager {
     return this.lifecycleGate.validateToken(token, expect);
   }
 
+  /**
+   * See DaemonLifecycleGate.consumeLastValidatedAgentId — read by bootstrap.ts's stop()
+   * to exclude the initiating agent from the interrupt/close pass of its own approved
+   * shutdown, so its own in-flight CLI subprocess survives to finish the operation.
+   */
+  consumeLastValidatedLifecycleAgentId(): string | null {
+    return this.lifecycleGate.consumeLastValidatedAgentId();
+  }
+
   async respondToPermission(
     agentId: string,
     requestId: string,

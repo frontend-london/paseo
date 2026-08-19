@@ -5,7 +5,10 @@ import path from "node:path";
 import { loadConfig, resolvePaseoHome, spawnProcess } from "@getpaseo/server";
 import treeKill from "tree-kill";
 import { tryConnectToDaemon } from "../../utils/client.js";
-import { requestApprovalIfAgentInvoked } from "./lifecycle-approval.js";
+import {
+  LIFECYCLE_AUTHORIZATION_ENV_VAR,
+  requestApprovalIfAgentInvoked,
+} from "./lifecycle-approval.js";
 
 export interface DaemonStartOptions {
   port?: string;
@@ -58,12 +61,17 @@ export interface StopLocalDaemonOptions {
 }
 
 export interface StopLocalDaemonResult {
-  action: "stopped" | "not_running";
+  action: "stopped" | "not_running" | "handed_off";
   home: string;
   pid: number | null;
   forced: boolean;
   usedLifecycleRpc: boolean;
-  reason: "not_running" | "lifecycle_shutdown_rpc" | "owner_pid_signal" | "owner_pid_sigkill";
+  reason:
+    | "not_running"
+    | "lifecycle_shutdown_rpc"
+    | "owner_pid_signal"
+    | "owner_pid_sigkill"
+    | "lifecycle_handed_off";
   message: string;
 }
 
@@ -500,7 +508,47 @@ async function waitForStopAfterRequest(args: {
 type LifecycleShutdownAttempt =
   | { requested: true }
   | { requested: false; reason: string }
-  | { denied: true; message?: string };
+  | { denied: true; message?: string }
+  | { handedOff: true; pid: number | null };
+
+/**
+ * True when this process is itself the detached continuation spawned by
+ * spawnDetachedLifecycleContinuation after an approval already happened — it should
+ * proceed straight to the real shutdown+restart work, not hand off again.
+ */
+function isDetachedLifecycleContinuation(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env[LIFECYCLE_AUTHORIZATION_ENV_VAR]);
+}
+
+/**
+ * An agent's own Shell-tool subprocess (this CLI invocation) is a descendant of that
+ * agent's own provider process, which in turn belongs to the *old* daemon's process
+ * session. When that daemon's session leader exits as part of the very shutdown this
+ * process just triggered, the kernel sends SIGHUP to every remaining process still in
+ * that session — including this one — killing it before it can finish spawning the
+ * replacement daemon. Proven by a real-process E2E (the initiating agent's own
+ * `daemon restart` was killed mid-flight even though AgentManager never touched it).
+ *
+ * The fix: once approval is granted, re-exec this exact CLI invocation as a `detached`
+ * child (POSIX: setsid — a new session, immune to the old one's SIGHUP), carrying the
+ * already-granted authorization via env so the clone doesn't re-request approval. The
+ * original (still-doomed) process then returns immediately without doing the actual
+ * shutdown itself.
+ */
+function spawnDetachedLifecycleContinuation(authorization: {
+  token: string;
+  operationId: string;
+}): ChildProcess {
+  const child = spawnProcess(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {
+    detached: true,
+    envMode: "internal",
+    env: process.env,
+    envOverlay: { [LIFECYCLE_AUTHORIZATION_ENV_VAR]: JSON.stringify(authorization) },
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  child.unref();
+  return child;
+}
 
 export class DaemonLifecycleDeniedError extends Error {
   constructor(message?: string) {
@@ -722,6 +770,14 @@ async function requestLifecycleShutdown(
     }
     const authorization = "approved" in approval ? approval.authorization : undefined;
 
+    if (authorization && agentId && !isDetachedLifecycleContinuation()) {
+      // Approval just happened for the first time in *this* process — hand the actual
+      // shutdown+restart off to a detached clone before it can be killed by its own
+      // triggered shutdown (see spawnDetachedLifecycleContinuation).
+      const child = spawnDetachedLifecycleContinuation(authorization);
+      return { handedOff: true, pid: child.pid ?? null };
+    }
+
     await client.shutdownServer({
       timeout: Math.min(remainingTimeoutMs(), 5000),
       authorization,
@@ -737,6 +793,24 @@ async function requestLifecycleShutdown(
   } finally {
     await client.close().catch(() => undefined);
   }
+}
+
+function createHandedOffStopResult(
+  state: LocalDaemonState,
+  pid: number | null,
+): StopLocalDaemonResult {
+  const pidSuffix = pid ? ` (PID ${pid})` : "";
+  return {
+    action: "handed_off",
+    home: state.home,
+    pid,
+    forced: false,
+    usedLifecycleRpc: true,
+    reason: "lifecycle_handed_off",
+    message:
+      `Daemon lifecycle operation approved; handed off to a detached background process${pidSuffix} ` +
+      "immune to this session, which will complete independently.",
+  };
 }
 
 export async function stopLocalDaemon(
@@ -758,6 +832,14 @@ export async function stopLocalDaemon(
     // Explicitly denied (or approved with no usable token) — must never fall through to
     // signalDaemonOwnerForStop below; that would silently defeat the approval gate.
     throw new DaemonLifecycleDeniedError(shutdownAttempt.message);
+  }
+
+  if ("handedOff" in shutdownAttempt) {
+    // Approved and handed off to a detached clone (see
+    // spawnDetachedLifecycleContinuation) — the actual shutdown/restart happens there,
+    // independent of this process, which is about to be killed by its own session's
+    // teardown. Nothing left to wait for here.
+    return createHandedOffStopResult(state, shutdownAttempt.pid);
   }
 
   const lifecycleRequested = shutdownAttempt.requested;

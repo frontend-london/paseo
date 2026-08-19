@@ -219,3 +219,39 @@ test("token validation rejects mismatched agentId or operation", async () => {
     }),
   ).toBe(true);
 });
+
+test("consumeLastValidatedLifecycleAgentId remembers who last passed RPC validation, and clears on read", async () => {
+  const { manager, agentId } = await setup();
+
+  // Before any validation, nothing to consume.
+  expect(manager.consumeLastValidatedLifecycleAgentId()).toBeNull();
+
+  const approval = await manager.requestDaemonLifecycleApproval({
+    agentId,
+    operation: "restart",
+    host: "h",
+  });
+  const [resolution] = await Promise.all([
+    approval.wait(),
+    manager.respondToPermission(agentId, approval.requestId, { behavior: "allow" }),
+  ]);
+  const token = resolution.token;
+  if (!token) throw new Error("expected token");
+
+  // Merely minting the token (approval) doesn't set it — only a successful RPC-layer
+  // validateDaemonLifecycleAuthorization call does (that's the point where the daemon
+  // actually knows "this specific agent's shutdown/restart RPC was just authorized").
+  expect(manager.consumeLastValidatedLifecycleAgentId()).toBeNull();
+
+  expect(
+    manager.validateDaemonLifecycleAuthorization(token.token, {
+      operationId: token.operationId,
+      agentId,
+      operation: "restart",
+    }),
+  ).toBe(true);
+
+  expect(manager.consumeLastValidatedLifecycleAgentId()).toBe(agentId);
+  // Consumed — a second read is null until another validation happens.
+  expect(manager.consumeLastValidatedLifecycleAgentId()).toBeNull();
+});

@@ -2448,7 +2448,14 @@ export class Session {
     this.emit({
       type: "daemon_lifecycle_approval_response",
       payload: {
-        requestId: approval.requestId,
+        // RPC correlation id from the *client's own request* — not approval.requestId
+        // (the gate's internal permission-request id, already carried inside
+        // resolution.token.operationId). A caller's sendRequest() waits by matching
+        // this field against the requestId it sent; using the wrong id here left the
+        // CLI hanging forever even after a real Deny/Approve resolved server-side
+        // (found via a real-process daemon-restart E2E; see the "resolves with the
+        // approval decision from AgentManager" test below for the regression guard).
+        requestId: msg.requestId,
         agentId: msg.agentId,
         decision: resolution.decision,
         token: resolution.token,

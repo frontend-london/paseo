@@ -5382,16 +5382,23 @@ describe("daemon lifecycle approval gate", () => {
 
   test("a daemon_lifecycle_approval_request resolves with the approval decision from AgentManager", async () => {
     const messages: SessionOutboundMessage[] = [];
+    // Deliberately distinct from the client's RPC requestId below: the gate's internal
+    // permission-request id (surfaced as approval.requestId / token.operationId) is a
+    // different value than the WS RPC correlation id the client's sendRequest() is
+    // matching on. Using the same literal for both here previously hid a real bug where
+    // the response echoed the wrong one and the CLI hung forever waiting for a match
+    // (caught by the real-process daemon-restart E2E, not by this test as originally
+    // written).
     const token = {
       token: "tok-1",
-      operationId: "req-4",
+      operationId: "gate-permission-id-99",
       agentId: "agent-1",
       operation: "restart" as const,
       host: "h",
       expiresAt: new Date().toISOString(),
     };
     const requestDaemonLifecycleApproval = vi.fn().mockResolvedValue({
-      requestId: "req-4",
+      requestId: "gate-permission-id-99",
       wait: () => Promise.resolve({ decision: "approved", token }),
     });
     const session = createSessionForTest({
@@ -5402,7 +5409,7 @@ describe("daemon lifecycle approval gate", () => {
 
     await session.handleMessage({
       type: "daemon_lifecycle_approval_request",
-      requestId: "req-4",
+      requestId: "rpc-correlation-req-4",
       agentId: "agent-1",
       operation: "restart",
       host: "h",
@@ -5418,7 +5425,8 @@ describe("daemon lifecycle approval gate", () => {
       {
         type: "daemon_lifecycle_approval_response",
         payload: {
-          requestId: "req-4",
+          // Must echo the client's own RPC requestId, not the gate's internal one.
+          requestId: "rpc-correlation-req-4",
           agentId: "agent-1",
           decision: "approved",
           token,

@@ -52,6 +52,7 @@ interface IssuedToken {
 export class DaemonLifecycleGate {
   private inFlight: PendingLifecycleApproval | null = null;
   private readonly tokens = new Map<string, IssuedToken>();
+  private lastValidatedAgentId: string | null = null;
 
   getInFlightOperationId(): string | null {
     return this.inFlight?.requestId ?? null;
@@ -144,7 +145,28 @@ export class DaemonLifecycleGate {
       return false;
     }
     issued.consumed = true;
+    this.lastValidatedAgentId = expect.agentId;
     return true;
+  }
+
+  /**
+   * The agentId whose token most recently passed validateToken(), consumed on read.
+   *
+   * Why this exists: the initiating agent's own Shell-tool subprocess (running
+   * `paseo daemon stop/restart`) is a descendant of that agent's own provider process.
+   * If the daemon's shutdown sequence gracefully-interrupts-and-closes that same agent
+   * as part of "every running session," it tree-kills its own in-flight CLI subprocess
+   * before that subprocess can finish spawning the replacement daemon — proven by a
+   * real-process E2E (session B's own `daemon restart` was killed by its own approved
+   * restart). bootstrap.ts's stop() reads this once, right after RPC validation, to
+   * exclude that one agent from the interrupt/close pass — it's still captured in the
+   * resume manifest like every other running session, just not torn down by *this*
+   * process's shutdown; it's left to exit on its own (or get reaped on next resume).
+   */
+  consumeLastValidatedAgentId(): string | null {
+    const id = this.lastValidatedAgentId;
+    this.lastValidatedAgentId = null;
+    return id;
   }
 
   private pruneExpiredTokens(): void {
