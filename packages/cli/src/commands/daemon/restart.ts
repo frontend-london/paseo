@@ -15,7 +15,7 @@ import type {
 } from "../../output/index.js";
 
 interface RestartResult {
-  action: "restarted";
+  action: "restarted" | "handed_off";
   home: string;
   pid: string;
   message: string;
@@ -113,6 +113,23 @@ export async function runRestartCommand(
       } else {
         throw err;
       }
+    }
+
+    if (stopResult.action === "handed_off") {
+      // The stop half was approved and handed off to a detached clone of this exact
+      // `daemon restart` invocation (see spawnDetachedLifecycleContinuation) — that
+      // clone performs *both* the stop and the start independently, immune to this
+      // process being killed by its own triggered shutdown. Nothing left to do here.
+      return {
+        type: "single",
+        data: {
+          action: "handed_off",
+          home: stopResult.home,
+          pid: stopResult.pid === null ? "-" : String(stopResult.pid),
+          message: stopResult.message,
+        },
+        schema: restartResultSchema,
+      };
     }
 
     const startup = await startLocalDaemonDetached(startOptions);

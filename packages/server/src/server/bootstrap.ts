@@ -1635,6 +1635,14 @@ export async function createPaseoDaemon(
     // OS signal) — the resume mechanism is universal; only the *approval* requirement
     // upstream of this point is agent-specific. See lifecycle-resume-manifest.ts.
     const lifecycleOperationId = options?.operationId ?? randomUUID();
+    // If this shutdown was triggered by an agent's own approved stop/restart, that
+    // agent's Shell-tool subprocess (running `paseo daemon stop|restart`) is a
+    // descendant of its own provider process. Tree-killing it as part of "close every
+    // running session" would kill that in-flight CLI subprocess before it finishes
+    // spawning the replacement daemon — proven by a real-process E2E. It still belongs
+    // in the resume manifest like every other running session; it's just excluded from
+    // *this* process's interrupt/close pass so its own subprocess can finish on its own.
+    const initiatingAgentId = agentManager.consumeLastValidatedLifecycleAgentId();
     const activeAgents = agentManager.listAgents().filter((agent) => agent.lifecycle === "running");
     if (activeAgents.length > 0) {
       const capturedAt = new Date().toISOString();
@@ -1660,14 +1668,16 @@ export async function createPaseoDaemon(
       }
 
       await Promise.all(
-        activeAgents.map((agent) =>
-          agentManager.cancelAgentRun(agent.id).catch((error: unknown) => {
-            logger.warn(
-              { err: error, agentId: agent.id },
-              "Graceful interrupt before daemon shutdown failed; session will be force-closed",
-            );
-          }),
-        ),
+        activeAgents
+          .filter((agent) => agent.id !== initiatingAgentId)
+          .map((agent) =>
+            agentManager.cancelAgentRun(agent.id).catch((error: unknown) => {
+              logger.warn(
+                { err: error, agentId: agent.id },
+                "Graceful interrupt before daemon shutdown failed; session will be force-closed",
+              );
+            }),
+          ),
       );
     }
 
@@ -1677,7 +1687,7 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
-    await closeAllAgents(logger, agentManager);
+    await closeAllAgents(logger, agentManager, { excludeAgentId: initiatingAgentId });
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
@@ -1721,8 +1731,15 @@ export async function createPaseoDaemon(
   };
 }
 
-async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promise<void> {
-  const agents = agentManager.listAgents();
+async function closeAllAgents(
+  logger: Logger,
+  agentManager: AgentManager,
+  options?: { excludeAgentId?: string | null },
+): Promise<void> {
+  const excludeAgentId = options?.excludeAgentId;
+  const agents = agentManager
+    .listAgents()
+    .filter((agent) => !excludeAgentId || agent.id !== excludeAgentId);
   await Promise.all(
     agents.map(async (agent) => {
       try {

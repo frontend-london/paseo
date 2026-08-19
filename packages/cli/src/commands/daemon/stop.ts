@@ -14,12 +14,17 @@ import type {
 } from "../../output/index.js";
 
 interface StopResult {
-  action: "stopped" | "not_running";
+  action: "stopped" | "not_running" | "handed_off";
   home: string;
   pid: string;
   forced: boolean;
   usedLifecycleRpc: boolean;
-  reason: "not_running" | "lifecycle_shutdown_rpc" | "owner_pid_signal" | "owner_pid_sigkill";
+  reason:
+    | "not_running"
+    | "lifecycle_shutdown_rpc"
+    | "owner_pid_signal"
+    | "owner_pid_sigkill"
+    | "lifecycle_handed_off";
   message: string;
 }
 
@@ -29,7 +34,7 @@ const stopResultSchema: OutputSchema<StopResult> = {
     {
       header: "STATUS",
       field: "action",
-      color: (value) => (value === "stopped" ? "green" : "yellow"),
+      color: (value) => (value === "stopped" || value === "handed_off" ? "green" : "yellow"),
     },
     { header: "HOME", field: "home" },
     { header: "PID", field: "pid" },
