@@ -6,9 +6,14 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 const requestDaemonLifecycleApproval = vi.fn();
 const shutdownServer = vi.fn();
 const close = vi.fn().mockResolvedValue(undefined);
+// The gate's server-identity check (cross-home shutdown protection) compares this
+// against getOrCreateServerId(state.home) — set per-test to the real value for that
+// test's home so the identity check passes and the approval flow under test is reached.
+let currentServerId: string | undefined;
 
 vi.mock("../../utils/client.js", () => ({
   tryConnectToDaemon: vi.fn(async () => ({
+    getLastServerInfoMessage: () => ({ serverId: currentServerId }),
     requestDaemonLifecycleApproval,
     shutdownServer,
     close,
@@ -23,6 +28,7 @@ vi.mock("@getpaseo/server", async (importOriginal) => {
 });
 
 const { stopLocalDaemon, DaemonLifecycleDeniedError } = await import("./local-daemon.js");
+const { getOrCreateServerId } = await import("@getpaseo/server");
 
 const tempRoots: string[] = [];
 
@@ -39,6 +45,7 @@ async function createPaseoHomeWithRunningDaemon(): Promise<string> {
     path.join(paseoHome, "paseo.pid"),
     JSON.stringify({ pid: process.pid, listen: "127.0.0.1:6767" }, null, 2),
   );
+  currentServerId = getOrCreateServerId(paseoHome);
   return paseoHome;
 }
 
