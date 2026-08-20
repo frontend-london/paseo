@@ -46,6 +46,7 @@ interface AgentInspect {
   }>;
   Worktree: string | null;
   ParentAgentId: string | null;
+  WorkspaceId: string | null;
 }
 
 /** Key-value row for table display */
@@ -151,6 +152,7 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     })),
     Worktree: snapshot.labels?.["paseo.worktree"] ?? null,
     ParentAgentId: snapshot.labels?.[PARENT_AGENT_ID_LABEL] ?? null,
+    WorkspaceId: snapshot.workspaceId ?? null,
   };
 }
 
@@ -202,6 +204,7 @@ function toInspectRows(agent: AgentInspect): InspectRow[] {
 
   rows.push({ key: "Worktree", value: agent.Worktree ?? "null" });
   rows.push({ key: "ParentAgentId", value: agent.ParentAgentId ?? "null" });
+  rows.push({ key: "WorkspaceId", value: agent.WorkspaceId ?? "null" });
 
   return rows;
 }
