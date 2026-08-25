@@ -1285,7 +1285,11 @@ class TimelineAssembler {
       !isClaudeTranscriptNoiseText(nextAssistantText)
     ) {
       state.emittedAssistantLength = state.assistantText.length;
-      items.push({ type: "assistant_message", text: nextAssistantText, messageId: state.id });
+      items.push({
+        type: "assistant_message",
+        text: nextAssistantText,
+        messageId: state.id,
+      });
     }
 
     const nextReasoningText = state.reasoningText.slice(state.emittedReasoningLength);
@@ -1564,7 +1568,10 @@ export class ClaudeAgentClient implements AgentClient {
       getClaudeModelsWithSettings(this.logger, this.configDir, claudeCodeVersion),
     );
     const modes = detectIneligibleAutoModeTransport(
-      createProviderEnv({ baseEnv: process.env, runtimeSettings: this.runtimeSettings }),
+      createProviderEnv({
+        baseEnv: process.env,
+        runtimeSettings: this.runtimeSettings,
+      }),
     )
       ? DEFAULT_MODES.filter((mode) => mode.id !== "auto")
       : DEFAULT_MODES;
@@ -2039,6 +2046,16 @@ class ClaudeAgentSession implements AgentSession {
   private claudeSessionId: string | null;
   private persistence: AgentPersistenceHandle | null;
   private currentMode: PermissionMode;
+  // The permission mode the active query was actually launched with. Paseo — not
+  // the SDK's persisted session state — is the source of truth for the user's
+  // permission intent. On resume (after an interrupt/teardown/background-task
+  // stop) Claude Code emits a system/init whose permissionMode reflects the
+  // *persisted* mode (often "default"), not the mode we launched with. Adopting
+  // that echo would silently downgrade an explicit bypassPermissions selection,
+  // resurrecting canUseTool prompts that then resolve to a synthetic deny even
+  // though the user never rejected anything. We remember what we launched with so
+  // handleSystemMessage can refuse a downgrade and re-assert the user's mode.
+  private launchedMode: PermissionMode | null = null;
   private planResumeMode: PermissionMode | null = null;
   private availableModes: AgentMode[] = DEFAULT_MODES;
   private toolUseCache = new Map<string, ToolUseCacheEntry>();
@@ -3119,6 +3136,12 @@ class ClaudeAgentSession implements AgentSession {
 
     const input = createAsyncMessageInput<SDKUserMessage>();
     const options = await this.buildOptions();
+    // Record the mode this query is actually launching with so a stale system/init
+    // echo (e.g. a persisted "default" replayed by --resume) cannot silently
+    // downgrade the user's selection in handleSystemMessage.
+    this.launchedMode = isPermissionMode(options.permissionMode)
+      ? options.permissionMode
+      : this.currentMode;
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
     this.query = claudeQuery(
@@ -3201,13 +3224,25 @@ class ClaudeAgentSession implements AgentSession {
         : undefined;
     assertClaudeThinkingOptionSupported(this.config.model, thinkingOptionId);
     if (thinkingOptionId === CLAUDE_DISABLED_THINKING_OPTION_ID) {
-      return { thinking: { type: "disabled" }, effort: undefined, ultracode: false };
+      return {
+        thinking: { type: "disabled" },
+        effort: undefined,
+        ultracode: false,
+      };
     }
     if (thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID) {
-      return { thinking: { type: "adaptive" }, effort: "xhigh", ultracode: true };
+      return {
+        thinking: { type: "adaptive" },
+        effort: "xhigh",
+        ultracode: true,
+      };
     }
     if (thinkingOptionId && isClaudeThinkingEffort(thinkingOptionId)) {
-      return { thinking: { type: "adaptive" }, effort: thinkingOptionId, ultracode: false };
+      return {
+        thinking: { type: "adaptive" },
+        effort: thinkingOptionId,
+        ultracode: false,
+      };
     }
     return { thinking: undefined, effort: undefined, ultracode: false };
   }
@@ -3233,7 +3268,9 @@ class ClaudeAgentSession implements AgentSession {
       this.config.providerOptions,
       this.config.toolPolicy,
     );
-    const settingsOptions = this.buildSettingsOptions(providerOptions, { ultracode });
+    const settingsOptions = this.buildSettingsOptions(providerOptions, {
+      ultracode,
+    });
     const sdkEnv = this.buildSdkEnv();
     assertClaudeAutoModeEligible(this.currentMode, sdkEnv);
 
@@ -3375,7 +3412,10 @@ class ClaudeAgentSession implements AgentSession {
             });
           }
         } else {
-          content.push({ type: "text", text: renderPromptAttachmentAsText(chunk) });
+          content.push({
+            type: "text",
+            text: renderPromptAttachmentAsText(chunk),
+          });
         }
       }
     } else {
@@ -3659,7 +3699,11 @@ class ClaudeAgentSession implements AgentSession {
   private failRunningRuntimeTasks(): void {
     this.dispatchEvents(
       foldSubagentObservations(this.taskProtocolSource.failRunningTasks()).map(
-        (event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }),
+        (event): AgentStreamEvent => ({
+          type: "provider_subagent",
+          provider: "claude",
+          event,
+        }),
       ),
     );
   }
@@ -4137,7 +4181,13 @@ class ClaudeAgentSession implements AgentSession {
         message,
         canonicalSubagentId ?? parentToolUseId,
       ),
-    ).map((event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }));
+    ).map(
+      (event): AgentStreamEvent => ({
+        type: "provider_subagent",
+        provider: "claude",
+        event,
+      }),
+    );
     const routedId = canonicalSubagentId ?? parentToolUseId;
     return [...runtimeEvents, ...this.sidechainTracker.handleMessage(message, routedId)];
   }
@@ -4435,6 +4485,56 @@ class ClaudeAgentSession implements AgentSession {
     };
   }
 
+  /**
+   * Reconcile the permission mode reported by a system/init message against the
+   * mode Paseo actually launched the query with.
+   *
+   * Claude Code echoes a permissionMode on every init. On a fresh launch this
+   * matches what we passed. On a --resume (which happens after an interrupt,
+   * teardown, or a background-task stop that recreated the query) the echo can
+   * instead reflect the *persisted* session mode — typically "default" — even
+   * though we launched with the user's selection (e.g. "bypassPermissions").
+   *
+   * Blindly adopting that echo silently downgrades the user's mode. The next
+   * tool then goes through canUseTool and, with no interactive client to answer,
+   * resolves to a synthetic { behavior: "deny" }, which the SDK renders as
+   * "The user doesn't want to proceed with this tool use" — a false rejection
+   * the user never made. To preserve the invariant that only an explicit user
+   * action can produce a rejection, we never let init downgrade the launched
+   * mode: we keep it and re-assert it onto the live query so the SDK and Paseo
+   * agree again.
+   */
+  private adoptInitPermissionMode(reportedMode: PermissionMode): void {
+    const launchedMode = this.launchedMode;
+    const isDowngradeFromLaunch =
+      launchedMode !== null && launchedMode !== "plan" && reportedMode !== launchedMode;
+
+    if (isDowngradeFromLaunch) {
+      this.logger.warn(
+        { launchedMode, reportedMode },
+        "Claude init reported a permission mode that differs from the launched mode; " +
+          "keeping the launched mode and re-asserting it (stale --resume echo).",
+      );
+      this.currentMode = launchedMode;
+      this.planResumeMode = launchedMode;
+      const query = this.query;
+      if (query) {
+        void query.setPermissionMode(launchedMode).catch((error) => {
+          this.logger.warn(
+            { err: error, launchedMode },
+            "Failed to re-assert launched permission mode after stale init echo",
+          );
+        });
+      }
+      return;
+    }
+
+    this.currentMode = reportedMode;
+    if (this.currentMode !== "plan") {
+      this.planResumeMode = this.currentMode;
+    }
+  }
+
   private captureSessionIdFromMessage(message: SDKMessage): {
     threadStartedSessionId: string | null;
     notice: AgentTimelineItem | null;
@@ -4517,10 +4617,7 @@ class ClaudeAgentSession implements AgentSession {
       notice = this.createClaudeSessionChangedNotice(existingSessionId, newSessionId);
     }
     this.availableModes = DEFAULT_MODES;
-    this.currentMode = message.permissionMode;
-    if (this.currentMode !== "plan") {
-      this.planResumeMode = this.currentMode;
-    }
+    this.adoptInitPermissionMode(message.permissionMode);
     this.persistence = null;
     if (message.model) {
       const normalizedRuntimeModel = normalizeClaudeRuntimeModelId(message.model);
@@ -4721,7 +4818,11 @@ class ClaudeAgentSession implements AgentSession {
         for (const event of foldSubagentObservations(
           this.taskProtocolSource.observeHook(input as ClaudeHookObservationInput),
         )) {
-          this.notifySubscribers({ type: "provider_subagent", provider: "claude", event });
+          this.notifySubscribers({
+            type: "provider_subagent",
+            provider: "claude",
+            event,
+          });
         }
       } catch (error) {
         this.logger.debug({ err: error }, "Failed to read subagent effort from hook");
@@ -5680,7 +5781,9 @@ function readClaudeReplayParentFacts(parentEntries: ClaudeHistoryEntry[]): Claud
       const block = toObjectRecord(value);
       if (block?.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
       if (!toolCalls.has(block.tool_use_id)) continue;
-      outcomesByToolCallId.set(block.tool_use_id, { failed: block.is_error === true });
+      outcomesByToolCallId.set(block.tool_use_id, {
+        failed: block.is_error === true,
+      });
     }
   }
 
@@ -5715,7 +5818,9 @@ function readClaudeSidechainHistory(historyPath: string): ClaudeSidechainHistory
   };
   const workflowDirectory = path.join(sessionDirectory, "workflows");
   if (fs.existsSync(workflowDirectory)) {
-    for (const entry of fs.readdirSync(workflowDirectory, { withFileTypes: true })) {
+    for (const entry of fs.readdirSync(workflowDirectory, {
+      withFileTypes: true,
+    })) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       try {
         history.workflowContents.push(
@@ -5825,7 +5930,10 @@ function readClaudeHistoricalSubagentToolResults(
       if (block?.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
       const match = /agentId:\s*([\w-]+)/.exec(JSON.stringify(block.content));
       if (!match?.[1]) continue;
-      results.set(match[1], { toolCallId: block.tool_use_id, failed: block.is_error === true });
+      results.set(match[1], {
+        toolCallId: block.tool_use_id,
+        failed: block.is_error === true,
+      });
     }
   }
   return results;

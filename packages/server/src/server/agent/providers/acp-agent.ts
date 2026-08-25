@@ -208,7 +208,10 @@ function resolveTerminalCommand(
     return { command, args: [] };
   }
 
-  const shell = buildStringCommandShellInvocation({ command, windowsShell: "cmd" });
+  const shell = buildStringCommandShellInvocation({
+    command,
+    windowsShell: "cmd",
+  });
   return { command: shell.shell, args: shell.args, shell: false };
 }
 
@@ -273,8 +276,22 @@ export function buildACPClientCapabilities(
 // NO_BROWSER is honored by Gemini CLI; other ACP agents ignore it.
 const PROBE_ENV: Record<string, string> = { NO_BROWSER: "true" };
 const ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS = 20_000;
+/**
+ * Bound on the ACP initialize handshake for a session's worker process. A
+ * hung initialize must not pin the session (or daemon shutdown) forever.
+ */
+const DEFAULT_ACP_INITIALIZE_TIMEOUT_MS = 30_000;
+/**
+ * Bound on session-attach RPCs (session/new, session/load,
+ * unstable_resumeSession). These replay history, so they get a wider bound than
+ * initialize; a hung attach must never pin session setup forever.
+ */
+const DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS = 60_000;
 
-function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
+function summarizeMalformedACPStdoutError(error: unknown): {
+  type: string;
+  message: string;
+} {
   return {
     type: error instanceof Error ? error.name : typeof error,
     message: "ACP stdout line was not valid JSON",
@@ -560,11 +577,21 @@ interface SelectConfigChoice {
 }
 type AvailableACPModel = NonNullable<SessionModelState["availableModels"]>[number];
 
+/** Where the current mode list originated for ACP mode switching. */
+export type ACPModeSource = "legacy" | "config" | "fallback";
+
 interface ACPModeSelection {
   availableMode: AgentMode | null;
   configOption: SelectConfigOption | null;
   configChoice: SelectConfigChoice | null;
   hasAvailableModes: boolean;
+  modeSource: ACPModeSource;
+  /**
+   * True when modes came from ACP session mode state (`modes` / `session/set_mode`).
+   * False when the UI list was only mirrored from `configOptions` — those must use
+   * `session/set_config_option` (e.g. antigravity-acp Skip Permissions).
+   */
+  usesLegacySessionMode: boolean;
 }
 
 interface ACPModelSelection {
@@ -610,17 +637,32 @@ export function resolveACPModeSelection({
   modeId,
   availableModes,
   configOptions,
+  modeSource = "fallback",
 }: {
   modeId: string;
   availableModes: AgentMode[];
   configOptions: SessionConfigOption[] | null | undefined;
+  modeSource?: ACPModeSource;
 }): ACPModeSelection {
-  const configOption = findSelectConfigOption({ configOptions, category: "mode" });
+  const configOption = findSelectConfigOption({
+    configOptions,
+    category: "mode",
+  });
+  const hasAvailableModes = availableModes.length > 0;
+  // Config-mirrored mode lists (antigravity-acp and similar) must use
+  // session/set_config_option. Legacy session modes and provider default mode
+  // lists still use session/set_mode.
+  const usesLegacySessionMode = hasAvailableModes && modeSource !== "config";
   return {
     availableMode: availableModes.find((mode) => mode.id === modeId) ?? null,
     configOption,
-    configChoice: findSelectConfigChoice({ option: configOption, value: modeId }),
-    hasAvailableModes: availableModes.length > 0,
+    configChoice: findSelectConfigChoice({
+      option: configOption,
+      value: modeId,
+    }),
+    hasAvailableModes,
+    modeSource,
+    usesLegacySessionMode,
   };
 }
 
@@ -633,20 +675,29 @@ export function resolveACPModelSelection({
   availableModels: AvailableACPModel[] | null | undefined;
   configOptions: SessionConfigOption[] | null | undefined;
 }): ACPModelSelection {
-  const configOption = findSelectConfigOption({ configOptions, category: "model" });
+  const configOption = findSelectConfigOption({
+    configOptions,
+    category: "model",
+  });
   return {
     availableModel: availableModels?.find((model) => model.modelId === modelId) ?? null,
     configOption,
-    configChoice: findSelectConfigChoice({ option: configOption, value: modelId }),
+    configChoice: findSelectConfigChoice({
+      option: configOption,
+      value: modelId,
+    }),
     hasAvailableModels: Boolean(availableModels?.length),
   };
 }
 
 export function deriveModesFromACP(
   fallbackModes: AgentMode[],
-  modeState?: { availableModes?: SessionMode[] | null; currentModeId?: string | null } | null,
+  modeState?: {
+    availableModes?: SessionMode[] | null;
+    currentModeId?: string | null;
+  } | null,
   configOptions?: SessionConfigOption[] | null,
-): { modes: AgentMode[]; currentModeId: string | null } {
+): { modes: AgentMode[]; currentModeId: string | null; source: ACPModeSource } {
   if (modeState?.availableModes?.length) {
     return {
       modes: modeState.availableModes.map((mode) => ({
@@ -655,10 +706,14 @@ export function deriveModesFromACP(
         description: mode.description ?? undefined,
       })),
       currentModeId: modeState.currentModeId ?? null,
+      source: "legacy",
     };
   }
 
-  const modeOption = findSelectConfigOption({ configOptions, category: "mode" });
+  const modeOption = findSelectConfigOption({
+    configOptions,
+    category: "mode",
+  });
   if (modeOption) {
     const flatOptions = flattenSelectOptions(modeOption.options);
     return {
@@ -668,12 +723,14 @@ export function deriveModesFromACP(
         description: option.description ?? undefined,
       })),
       currentModeId: modeOption.currentValue,
+      source: "config",
     };
   }
 
   return {
     modes: fallbackModes,
     currentModeId: null,
+    source: "fallback",
   };
 }
 
@@ -1251,10 +1308,7 @@ export class ACPAgentClient implements AgentClient {
   }
 
   protected async buildACPProbeDiagnosticRows(
-    options: {
-      cwd?: string;
-      phaseTimeoutMs?: number;
-    } = {},
+    options: { cwd?: string; phaseTimeoutMs?: number } = {},
   ): Promise<DiagnosticEntry[]> {
     const rows: DiagnosticEntry[] = [];
     const phaseTimeoutMs = options.phaseTimeoutMs ?? ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS;
@@ -1358,7 +1412,10 @@ export class ACPAgentClient implements AgentClient {
     }
   }
 
-  protected async resolveLaunchCommand(): Promise<{ command: string; args: string[] }> {
+  protected async resolveLaunchCommand(): Promise<{
+    command: string;
+    args: string[];
+  }> {
     const prefix = await resolveProviderLaunch({
       commandConfig: this.runtimeSettings?.command,
       defaultBinary: this.defaultCommand[0],
@@ -1442,6 +1499,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private sessionId: string | null = null;
   private currentMode: string | null = null;
   private availableModes: AgentMode[];
+  /** Tracks whether availableModes came from legacy session modes or configOptions. */
+  private modeSource: ACPModeSource = "fallback";
   private currentModel: string | null = null;
   private availableModels: AvailableACPModel[] | null = null;
   private thinkingOptionId: string | null = null;
@@ -1449,7 +1508,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private lastActivityAt: string | null = null;
   private configOptions: SessionConfigOption[] = [];
   private cachedCommands: AgentSlashCommand[] = [];
-  private commandsReadyDeferred: { promise: Promise<void>; resolve: () => void } | null = null;
+  private commandsReadyDeferred: {
+    promise: Promise<void>;
+    resolve: () => void;
+  } | null = null;
   private commandsReadySettled = false;
   private waitForInitialCommands: boolean;
   private initialCommandsWaitTimeoutMs: number;
@@ -1467,7 +1529,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.provider = options.provider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.capabilities = options.capabilities;
-    this.logger = options.logger.child({ module: "agent", provider: options.provider });
+    this.logger = options.logger.child({
+      module: "agent",
+      provider: options.provider,
+    });
     this.runtimeSettings = options.runtimeSettings;
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes;
@@ -1483,6 +1548,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.beforeModeWriter = options.beforeModeWriter;
     this.thinkingOptionWriter = options.thinkingOptionWriter;
     this.availableModes = options.defaultModes;
+    this.modeSource = "fallback";
     this.agentId = options.agentId;
     this.launchEnv = options.launchEnv;
     this.initialHandle = options.handle;
@@ -1507,11 +1573,15 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
 
-      const response = await this.runACPRequest(() =>
-        this.connection!.newSession({
-          cwd: this.config.cwd,
-          mcpServers: this.acpMcpServers(),
-        }),
+      const response = await withTimeout(
+        this.runACPRequest(() =>
+          this.connection!.newSession({
+            cwd: this.config.cwd,
+            mcpServers: this.acpMcpServers(),
+          }),
+        ),
+        DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS,
+        `ACP session/new timed out after ${DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS}ms`,
       );
       this.sessionId = response.sessionId;
       this.bootstrapThreadEventPending = true;
@@ -1546,24 +1616,32 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       const sessionCapabilities = this.agentCapabilities?.sessionCapabilities;
       if (this.agentCapabilities?.loadSession) {
         this.replayingHistory = true;
-        const response = await this.runACPRequest(() =>
-          this.connection!.loadSession({
-            sessionId: handle.sessionId,
-            cwd: this.config.cwd,
-            mcpServers: this.acpMcpServers(),
-          }),
+        const response = await withTimeout(
+          this.runACPRequest(() =>
+            this.connection!.loadSession({
+              sessionId: handle.sessionId,
+              cwd: this.config.cwd,
+              mcpServers: this.acpMcpServers(),
+            }),
+          ),
+          DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS,
+          `ACP session/load timed out after ${DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS}ms`,
         );
         this.deliverTranslatedEvents(this.flushPendingUserMessage());
         this.replayingHistory = false;
         this.historyPending = this.persistedHistory.length > 0;
         this.applySessionState(response);
       } else if (sessionCapabilities?.resume) {
-        const response = await this.runACPRequest(() =>
-          this.connection!.unstable_resumeSession({
-            sessionId: handle.sessionId,
-            cwd: this.config.cwd,
-            mcpServers: this.acpMcpServers(),
-          }),
+        const response = await withTimeout(
+          this.runACPRequest(() =>
+            this.connection!.unstable_resumeSession({
+              sessionId: handle.sessionId,
+              cwd: this.config.cwd,
+              mcpServers: this.acpMcpServers(),
+            }),
+          ),
+          DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS,
+          `ACP unstable_resumeSession timed out after ${DEFAULT_ACP_SESSION_LOAD_TIMEOUT_MS}ms`,
         );
         this.applySessionState(response);
       } else {
@@ -1764,8 +1842,110 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       modeId,
       availableModes: this.availableModes,
       configOptions: this.configOptions,
+      modeSource: this.modeSource,
     });
     await this.setModeWithSelection({ modeId, selection });
+  }
+
+  private applyDerivedModes(modeInfo: {
+    modes: AgentMode[];
+    currentModeId: string | null;
+    source: ACPModeSource;
+  }): void {
+    this.availableModes = modeInfo.modes;
+    this.modeSource = modeInfo.source;
+  }
+
+  private validateModeSelection(modeId: string, selection: ACPModeSelection): boolean {
+    if (selection.usesLegacySessionMode) {
+      if (!selection.availableMode) {
+        this.warnInvalidSelection(
+          modeId,
+          `is not valid ${this.provider} mode. Available options: ${this.availableModes
+            .map((mode) => mode.id)
+            .join(", ")}`,
+        );
+        return false;
+      }
+      return true;
+    }
+
+    const modeOption = selection.configOption;
+    if (!modeOption) {
+      // No config mode option: fall back to legacy session mode API when we have a list.
+      if (selection.hasAvailableModes) {
+        if (!selection.availableMode) {
+          this.warnInvalidSelection(
+            modeId,
+            `is not valid ${this.provider} mode. Available options: ${this.availableModes
+              .map((mode) => mode.id)
+              .join(", ")}`,
+          );
+          return false;
+        }
+        return true;
+      }
+      throw new Error(`${this.provider} does not expose ACP mode switching`);
+    }
+
+    if (!selection.configChoice) {
+      // Config option exists but choice is missing — if we still have a legacy mode
+      // list match, allow set_mode; otherwise warn.
+      if (
+        selection.hasAvailableModes &&
+        selection.availableMode &&
+        selection.modeSource !== "config"
+      ) {
+        return true;
+      }
+      this.warnInvalidSelection(
+        modeId,
+        `is not valid ${this.provider} mode config option. Available options: ${flattenSelectOptions(
+          modeOption.options,
+        )
+          .map((option) => option.value)
+          .join(", ")}`,
+      );
+      return false;
+    }
+
+    // Config choice exists, but a non-config-derived available mode list does not
+    // advertise the requested mode. Prefer the available list and warn rather than
+    // silently switching via a config option that may not match the provider's state.
+    if (
+      selection.hasAvailableModes &&
+      !selection.availableMode &&
+      selection.modeSource !== "config"
+    ) {
+      this.warnInvalidSelection(
+        modeId,
+        `is not valid ${this.provider} mode. Available options: ${this.availableModes
+          .map((mode) => mode.id)
+          .join(", ")}`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  private resolveModeWriteStrategy(selection: ACPModeSelection): "legacy" | "config" {
+    if (
+      selection.usesLegacySessionMode ||
+      (!selection.configOption &&
+        selection.hasAvailableModes &&
+        Boolean(selection.availableMode)) ||
+      (selection.modeSource !== "config" &&
+        selection.hasAvailableModes &&
+        Boolean(selection.availableMode) &&
+        !selection.configChoice)
+    ) {
+      return "legacy";
+    }
+    if (selection.configOption && selection.configChoice) {
+      return "config";
+    }
+    throw new Error(`${this.provider} does not expose ACP mode switching`);
   }
 
   // Mode/model selection updates stay after ACP RPC success; this intentionally diverges from Zed's optimistic rollback path (acp.rs:3080-3104).
@@ -1789,7 +1969,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       if (providerResult.configOptions) {
         this.configOptions = this.transformConfigOptions(providerResult.configOptions);
       }
-      this.availableModes = deriveModesFromACP(this.defaultModes, null, this.configOptions).modes;
+      this.applyDerivedModes(deriveModesFromACP(this.defaultModes, null, this.configOptions));
       this.pushEvent({
         type: "mode_changed",
         provider: this.provider,
@@ -1799,32 +1979,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
 
-    if (selection.hasAvailableModes) {
-      if (!selection.availableMode) {
-        this.warnInvalidSelection(
-          modeId,
-          `is not valid ${this.provider} mode. Available options: ${this.availableModes
-            .map((mode) => mode.id)
-            .join(", ")}`,
-        );
-        return;
-      }
-    } else {
-      const modeOption = selection.configOption;
-      if (!modeOption) {
-        throw new Error(`${this.provider} does not expose ACP mode switching`);
-      }
-      if (!selection.configChoice) {
-        this.warnInvalidSelection(
-          modeId,
-          `is not valid ${this.provider} mode config option. Available options: ${flattenSelectOptions(
-            modeOption.options,
-          )
-            .map((option) => option.value)
-            .join(", ")}`,
-        );
-        return;
-      }
+    if (!this.validateModeSelection(modeId, selection)) {
+      return;
     }
 
     if (this.beforeModeWriter) {
@@ -1834,9 +1990,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }
     }
 
-    if (selection.hasAvailableModes) {
-      await this.connection.setSessionMode({ sessionId: this.sessionId, modeId });
+    const strategy = this.resolveModeWriteStrategy(selection);
+    if (strategy === "legacy") {
+      await this.connection.setSessionMode({
+        sessionId: this.sessionId,
+        modeId,
+      });
       this.currentMode = modeId;
+      this.modeSource = "legacy";
       this.pushEvent({
         type: "mode_changed",
         provider: this.provider,
@@ -1863,7 +2024,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       requestedValue: modeId,
       label: "mode",
     });
-    this.availableModes = deriveModesFromACP(this.defaultModes, null, this.configOptions).modes;
+    this.applyDerivedModes(deriveModesFromACP(this.defaultModes, null, this.configOptions));
     this.pushEvent({
       type: "mode_changed",
       provider: this.provider,
@@ -2074,7 +2235,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       requestedValue,
       label: featureOption.label,
     });
-    this.config.featureValues = { ...this.config.featureValues, [featureId]: currentValue };
+    this.config.featureValues = {
+      ...this.config.featureValues,
+      [featureId]: currentValue,
+    };
   }
 
   private applyConfigOptionResponse({
@@ -2093,7 +2257,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.configOptions = this.transformConfigOptions(response.configOptions);
     const responseOption =
       category === undefined
-        ? findSelectConfigOptionById({ configOptions: this.configOptions, id: configId })
+        ? findSelectConfigOptionById({
+            configOptions: this.configOptions,
+            id: configId,
+          })
         : findSelectConfigOption({
             configOptions: this.configOptions,
             category,
@@ -2204,7 +2371,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
       try {
         if (this.agentCapabilities?.sessionCapabilities?.close) {
-          await this.connection.unstable_closeSession({ sessionId: this.sessionId });
+          await this.connection.unstable_closeSession({
+            sessionId: this.sessionId,
+          });
         }
       } catch (error) {
         this.logger.debug({ err: error }, "ACP closeSession failed during shutdown");
@@ -2221,7 +2390,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.terminalEntries.clear();
 
     if (this.child) {
-      await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+      await this.terminateProcess(this.child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
     }
 
     this.subscribers.clear();
@@ -2234,10 +2406,15 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     const canAutoAccept =
       isACPAutoAcceptEnabled(this.config) && !isACPChooserRequest(params.options);
     if (canAutoAccept) {
-      const allowOption = selectPermissionOption(params.options, { behavior: "allow" });
+      const allowOption = selectPermissionOption(params.options, {
+        behavior: "allow",
+      });
       if (allowOption) {
         this.logger.info(
-          { toolCallId: params.toolCall.toolCallId, optionId: allowOption.optionId },
+          {
+            toolCallId: params.toolCall.toolCallId,
+            optionId: allowOption.optionId,
+          },
           "Auto-accepting ACP permission request",
         );
         return {
@@ -2458,7 +2635,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   async releaseTerminal(params: { sessionId: string; terminalId: string }): Promise<void> {
     const entry = this.getTerminalEntry(params.terminalId);
     if (!entry.exit) {
-      await this.terminateProcess(entry.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+      await this.terminateProcess(entry.child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
     }
     this.terminalEntries.delete(params.terminalId);
   }
@@ -2466,7 +2646,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   async killTerminal(params: KillTerminalRequest): Promise<Record<string, never>> {
     const entry = this.getTerminalEntry(params.terminalId);
     if (!entry.exit) {
-      await this.terminateProcess(entry.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+      await this.terminateProcess(entry.child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
     }
     return {};
   }
@@ -2523,16 +2706,26 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     // close the process even when the ACP handshake itself rejects.
     this.child = child;
     this.connection = connection;
-    const initialize = await this.runACPRequest(() =>
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: buildACPClientCapabilities(
-          this.clientCapabilityMeta,
-          this.clientCapabilities,
+    let initialize: InitializeResponse;
+    try {
+      initialize = await withTimeout(
+        this.runACPRequest(() =>
+          connection.initialize({
+            protocolVersion: PROTOCOL_VERSION,
+            clientCapabilities: buildACPClientCapabilities(
+              this.clientCapabilityMeta,
+              this.clientCapabilities,
+            ),
+            clientInfo: { name: "Paseo", version: "dev" },
+          }),
         ),
-        clientInfo: { name: "Paseo", version: "dev" },
-      }),
-    );
+        DEFAULT_ACP_INITIALIZE_TIMEOUT_MS,
+        `ACP initialize timed out after ${DEFAULT_ACP_INITIALIZE_TIMEOUT_MS}ms`,
+      );
+    } catch (error) {
+      await terminateChildProcess(child, 2_000, this.terminateProcess);
+      throw error;
+    }
 
     return { child, connection, initialize };
   }
@@ -2557,7 +2750,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.configOptions = this.transformConfigOptions(transformed.configOptions ?? []);
 
     const modeInfo = deriveModesFromACP(this.defaultModes, transformed.modes, this.configOptions);
-    this.availableModes = modeInfo.modes;
+    this.applyDerivedModes(modeInfo);
     this.currentMode = modeInfo.currentModeId ?? this.currentMode;
 
     this.availableModels = transformed.models?.availableModels ?? null;
@@ -2584,6 +2777,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         modeId: configuredModeId,
         availableModes: this.availableModes,
         configOptions: this.configOptions,
+        modeSource: this.modeSource,
       });
       await this.setModeWithSelection({ modeId: configuredModeId, selection });
     }
@@ -2595,7 +2789,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         configOptions: this.configOptions,
       });
       try {
-        await this.setModelWithSelection({ modelId: configuredModelId, selection });
+        await this.setModelWithSelection({
+          modelId: configuredModelId,
+          selection,
+        });
       } catch (error) {
         if (!this.isModelSelectionUnavailableError(error)) {
           throw error;
@@ -2797,12 +2994,21 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   private handleConfigOptionUpdate(update: ConfigOptionUpdate): AgentStreamEvent[] {
     this.configOptions = this.transformConfigOptions(update.configOptions);
-    const modeInfo = deriveModesFromACP(this.defaultModes, null, this.configOptions);
+    // Config updates only refresh the config-derived mode list when we are not
+    // already bound to legacy session modes (which keep session/set_mode).
+    const modeInfo =
+      this.modeSource === "legacy"
+        ? {
+            modes: this.availableModes,
+            currentModeId: deriveCurrentConfigValue(this.configOptions, "mode"),
+            source: "legacy" as const,
+          }
+        : deriveModesFromACP(this.defaultModes, null, this.configOptions);
     const nextMode = modeInfo.currentModeId;
     const nextModel = deriveCurrentConfigValue(this.configOptions, "model");
     const nextThinkingOptionId = deriveCurrentConfigValue(this.configOptions, "thought_level");
 
-    this.availableModes = modeInfo.modes;
+    this.applyDerivedModes(modeInfo);
     this.currentMode = nextMode ?? this.currentMode;
     this.currentModel = nextModel ?? this.currentModel;
     this.thinkingOptionId = nextThinkingOptionId ?? this.thinkingOptionId;
@@ -3185,10 +3391,17 @@ function toACPContentBlocks(prompt: AgentPromptInput): ContentBlock[] {
         contentBlocks.push({ type: "text", text: block.text });
         break;
       case "image":
-        contentBlocks.push({ type: "image", data: block.data, mimeType: block.mimeType });
+        contentBlocks.push({
+          type: "image",
+          data: block.data,
+          mimeType: block.mimeType,
+        });
         break;
       default:
-        contentBlocks.push({ type: "text", text: renderPromptAttachmentAsText(block) });
+        contentBlocks.push({
+          type: "text",
+          text: renderPromptAttachmentAsText(block),
+        });
         break;
     }
   }
@@ -3676,7 +3889,10 @@ async function terminateChildProcess(
   terminate: ProcessTerminator,
 ): Promise<void> {
   try {
-    await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
+    await terminate(child, {
+      gracefulTimeoutMs: timeoutMs,
+      forceTimeoutMs: timeoutMs,
+    });
   } finally {
     child.stdin.destroy();
     child.stdout.destroy();

@@ -1342,7 +1342,11 @@ test("assembles assistant timeline when message_delta arrives before message_sta
               type: "stream_event",
               event: {
                 type: "message_start",
-                message: { id: "message-1", role: "assistant", model: "opus" },
+                message: {
+                  id: "message-1",
+                  role: "assistant",
+                  model: "opus",
+                },
               },
             },
           };
@@ -1528,4 +1532,159 @@ test("does not use stream_event uuid as assistant message identity when message_
   expect(assembler.timelineAssembler.messages.size).toBe(0);
 
   await session.close();
+});
+
+// Regression: reproduces the false "user rejected tool use" that Paseo surfaced
+// to Claude while permission mode was Bypass and the user rejected nothing.
+//
+// Timeline of the real repro (agent:paseo/62c89ad):
+//   1. User selected Bypass; the query launched with permissionMode:bypassPermissions.
+//   2. A background command was stopped / the session was torn down, which
+//      recreated the query via --resume.
+//   3. Claude Code's resumed system/init echoed the *persisted* permissionMode
+//      ("default"), NOT the launched Bypass.
+//   4. Paseo blindly adopted the echo, downgrading currentMode to "default".
+//   5. The next Shell went through canUseTool and, with no interactive client,
+//      resolved to { behavior: "deny" } — which the SDK renders as
+//      "The user doesn't want to proceed with this tool use".
+//
+// The fix keeps the launched mode authoritative: init must never downgrade it,
+// and the live query is re-asserted back to Bypass.
+test("stale resume init cannot downgrade Bypass into a synthetic tool rejection", async () => {
+  const launchedModes: Array<string | undefined> = [];
+  const reassertedModes: string[] = [];
+
+  const buildTurn = (initPermissionMode: string) => {
+    let step = 0;
+    const mock = createBaseQueryMock(
+      vi.fn(async () => {
+        if (step === 0) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "init",
+              session_id: "bypass-resume-session",
+              permissionMode: initPermissionMode,
+              model: "opus",
+            },
+          };
+        }
+        if (step === 1) {
+          step += 1;
+          return {
+            done: false,
+            value: { type: "assistant", message: { content: "ok" } },
+          };
+        }
+        if (step === 2) {
+          step += 1;
+          return {
+            done: false,
+            value: {
+              type: "result",
+              subtype: "success",
+              usage: buildUsage(),
+              total_cost_usd: 0,
+            },
+          };
+        }
+        return { done: true, value: undefined };
+      }),
+    );
+    // Record any live re-assertion of the permission mode triggered by init.
+    mock.setPermissionMode.mockImplementation(async (mode: string) => {
+      reassertedModes.push(mode);
+    });
+    return mock;
+  };
+
+  // First turn resumes and echoes the persisted "default" (the stale downgrade).
+  // Second turn is a plain follow-up and echoes bypass again.
+  const initModes = ["default", "bypassPermissions"];
+  sdkQueryFactory.mockImplementation(({ options }: { options: { permissionMode?: string } }) => {
+    launchedModes.push(options.permissionMode);
+    return buildTurn(initModes.shift() ?? "bypassPermissions");
+  });
+
+  const client = new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory: sdkQueryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  });
+  const session = await client.createSession({
+    provider: "claude",
+    cwd: process.cwd(),
+    modeId: "bypassPermissions",
+  });
+
+  try {
+    await collectUntilTerminal(streamSession(session, "first shell"));
+
+    // The stale init MUST NOT have downgraded the user's Bypass selection...
+    expect(await session.getCurrentMode()).toBe("bypassPermissions");
+    // ...and Paseo re-asserted Bypass onto the live query so the SDK agrees.
+    expect(reassertedModes).toContain("bypassPermissions");
+
+    // A subsequent tool use relaunches the query. Because the mode was never
+    // downgraded, it launches in Bypass — canUseTool never fires, so no
+    // synthetic deny (and thus no "user rejected") can be produced.
+    (asInternals(session) as { queryRestartNeeded: boolean }).queryRestartNeeded = true;
+    await collectUntilTerminal(streamSession(session, "second shell"));
+
+    // Every query launch — including the relaunch after the stale init — uses
+    // Bypass. If the downgrade bug were present, the relaunch would carry
+    // "default" and canUseTool would fire.
+    expect(launchedModes.length).toBeGreaterThanOrEqual(2);
+    expect(launchedModes.every((mode) => mode === "bypassPermissions")).toBe(true);
+    expect(await session.getCurrentMode()).toBe("bypassPermissions");
+  } finally {
+    await session.close();
+  }
+});
+
+// Guard the true-positive: an explicit user deny still rejects, so we are not
+// masking real rejections.
+test("explicit user deny still produces a rejection", async () => {
+  const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+  sdkQueryFactory.mockImplementation(() => queryMock);
+
+  const session = await createSession();
+  try {
+    const request = {
+      id: "perm-explicit-deny",
+      provider: "claude" as const,
+      name: "Bash",
+      kind: "tool" as const,
+      input: { command: "rm -rf /" },
+    };
+    let resolvedResult: { behavior: string } | null = null;
+    (
+      asInternals(session) as {
+        pendingPermissions: Map<
+          string,
+          {
+            request: typeof request;
+            resolve: (r: { behavior: string }) => void;
+            cleanup?: () => void;
+          }
+        >;
+      }
+    ).pendingPermissions.set(request.id, {
+      request,
+      resolve: (result) => {
+        resolvedResult = result;
+      },
+    });
+
+    await session.respondToPermission(request.id, {
+      behavior: "deny",
+      message: "not now",
+    });
+
+    expect(resolvedResult).toMatchObject({ behavior: "deny" });
+  } finally {
+    await session.close();
+  }
 });
