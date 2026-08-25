@@ -376,6 +376,18 @@ function processIdentityMatches(
     if (record.identity.startedAt !== snapshot.startedAt) {
       return false;
     }
+    // Agents that rewrite their process title (e.g. kimi shows up as
+    // "kimi-cod", not "kimi acp") never match the command-signature check.
+    // A matching start timestamp plus exact equality with the command line
+    // captured at record time is still strong identity evidence.
+    if (
+      record.identity.commandLine &&
+      snapshot.commandLine &&
+      normalizeCommandLine(record.identity.commandLine) ===
+        normalizeCommandLine(snapshot.commandLine)
+    ) {
+      return true;
+    }
     return snapshot.commandLine ? commandLineMatchesRecord(record, snapshot.commandLine) : true;
   }
 

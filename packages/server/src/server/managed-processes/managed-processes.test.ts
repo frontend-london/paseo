@@ -74,6 +74,106 @@ describe("managed process registry", () => {
     expect(await restartedRegistry.list()).toEqual([]);
   });
 
+  test("reaps an ACP agent whose process rewrote its command line after spawn", async () => {
+    tempHome = await mkdtemp(path.join(tmpdir(), "paseo-managed-processes-"));
+    // kimi (and similar CLIs) overwrite their process title, so the live
+    // command line ("kimi-cod") no longer contains the "kimi acp" signature.
+    // Matching start time plus the command line captured at record time must
+    // still identify the leftover; otherwise the orphan leaks.
+    const processTable = new FakeProcessTable([
+      {
+        pid: 4103,
+        commandLine: "kimi-cod",
+        startedAt: "process-start-token",
+      },
+    ]);
+    const terminator = new FakeProcessTerminator();
+    const registry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable,
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    await registry.record({
+      owner: { provider: "acp", kind: "acp-agent" },
+      pid: 4103,
+      command: "kimi",
+      args: ["acp"],
+      metadata: { agentId: "agent-1" },
+    });
+
+    const restartedRegistry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable,
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    const result = await restartedRegistry.reapStale();
+
+    expect(result).toEqual({
+      checked: 1,
+      dead: 0,
+      mismatched: 0,
+      removed: 1,
+      terminated: 1,
+      errors: [],
+    });
+    expect(terminator.terminatedPids).toEqual([4103]);
+    expect(await restartedRegistry.list()).toEqual([]);
+  });
+
+  test("does not reap a reused PID that only shares the rewritten command line", async () => {
+    tempHome = await mkdtemp(path.join(tmpdir(), "paseo-managed-processes-"));
+    // Same rewritten title but a different start time: PID was reused by
+    // another kimi process, so the record must go without a kill.
+    const recordTable = new FakeProcessTable([
+      {
+        pid: 4104,
+        commandLine: "kimi-cod",
+        startedAt: "original-start-token",
+      },
+    ]);
+    const terminator = new FakeProcessTerminator();
+    const registry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable: recordTable,
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    await registry.record({
+      owner: { provider: "acp", kind: "acp-agent" },
+      pid: 4104,
+      command: "kimi",
+      args: ["acp"],
+      metadata: { agentId: "agent-1" },
+    });
+
+    const restartedRegistry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable: new FakeProcessTable([
+        {
+          pid: 4104,
+          commandLine: "kimi-cod",
+          startedAt: "reused-start-token",
+        },
+      ]),
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    const result = await restartedRegistry.reapStale();
+
+    expect(result).toEqual({
+      checked: 1,
+      dead: 0,
+      mismatched: 1,
+      removed: 1,
+      terminated: 0,
+      errors: [],
+    });
+    expect(terminator.terminatedPids).toEqual([]);
+    expect(await restartedRegistry.list()).toEqual([]);
+  });
+
   test("deletes a dead helper process record without terminating a PID", async () => {
     tempHome = await mkdtemp(path.join(tmpdir(), "paseo-managed-processes-"));
     const processTable = new FakeProcessTable([
