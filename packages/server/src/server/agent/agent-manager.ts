@@ -4164,9 +4164,6 @@ export class AgentManager {
       "handleStreamEvent: turn_failed",
     );
     if (terminalDisposition === "stale") return;
-    if (!isForegroundEvent && !agent.activeForegroundTurnId) {
-      agent.lifecycle = "error";
-    }
     agent.lastError = event.error;
     await this.appendSystemErrorTimelineMessage(
       agent,
@@ -4175,12 +4172,16 @@ export class AgentManager {
       options,
     );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
-    if (!isForegroundEvent && !agent.activeForegroundTurnId) {
+    if (!isForegroundEvent) {
+      agent.lifecycle = "error";
       this.emitState(agent);
-      if (agent.lifecycle === "error") {
-        this.closeAgentAfterTerminalError(agent.id);
-      }
     }
+    // Always reap the runtime for terminal turn_failed. A race can leave
+    // activeForegroundTurnId set while isForegroundEvent is still false
+    // (session event processed before streamAgent published the foreground
+    // turn), which previously skipped both finalizeForegroundTurn and the
+    // autonomous close guard.
+    this.closeAgentAfterTerminalError(agent.id);
   }
 
   private onStreamTurnCanceled(params: {
