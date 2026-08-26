@@ -2512,6 +2512,7 @@ export const es: TranslationResources = {
         error: "Error",
         available: "Disponible",
         notInstalled: "No instalado",
+        stale: "Obsoleto",
       },
       models: {
         one: "1 modelo",

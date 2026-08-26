@@ -185,6 +185,12 @@ interface ProviderLoadOptions {
   providers: AgentProvider[];
   catalogScope: ProviderCatalogScope;
   force: boolean;
+  /**
+   * `foreground` bypasses the shared background concurrency limit so a direct
+   * create_agent / getReadyProvider path cannot starve behind warm-up fan-out.
+   * `background` (default) shares a process-wide limit of 2 probes.
+   */
+  priority?: "foreground" | "background";
 }
 interface ProviderLoad {
   promise: Promise<void>;
@@ -211,6 +217,8 @@ export class ProviderSnapshotManager {
   private readonly snapshots = new Map<string, Map<AgentProvider, ProviderSnapshotEntry>>();
   private readonly providerLoads = new Map<string, Map<AgentProvider, ProviderLoad>>();
   private readonly events = new EventEmitter();
+  /** Shared across all background warm-up/refresh batches for this manager. */
+  private readonly backgroundRefreshLimit = pLimit(PROVIDER_REFRESH_CONCURRENCY);
   private destroyed = false;
   private refreshTimeoutMs: number;
   private diagnosticTimeoutMs: number;
@@ -285,7 +293,11 @@ export class ProviderSnapshotManager {
     if (providersToWarm.length === 0) {
       return;
     }
-    await this.warmUp(target, providersToWarm);
+    // Awaited reads (create_agent / getReadyProvider) use foreground so a single
+    // requested provider is not queued behind unrelated background warm-up slots.
+    // Multi-provider awaited warm-ups still share the background concurrency limit.
+    const priority = providersToWarm.length === 1 ? "foreground" : "background";
+    await this.warmUp(target, providersToWarm, priority);
   }
 
   async refresh(options: ProviderSnapshotRefreshOptions): Promise<void> {
@@ -775,7 +787,11 @@ export class ProviderSnapshotManager {
     return entries;
   }
 
-  private async warmUp(target: ProviderSnapshotTarget, providers?: AgentProvider[]): Promise<void> {
+  private async warmUp(
+    target: ProviderSnapshotTarget,
+    providers?: AgentProvider[],
+    priority: "foreground" | "background" = "background",
+  ): Promise<void> {
     const providersToRefresh = providers ?? this.getProviderIds();
 
     await this.loadProviders({
@@ -783,6 +799,7 @@ export class ProviderSnapshotManager {
       catalogScope: target.catalogScope,
       providers: providersToRefresh,
       force: false,
+      priority,
     });
   }
 
@@ -795,6 +812,8 @@ export class ProviderSnapshotManager {
       catalogScope: target.catalogScope,
       providers,
       force: true,
+      // Single-provider refreshes (diagnostics / create waits) stay foreground.
+      priority: providers.length === 1 ? "foreground" : "background",
     });
   }
 
@@ -856,9 +875,13 @@ export class ProviderSnapshotManager {
   }
 
   private async loadProviders(options: ProviderLoadOptions): Promise<void> {
-    const limit = pLimit(PROVIDER_REFRESH_CONCURRENCY);
+    const run = (provider: AgentProvider) => this.loadProvider({ ...options, provider });
+    if (options.priority === "foreground") {
+      await Promise.allSettled(options.providers.map((provider) => run(provider)));
+      return;
+    }
     await Promise.allSettled(
-      options.providers.map((provider) => limit(() => this.loadProvider({ ...options, provider }))),
+      options.providers.map((provider) => this.backgroundRefreshLimit(() => run(provider))),
     );
   }
 
@@ -966,6 +989,8 @@ export class ProviderSnapshotManager {
         models: catalog.models,
         modes: catalog.modes,
         fetchedAt: new Date().toISOString(),
+        stale: undefined,
+        refreshError: undefined,
       });
     } catch (error) {
       const cached = snapshot.get(provider);

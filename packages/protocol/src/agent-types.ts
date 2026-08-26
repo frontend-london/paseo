@@ -111,6 +111,10 @@ export interface ProviderSnapshotEntry {
   models?: AgentModelDefinition[];
   modes?: AgentMode[];
   fetchedAt?: string;
+  /** True when serving a retained catalog after a failed refresh. */
+  stale?: boolean;
+  /** Refresh failure associated with a retained stale catalog. */
+  refreshError?: string;
   label?: string;
   description?: string;
   defaultModeId?: string | null;

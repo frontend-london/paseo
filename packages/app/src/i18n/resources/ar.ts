@@ -2456,6 +2456,7 @@ export const ar: TranslationResources = {
         error: "خطأ",
         available: "متاح",
         notInstalled: "غير مثبت",
+        stale: "قديم",
       },
       models: {
         one: "1 نموذج",

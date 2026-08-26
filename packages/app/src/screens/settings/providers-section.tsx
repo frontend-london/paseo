@@ -53,6 +53,7 @@ function getProviderStatus(
   enabled: boolean,
   modelCount: number,
   t: TFunction,
+  stale?: boolean,
 ): ProviderStatus {
   if (!enabled)
     return { tone: "muted", label: t("settings.providers.statuses.disabled"), modelCount: null };
@@ -61,6 +62,13 @@ function getProviderStatus(
   }
   if (status === "error") {
     return { tone: "danger", label: t("settings.providers.statuses.error"), modelCount: null };
+  }
+  if (status === "ready" && stale) {
+    return {
+      tone: "warning",
+      label: t("settings.providers.statuses.stale"),
+      modelCount: modelCount > 0 ? modelCount : null,
+    };
   }
   if (status === "ready") {
     return {
@@ -184,13 +192,14 @@ function ProviderRow({
   const ProviderIcon = getProviderIcon(def.id);
   const providerError =
     enabled &&
-    entry.status === "error" &&
-    typeof entry.error === "string" &&
-    entry.error.trim().length > 0
+    ((entry.status === "error" && typeof entry.error === "string" && entry.error.trim().length > 0
       ? entry.error.trim()
-      : null;
+      : null) ??
+      (entry.stale && typeof entry.refreshError === "string" && entry.refreshError.trim().length > 0
+        ? entry.refreshError.trim()
+        : null));
   const modelCount = filterSelectableModels(entry.models ?? null)?.length ?? 0;
-  const providerStatus = getProviderStatus(entry.status, enabled, modelCount, t);
+  const providerStatus = getProviderStatus(entry.status, enabled, modelCount, t, entry.stale);
 
   const handlePress = useCallback(() => {
     onPress(def.id);

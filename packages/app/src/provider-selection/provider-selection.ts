@@ -30,7 +30,13 @@ function buildModelRowKey(provider: string, modelId: string): string {
 }
 
 export type ProviderModelSelection =
-  | { kind: "models"; rows: ProviderSelectionModelRow[] }
+  | {
+      kind: "models";
+      rows: ProviderSelectionModelRow[];
+      /** Catalog retained after a failed refresh; create may still use last models. */
+      stale?: boolean;
+      refreshError?: string;
+    }
   | { kind: "loading" }
   | { kind: "error"; message: string };
 
@@ -104,11 +110,21 @@ function buildEntryModelSelection(
   entry: ProviderSnapshotEntry,
   label: string,
 ): ProviderModelSelection {
+  const withStale = (selection: ProviderModelSelection): ProviderModelSelection => {
+    if (selection.kind !== "models") return selection;
+    if (!entry.stale && !entry.refreshError) return selection;
+    return {
+      ...selection,
+      ...(entry.stale ? { stale: true } : {}),
+      ...(entry.refreshError ? { refreshError: entry.refreshError } : {}),
+    };
+  };
+
   if ((entry.models?.length ?? 0) > 0) {
-    return buildModelSelection(entry.provider, label, entry.models ?? null);
+    return withStale(buildModelSelection(entry.provider, label, entry.models ?? null));
   }
   if (entry.status === "ready") {
-    return buildModelSelection(entry.provider, label, entry.models ?? null);
+    return withStale(buildModelSelection(entry.provider, label, entry.models ?? null));
   }
   if (entry.status === "loading") {
     return { kind: "loading" };
@@ -117,6 +133,7 @@ function buildEntryModelSelection(
     kind: "error",
     message:
       entry.error ??
+      entry.refreshError ??
       (entry.status === "unavailable"
         ? i18n.t("providerSelection.unavailable")
         : i18n.t("providerSelection.unknownError")),

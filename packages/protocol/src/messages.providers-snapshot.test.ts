@@ -50,6 +50,21 @@ describe("provider snapshot message schemas", () => {
     expect(parsed.source).toBe("custom");
   });
 
+  test("preserves stale catalog metadata on provider snapshot entries", () => {
+    const parsed = ProviderSnapshotEntrySchema.parse({
+      provider: "cursor",
+      status: "ready",
+      enabled: true,
+      stale: true,
+      refreshError: "ACP initialize timed out after 20000ms",
+      fetchedAt: "2026-08-26T00:00:00.000Z",
+      label: "Cursor",
+    });
+
+    expect(parsed.stale).toBe(true);
+    expect(parsed.refreshError).toBe("ACP initialize timed out after 20000ms");
+  });
+
   test("defaults missing enabled state in providers snapshot response entries", () => {
     const parsed = GetProvidersSnapshotResponseMessageSchema.parse({
       type: "get_providers_snapshot_response",

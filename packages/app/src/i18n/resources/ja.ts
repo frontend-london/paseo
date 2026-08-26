@@ -2481,6 +2481,7 @@ export const ja: TranslationResources = {
         error: "エラー",
         available: "利用可能",
         notInstalled: "未インストール",
+        stale: "古い",
       },
       models: {
         one: "1つのモデル",

@@ -3647,6 +3647,7 @@ describe("ACPAgentSession initialization cleanup", () => {
 describe("ACPAgentClient probe cleanup", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   test("terminates the probe process tree and closes its stdio", async () => {
@@ -3689,7 +3690,7 @@ describe("ACPAgentClient probe cleanup", () => {
     expect(child.stderr.destroyed).toBe(true);
   });
 
-  test("uses the short catalog initialize deadline and cleans up the probe", async () => {
+  test("passes a short initialize deadline into spawnProcess for catalog probes", async () => {
     const terminator = new FakeTerminator();
     const child = createProbeChildStub();
     let initializeTimeoutMs: number | undefined;
@@ -3724,6 +3725,98 @@ describe("ACPAgentClient probe cleanup", () => {
 
     expect(initializeTimeoutMs).toBe(20_000);
     expect(terminator.terminated).toContain(child);
+  });
+
+  test("times out a hung initializeTransport and terminates the probe", async () => {
+    vi.useFakeTimers();
+    const terminator = new FakeTerminator();
+    const child = createProbeChildStub();
+    Object.defineProperty(child, "pid", { value: 4242 });
+
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnTransport() {
+        return {
+          child,
+          connection: {
+            initialize: () => new Promise(() => undefined),
+            newSession: vi.fn(),
+          } as unknown as ClientSideConnection,
+          stderrChunks: ["initialize hung"],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "cursor",
+      logger: createTestLogger(),
+      defaultCommand: ["cursor-agent", "acp"],
+      defaultModes: [],
+      terminateProcess: terminator.terminate,
+      catalogStageTimeoutMs: 50,
+      catalogProbeTimeoutMs: 200,
+    });
+
+    try {
+      const pending = client.fetchCatalog({
+        scope: "workspace",
+        cwd: "/tmp/acp-models",
+        force: false,
+      });
+      const expectation = expect(pending).rejects.toThrow(/ACP initialize timed out after 50ms/);
+      await vi.advanceTimersByTimeAsync(50);
+      await expectation;
+      expect(terminator.terminated).toContain(child);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("times out a hung session/new after initialize and terminates the probe", async () => {
+    vi.useFakeTimers();
+    const terminator = new FakeTerminator();
+    const child = createProbeChildStub();
+    Object.defineProperty(child, "pid", { value: 4243 });
+
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnTransport() {
+        return {
+          child,
+          connection: {
+            initialize: vi.fn().mockResolvedValue({ agentCapabilities: {} }),
+            newSession: () => new Promise(() => undefined),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "cursor",
+      logger: createTestLogger(),
+      defaultCommand: ["cursor-agent", "acp"],
+      defaultModes: [],
+      terminateProcess: terminator.terminate,
+      catalogStageTimeoutMs: 50,
+      catalogProbeTimeoutMs: 200,
+    });
+
+    try {
+      const pending = client.fetchCatalog({
+        scope: "workspace",
+        cwd: "/tmp/acp-models",
+        force: false,
+      });
+      const expectation = expect(pending).rejects.toThrow(/ACP session\/new timed out after 50ms/);
+      await vi.advanceTimersByTimeAsync(50);
+      await expectation;
+      expect(terminator.terminated).toContain(child);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
