@@ -2497,6 +2497,7 @@ export const ptBR: TranslationResources = {
         error: "Erro",
         available: "Disponível",
         notInstalled: "Não instalado",
+        stale: "Desatualizado",
       },
       models: {
         one: "1 modelo",

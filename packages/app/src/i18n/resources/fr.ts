@@ -2520,6 +2520,7 @@ export const fr: TranslationResources = {
         error: "Erreur",
         available: "Disponible",
         notInstalled: "Non installé",
+        stale: "Périmé",
       },
       models: {
         one: "1 modèle",

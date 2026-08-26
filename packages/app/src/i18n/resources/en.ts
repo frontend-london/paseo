@@ -2524,6 +2524,7 @@ export const en = {
         error: "Error",
         available: "Available",
         notInstalled: "Not installed",
+        stale: "Stale",
       },
       models: {
         one: "1 model",

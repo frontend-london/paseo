@@ -2471,6 +2471,7 @@ export const ko: TranslationResources = {
         error: "오류",
         available: "사용 가능",
         notInstalled: "설치되지 않음",
+        stale: "만료됨",
       },
       models: {
         one: "모델 1개",

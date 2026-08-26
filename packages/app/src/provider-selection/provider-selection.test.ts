@@ -129,6 +129,24 @@ describe("combined model selector data", () => {
     ).toEqual([]);
   });
 
+  it("preserves models for stale ready catalogs and marks selection degraded", () => {
+    const [provider] = buildSelectableProviderSelectorProviders([
+      snapshotEntry({
+        provider: "codex",
+        status: "ready",
+        stale: true,
+        refreshError: "ACP initialize timed out after 20000ms",
+        models: [codexModel],
+      }),
+    ]);
+    expect(provider?.modelSelection).toMatchObject({
+      kind: "models",
+      stale: true,
+      refreshError: "ACP initialize timed out after 20000ms",
+      rows: [{ modelId: "gpt-5.4" }],
+    });
+  });
+
   it("surfaces non-ready providers with their state-specific selection", () => {
     expect(
       buildSelectableProviderSelectorProviders([

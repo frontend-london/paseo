@@ -2424,6 +2424,7 @@ export const zhCN: TranslationResources = {
         error: "错误",
         available: "可用",
         notInstalled: "未安装",
+        stale: "已过期",
       },
       models: {
         one: "1 个 Model",

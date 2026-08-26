@@ -2503,6 +2503,7 @@ export const ru: TranslationResources = {
         error: "Ошибка",
         available: "Доступен",
         notInstalled: "Не установлен",
+        stale: "Устарел",
       },
       models: {
         one: "1 модель",
