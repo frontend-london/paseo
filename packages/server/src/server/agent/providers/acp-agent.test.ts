@@ -3688,6 +3688,43 @@ describe("ACPAgentClient probe cleanup", () => {
     expect(child.stdout.destroyed).toBe(true);
     expect(child.stderr.destroyed).toBe(true);
   });
+
+  test("uses the short catalog initialize deadline and cleans up the probe", async () => {
+    const terminator = new FakeTerminator();
+    const child = createProbeChildStub();
+    let initializeTimeoutMs: number | undefined;
+
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnProcess(
+        _env?: Record<string, string>,
+        options?: { initializeTimeoutMs?: number; onSpawned?: (probe: SpawnedACPProcess) => void },
+      ): Promise<SpawnedACPProcess> {
+        initializeTimeoutMs = options?.initializeTimeoutMs;
+        const probe = {
+          child,
+          connection: {
+            newSession: vi.fn().mockResolvedValue({ modes: null, models: null, configOptions: [] }),
+          },
+          initialize: { agentCapabilities: {} },
+        } as unknown as SpawnedACPProcess;
+        options?.onSpawned?.(probe);
+        return probe;
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "cursor",
+      logger: createTestLogger(),
+      defaultCommand: ["cursor-agent", "acp"],
+      defaultModes: [],
+      terminateProcess: terminator.terminate,
+    });
+
+    await client.fetchCatalog({ scope: "workspace", cwd: "/tmp/acp-models", force: false });
+
+    expect(initializeTimeoutMs).toBe(20_000);
+    expect(terminator.terminated).toContain(child);
+  });
 });
 
 describe("ACP session/load invariant — cwd and mcpServers always passed", () => {
