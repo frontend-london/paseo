@@ -1481,13 +1481,18 @@ export class AgentManager {
   // tracked background task: the caller is mid-way through finalizing a turn
   // and must not block on (or fail because of) process teardown.
   private closeAgentAfterTerminalError(agentId: string): void {
-    const task = this.closeAgent(agentId).catch((error: unknown) => {
-      this.logger.warn(
-        { err: error, agentId },
-        "Failed to close agent runtime after terminal error",
-      );
+    // Defer past the in-flight session-event queue task. closeAgentRuntime drains
+    // that queue first; invoking it from finalizeForegroundTurn (still inside
+    // handleStreamEvent) deadlocks on the current tail promise.
+    queueMicrotask(() => {
+      const task = this.closeAgent(agentId).catch((error: unknown) => {
+        this.logger.warn(
+          { err: error, agentId },
+          "Failed to close agent runtime after terminal error",
+        );
+      });
+      this.trackBackgroundTask(task);
     });
-    this.trackBackgroundTask(task);
   }
 
   closeAgent(agentId: string): Promise<void> {

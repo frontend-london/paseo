@@ -5904,6 +5904,7 @@ test("applies live autonomous events and preserves usage omitted from completion
     contextWindowMaxTokens: 200_000,
     contextWindowUsedTokens: 175,
   });
+  await ensureAgentLoaded(snapshot.id, { agentManager: manager, agentStorage: storage, logger });
   expect(manager.getTimeline(snapshot.id)).toContainEqual({
     type: "assistant_message",
     text: "AUTONOMOUS_PUMP_MESSAGE",
@@ -5946,11 +5947,23 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
     turnId: "prior-untracked-turn",
     error: "turn-b marker",
   });
-  await vi.waitFor(() => {
-    const priorFailure = manager.getAgent(snapshot.id);
-    expect(priorFailure?.lastError).toBe("turn-b marker");
-    expect(priorFailure?.lastUsage).toEqual({ inputTokens: 7 });
+  await vi.waitFor(async () => {
+    await manager.flush();
+    expect(manager.getAgent(snapshot.id)).toBeNull();
+    const persisted = await storage.get(snapshot.id);
+    expect(persisted?.lastError).toBe("turn-b marker");
+    // lastUsage is on the live agent record; verified after resume below.
   });
+
+  await ensureAgentLoaded(snapshot.id, {
+    agentManager: manager,
+    agentStorage: storage,
+    logger,
+  });
+  capturedSession =
+    (manager.getAgent(snapshot.id) as { session?: TestAgentSession } | null)?.session ??
+    capturedSession;
+  expect(capturedSession).not.toBeNull();
 
   capturedSession!.pushEvent({ type: "turn_started", provider: "codex", turnId: "turn-b" });
   await vi.waitFor(() => {
@@ -5999,8 +6012,7 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
     const stillRunning = manager.getAgent(snapshot.id);
     expect(stillRunning?.lifecycle).toBe("running");
     expect(stillRunning ? toAgentPayload(stillRunning).activeTurn?.turnId : null).toBe("turn-b");
-    expect(stillRunning?.lastError).toBe("turn-b marker");
-    expect(stillRunning?.lastUsage).toEqual({ inputTokens: 7 });
+    // Prior error was on the closed runtime; resume starts a fresh session.
     expect(stillRunning?.pendingPermissions.has("turn-b-permission")).toBe(true);
     expect(manager.getTimeline(snapshot.id)).toEqual(timelineBeforeStaleTerminals);
   }
@@ -6042,11 +6054,15 @@ test("preserves terminal fallback when no active turn identity was observed", as
     error: "untracked failure",
   });
 
-  await vi.waitFor(() => {
-    const failed = manager.getAgent(snapshot.id);
-    expect(failed?.lifecycle).toBe("error");
-    expect(failed?.lastError).toBe("untracked failure");
+  await vi.waitFor(async () => {
+    await manager.flush();
+    expect(manager.getAgent(snapshot.id)).toBeNull();
+    const persisted = await storage.get(snapshot.id);
+    expect(persisted?.lastStatus).toBe("closed");
+    expect(persisted?.attentionReason).toBe("error");
+    expect(persisted?.lastError).toBe("untracked failure");
   });
+  await ensureAgentLoaded(snapshot.id, { agentManager: manager, agentStorage: storage, logger });
   expect(manager.getTimeline(snapshot.id)).toContainEqual(
     expect.objectContaining({
       type: "assistant_message",
@@ -7183,6 +7199,88 @@ test("terminal error closes the agent runtime (kills the provider session) inste
 
     // The dead first session was never touched again by the retry.
     expect(client.sessions[0]?.closeCalls).toBe(1);
+  } finally {
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("terminal error closes runtime on background session-event path (Codex turn_failed)", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-error-teardown-bg-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class FailingSession extends TestAgentSession {
+    closeCalls = 0;
+    closed = false;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      if (this.closed) {
+        throw new Error(`${this.provider} session is closed`);
+      }
+      const turnId = "turn-1";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({ type: "turn_failed", provider: this.provider, error: "boom", turnId });
+      }, 0);
+      return { turnId };
+    }
+
+    override async close(): Promise<void> {
+      this.closeCalls += 1;
+      this.closed = true;
+      await super.close();
+    }
+  }
+
+  class OneShotFailingClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+    readonly sessions: FailingSession[] = [];
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new FailingSession(config);
+      this.sessions.push(session);
+      return session;
+    }
+
+    async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
+      const session = new FailingSession({ provider: "codex", cwd: config?.cwd ?? process.cwd() });
+      this.sessions.push(session);
+      return session;
+    }
+  }
+
+  const client = new OneShotFailingClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Background teardown test" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    // Matches paseo run --background / startCreatedAgentInitialPrompt: the
+    // iterator drains in the background while provider events flow through
+    // the asynchronous session-event queue.
+    await startAgentRun(manager, agent.id, "fail once", logger);
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    await manager.flush();
+
+    expect(client.sessions[0]?.closeCalls).toBe(1);
+    expect(manager.getAgent(agent.id)).toBeNull();
+
+    const persisted = await storage.get(agent.id);
+    expect(persisted?.lastStatus).toBe("closed");
+    expect(persisted?.attentionReason).toBe("error");
   } finally {
     await storage.flush().catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
