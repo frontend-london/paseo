@@ -1471,6 +1471,25 @@ export class AgentManager {
     }
   }
 
+  // Terminal `error` leaves the provider process (and any MCP/ACP children it
+  // spawned) alive with nothing tearing it down: the agent record shows
+  // "error" forever while `devin acp` and friends keep running under it,
+  // accumulating until the host runs out of memory. Route error the same way
+  // archive/reload already do -- through closeAgent's tree-kill teardown --
+  // so retrying goes through the normal resume-from-persistence path instead
+  // of reusing a session that has no live process backing it. Runs as a
+  // tracked background task: the caller is mid-way through finalizing a turn
+  // and must not block on (or fail because of) process teardown.
+  private closeAgentAfterTerminalError(agentId: string): void {
+    const task = this.closeAgent(agentId).catch((error: unknown) => {
+      this.logger.warn(
+        { err: error, agentId },
+        "Failed to close agent runtime after terminal error",
+      );
+    });
+    this.trackBackgroundTask(task);
+  }
+
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
@@ -2351,6 +2370,9 @@ export class AgentManager {
     if (!shouldHoldBusyForReplacement) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
+    }
+    if (nextLifecycle === "error") {
+      this.closeAgentAfterTerminalError(mutableAgent.id);
     }
   }
 
@@ -4141,6 +4163,9 @@ export class AgentManager {
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
+      if (agent.lifecycle === "error") {
+        this.closeAgentAfterTerminalError(agent.id);
+      }
     }
   }
 

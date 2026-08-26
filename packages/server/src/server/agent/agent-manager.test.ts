@@ -6962,55 +6962,64 @@ test("onAgentAttention is not called for delegated child agents", async () => {
   expect(attentionCalls).toEqual([]);
 });
 
-test("clearAgentAttention on errored agent stays cleared until a new error transition", async () => {
+test("a turn failure raises attention as error before the runtime closes", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-attention-error-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
 
   class FailingSession extends TestAgentSession {
-    private attempt = 0;
+    closeCalls = 0;
 
     override async startTurn(): Promise<{ turnId: string }> {
-      this.attempt += 1;
-      const attempt = this.attempt;
-      const turnId = `fail-turn-${attempt}`;
+      const turnId = "fail-turn-1";
       setTimeout(() => {
         this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
         this.pushEvent({
           type: "turn_failed",
           provider: this.provider,
-          error: `boom-${attempt}`,
+          error: "boom-1",
           turnId,
         });
       }, 0);
       return { turnId };
+    }
+
+    override async close(): Promise<void> {
+      this.closeCalls += 1;
+      await super.close();
     }
   }
 
   class FailingClient implements AgentClient {
     readonly provider = "codex" as const;
     readonly capabilities = TEST_CAPABILITIES;
+    readonly sessions: FailingSession[] = [];
 
     async isAvailable(): Promise<boolean> {
       return true;
     }
 
     async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      return new FailingSession(config);
+      const session = new FailingSession(config);
+      this.sessions.push(session);
+      return session;
     }
 
     async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
-      return new FailingSession({
+      const session = new FailingSession({
         provider: "codex",
         cwd: config?.cwd ?? process.cwd(),
       });
+      this.sessions.push(session);
+      return session;
     }
   }
 
   const attentionReasons: Array<"finished" | "error" | "permission"> = [];
+  const client = new FailingClient();
   const manager = new AgentManager({
     clients: {
-      codex: new FailingClient(),
+      codex: client,
     },
     registry: storage,
     logger,
@@ -7031,49 +7040,202 @@ test("clearAgentAttention on errored agent stays cleared until a new error trans
   );
 
   await expect(manager.runAgent(agent.id, "fail once")).rejects.toThrow("boom-1");
-  await manager.flush();
 
-  const afterFirstFailure = manager.getAgent(agent.id);
-  expect(afterFirstFailure?.lifecycle).toBe("error");
-  expect(afterFirstFailure?.attention.requiresAttention).toBe(true);
-  expect(afterFirstFailure?.attention).toMatchObject({
-    requiresAttention: true,
-    attentionReason: "error",
+  // The error attention signal lands synchronously with the lifecycle
+  // transition, independent of when the runtime-teardown background task
+  // (see next test) happens to run.
+  expect(attentionReasons).toEqual(["error"]);
+
+  await manager.flush();
+});
+
+test("terminal error closes the agent runtime (kills the provider session) instead of leaking it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-error-teardown-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  // Models the real ACP provider session: once close() has run, the
+  // underlying process/connection is gone and startTurn must refuse to
+  // reuse it -- exactly like acp-agent.ts's `if (this.closed) throw ...`.
+  class FailingSession extends TestAgentSession {
+    closeCalls = 0;
+    closed = false;
+
+    constructor(
+      config: AgentSessionConfig,
+      private readonly shouldFail: boolean,
+    ) {
+      super(config);
+    }
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      if (this.closed) {
+        throw new Error(`${this.provider} session is closed`);
+      }
+      const turnId = "turn-1";
+      const shouldFail = this.shouldFail;
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        if (shouldFail) {
+          this.pushEvent({ type: "turn_failed", provider: this.provider, error: "boom", turnId });
+        } else {
+          this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        }
+      }, 0);
+      return { turnId };
+    }
+
+    override async close(): Promise<void> {
+      this.closeCalls += 1;
+      this.closed = true;
+      await super.close();
+    }
+  }
+
+  class OneShotFailingClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+    readonly sessions: FailingSession[] = [];
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    // The first session (direct create) fails its turn, matching a
+    // transient provider/API error with a perfectly healthy process.
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new FailingSession(config, true);
+      this.sessions.push(session);
+      return session;
+    }
+
+    // Any resumed session (post-error retry) succeeds, matching resume
+    // spinning up a fresh provider process.
+    async resumeSession(config?: Partial<AgentSessionConfig>): Promise<AgentSession> {
+      const session = new FailingSession(
+        { provider: "codex", cwd: config?.cwd ?? process.cwd() },
+        false,
+      );
+      this.sessions.push(session);
+      return session;
+    }
+  }
+
+  const client = new OneShotFailingClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
   });
 
-  const persistedAfterFirstFailure = await storage.get(agent.id);
-  expect(persistedAfterFirstFailure?.lastStatus).toBe("error");
-  expect(persistedAfterFirstFailure?.requiresAttention).toBe(true);
-  expect(persistedAfterFirstFailure?.attentionReason).toBe("error");
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Teardown test" },
+      undefined,
+      { workspaceId: undefined },
+    );
 
-  await manager.clearAgentAttention(agent.id);
-  manager.notifyAgentState(agent.id);
-  await manager.flush();
+    await expect(manager.runAgent(agent.id, "fail once")).rejects.toThrow("boom");
+    await manager.flush();
 
-  const afterClear = manager.getAgent(agent.id);
-  expect(afterClear?.lifecycle).toBe("error");
-  expect(afterClear?.attention).toEqual({ requiresAttention: false });
+    // No live child process should be left behind: the first session's
+    // close() (the treeKill/SIGTERM+SIGKILL teardown in the real ACP
+    // provider) must have run exactly once.
+    expect(client.sessions[0]?.closeCalls).toBe(1);
 
-  const persistedAfterClear = await storage.get(agent.id);
-  expect(persistedAfterClear?.lastStatus).toBe("error");
-  expect(persistedAfterClear?.requiresAttention).toBe(false);
-  expect(persistedAfterClear?.attentionReason).toBeNull();
+    // The agent must not be left dangling in "error" forever -- it is no
+    // longer resident in the live registry, matching how archive/reload
+    // release a runtime today.
+    expect(manager.getAgent(agent.id)).toBeNull();
 
-  await expect(manager.runAgent(agent.id, "fail again")).rejects.toThrow("boom-2");
-  await manager.flush();
+    // But the error remains visible to the user: the persisted record
+    // keeps attentionReason "error" even though lastStatus is now "closed".
+    const persisted = await storage.get(agent.id);
+    expect(persisted?.lastStatus).toBe("closed");
+    expect(persisted?.requiresAttention).toBe(true);
+    expect(persisted?.attentionReason).toBe("error");
 
-  const afterSecondFailure = manager.getAgent(agent.id);
-  expect(afterSecondFailure?.lifecycle).toBe("error");
-  expect(afterSecondFailure?.attention).toMatchObject({
-    requiresAttention: true,
-    attentionReason: "error",
+    // Idempotency: the internal error->close trigger never lets a
+    // "runtime already gone" failure escape as an unhandled rejection or
+    // crash the daemon -- closeAgentAfterTerminalError swallows it (see the
+    // logger.warn call), same contract as every other background task
+    // tracked via trackBackgroundTask. Calling the public closeAgent
+    // directly on an already-closed agent still rejects (expected -- it
+    // has no agent to close), proving the daemon-safety guarantee lives in
+    // the error-triggered wrapper, not by pretending the agent exists.
+    await expect(manager.closeAgent(agent.id)).rejects.toThrow(/Unknown agent/);
+    await expect(manager.flush()).resolves.toBeUndefined();
+
+    // Retrying goes through the normal resume-from-persistence path (the
+    // same one archive/reload already use) and gets a brand-new provider
+    // session/process rather than reusing the dead one.
+    const resumed = await ensureAgentLoaded(agent.id, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    expect(resumed.lifecycle).not.toBe("error");
+    expect(client.sessions).toHaveLength(2);
+    expect(client.sessions[1]).not.toBe(client.sessions[0]);
+
+    const result = await manager.runAgent(agent.id, "retry");
+    expect(result.canceled).toBe(false);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+
+    // The dead first session was never touched again by the retry.
+    expect(client.sessions[0]?.closeCalls).toBe(1);
+  } finally {
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a successful turn does not close the agent runtime", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-error-teardown-noop-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class TrackedSession extends TestAgentSession {
+    closeCalls = 0;
+
+    override async close(): Promise<void> {
+      this.closeCalls += 1;
+      await super.close();
+    }
+  }
+
+  class TrackedClient extends TestAgentClient {
+    readonly sessions: TrackedSession[] = [];
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new TrackedSession(config);
+      this.sessions.push(session);
+      return session;
+    }
+  }
+
+  const client = new TrackedClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
   });
-  expect(attentionReasons).toEqual(["error", "error"]);
 
-  const persistedAfterSecondFailure = await storage.get(agent.id);
-  expect(persistedAfterSecondFailure?.lastStatus).toBe("error");
-  expect(persistedAfterSecondFailure?.requiresAttention).toBe(true);
-  expect(persistedAfterSecondFailure?.attentionReason).toBe("error");
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Happy path" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    const result = await manager.runAgent(agent.id, "hello");
+    await manager.flush();
+
+    expect(result.canceled).toBe(false);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(client.sessions[0]?.closeCalls).toBe(0);
+  } finally {
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("streamAgent clears pending run when startTurn fails before a turn id exists", async () => {
@@ -7136,6 +7298,12 @@ test("streamAgent clears pending run when startTurn fails before a turn id exist
   await expect(manager.runAgent(agent.id, "fail before turn id")).rejects.toThrow(
     "Invalid request: missing field `text`",
   );
+  await manager.flush();
+
+  // The failed turn closes the agent runtime (see the dedicated teardown
+  // tests above), so retrying goes through the normal resume-from-persistence
+  // path rather than reusing the errored session directly.
+  await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
 
   await expect(manager.runAgent(agent.id, "second turn")).resolves.toEqual(
     expect.objectContaining({
@@ -7975,11 +8143,21 @@ test("turn_failed emits a system error assistant timeline message and keeps erro
   );
 
   await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow("invalid model id");
+  await manager.flush();
 
-  const snapshot = manager.getAgent(agent.id);
-  expect(snapshot?.lifecycle).toBe("error");
-  expect(snapshot?.lastError).toBe("invalid model id");
+  // The runtime is closed after the terminal error (see the dedicated
+  // teardown tests), but the failure stays visible: lastError and the
+  // "error" attention reason survive onto the persisted, resumable record.
+  expect(manager.getAgent(agent.id)).toBeNull();
+  const persisted = await storage.get(agent.id);
+  expect(persisted?.lastStatus).toBe("closed");
+  expect(persisted?.lastError).toBe("invalid model id");
+  expect(persisted?.attentionReason).toBe("error");
 
+  // getTimeline requires a live agent; resume (as ensureAgentLoaded would on
+  // the next real prompt/open) to confirm the system error message survived
+  // the close.
+  await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
   const systemErrors = manager
     .getTimeline(agent.id)
     .filter(
@@ -8053,9 +8231,11 @@ test("turn_failed surfaces provider code and diagnostic in system error message"
   );
 
   await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow("Provider execution failed");
+  await manager.flush();
 
-  expect(manager.getAgent(agent.id)?.lastError).toBe("Provider execution failed");
+  expect((await storage.get(agent.id))?.lastError).toBe("Provider execution failed");
 
+  await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
   const systemError = manager
     .getTimeline(agent.id)
     .find(

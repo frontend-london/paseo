@@ -22,7 +22,11 @@ same Paseo agent ID. Provider history is not appended again when the canonical t
 primed.
 
 Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
-action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
+action such as archive, replacement, reload, workspace teardown, or daemon shutdown -- or the terminal
+`error` transition itself, which closes the runtime the same way archive does (killing the provider
+process tree) instead of leaving a dead session's process resident forever. `lastError` and the
+`error` attention reason survive onto the closed record so the failure stays visible; retrying goes
+through `ensureAgentLoaded()`'s normal resume path and gets a fresh provider process.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and
