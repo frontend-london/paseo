@@ -414,6 +414,95 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("retains the last valid catalog when a later provider refresh fails", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockResolvedValueOnce({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4" }],
+        modes: [],
+      })
+      .mockRejectedValueOnce(new Error("ACP initialize timed out after 20000ms"));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toMatchObject({
+        status: "ready",
+        stale: true,
+        refreshError: "ACP initialize timed out after 20000ms",
+        models: [{ id: "gpt-5.4" }],
+      });
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("bounds broad warm-up while a direct provider read stays independent", async () => {
+    const releases: Array<() => void> = [];
+    let active = 0;
+    const slowCatalog = async () => {
+      active += 1;
+      await new Promise<void>((release) => releases.push(release));
+      active -= 1;
+      return { models: [], modes: [] };
+    };
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+        claude: createExtraClient("claude", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+        pi: createExtraClient("pi", { isAvailable: async () => true, fetchCatalog: slowCatalog }),
+        opencode: createExtraClient("opencode", {
+          isAvailable: async () => true,
+          fetchCatalog: async () => ({ models: [], modes: [] }),
+        }),
+      },
+    });
+    try {
+      const warmUp = manager.listProviders({
+        cwd: "/tmp/project",
+        providers: ["codex", "claude", "pi"],
+        wait: true,
+      });
+      await vi.waitFor(() => expect(releases).toHaveLength(2));
+
+      // A request for an already independent healthy provider does not await the stuck pair.
+      const healthy = manager.resolveCreateConfig({
+        cwd: "/tmp/other-project",
+        provider: "opencode",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+      });
+
+      for (const release of releases.splice(0)) release();
+      await healthy;
+      await vi.waitFor(() => expect(releases).toHaveLength(1));
+      for (const release of releases.splice(0)) release();
+      await warmUp;
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("refreshTimeoutMs option overrides the default and yields a timeout error", async () => {
     // never-resolving isAvailable forces the timeout path
     const isAvailable = vi.fn(waitUntilAborted);

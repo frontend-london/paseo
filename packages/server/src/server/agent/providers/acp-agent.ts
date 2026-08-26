@@ -127,6 +127,9 @@ import {
 import { withTimeout } from "../../../utils/promise-timeout.js";
 
 const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
+// ProviderSnapshotManager has a longer outer deadline for non-ACP catalog work.
+// ACP initialize is one RPC round trip and must never consume that whole budget.
+const ACP_CATALOG_INITIALIZE_TIMEOUT_MS = 20_000;
 
 function assertChildWithPipes(
   child: ChildProcess,
@@ -1002,6 +1005,9 @@ export class ACPAgentClient implements AgentClient {
     const cwd = options.scope === "global" ? homedir() : options.cwd;
     let probe: UninitializedACPProcess | null = null;
     let closePromise: Promise<void> | null = null;
+    let stage: "spawn" | "initialize" | "catalog" = "spawn";
+    const startedAt = Date.now();
+    let failure: unknown;
     const closeProbe = (): Promise<void> => {
       if (!probe) return Promise.resolve();
       closePromise ??= this.closeProbe(probe);
@@ -1015,14 +1021,26 @@ export class ACPAgentClient implements AgentClient {
         raceProviderRefreshAbort(
           context?.signal,
           this.spawnProcess(PROBE_ENV, {
+            initializeTimeoutMs: ACP_CATALOG_INITIALIZE_TIMEOUT_MS,
             onSpawned: (spawned) => {
               probe = spawned;
+              stage = "initialize";
+              this.logger.info(
+                {
+                  provider: this.provider,
+                  pid: spawned.child.pid,
+                  stage,
+                  elapsedMs: Date.now() - startedAt,
+                },
+                "Started ACP catalog probe",
+              );
               if (context?.signal.aborted) void closeProbe().catch(() => undefined);
             },
           }),
         ),
       );
       probe = initializedProbe;
+      stage = "catalog";
       const response = await runProviderRefreshActivity(context, "session/new", () =>
         raceProviderRefreshAbort(
           context?.signal,
@@ -1069,9 +1087,27 @@ export class ACPAgentClient implements AgentClient {
         models: this.modelTransformer ? this.modelTransformer(models) : models,
         modes: modeInfo.modes,
       };
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
       context?.signal.removeEventListener("abort", handleAbort);
       await closeProbe();
+      if (failure) {
+        this.logger.warn(
+          {
+            err: failure,
+            provider: this.provider,
+            pid: probe?.child.pid,
+            stage,
+            elapsedMs: Date.now() - startedAt,
+            stderr: probe?.stderrChunks?.join("").trim() || undefined,
+            exitCode: probe?.child.exitCode,
+            signalCode: probe?.child.signalCode,
+          },
+          "ACP catalog probe failed",
+        );
+      }
     }
   }
 
