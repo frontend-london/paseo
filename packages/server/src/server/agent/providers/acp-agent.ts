@@ -132,6 +132,11 @@ const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
 const ACP_CATALOG_STAGE_TIMEOUT_MS = 20_000;
 const ACP_CATALOG_PROBE_TIMEOUT_MS = 45_000;
 
+function swallowLateRejection<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => undefined);
+  return promise;
+}
+
 function assertChildWithPipes(
   child: ChildProcess,
 ): asserts child is ChildProcessWithoutNullStreams {
@@ -1063,15 +1068,18 @@ export class ACPAgentClient implements AgentClient {
       stage = "session/new";
       const response = await runProviderRefreshActivity(context, "session/new", () => {
         const timeoutMs = this.catalogStageBudgetMs(probeDeadlineAt);
+        const newSessionPromise = swallowLateRejection(
+          this.runACPRequest(() =>
+            initializedProbe.connection.newSession({
+              cwd,
+              mcpServers: [],
+            }),
+          ),
+        );
         return raceProviderRefreshAbort(
           context?.signal,
           withTimeout(
-            this.runACPRequest(() =>
-              initializedProbe.connection.newSession({
-                cwd,
-                mcpServers: [],
-              }),
-            ),
+            newSessionPromise,
             timeoutMs,
             `ACP session/new timed out after ${timeoutMs}ms`,
           ),
@@ -1087,22 +1095,25 @@ export class ACPAgentClient implements AgentClient {
         ? await runProviderRefreshActivity(context, "catalog.resolve", () => {
             stage = "catalog.resolve";
             const timeoutMs = this.catalogStageBudgetMs(probeDeadlineAt);
+            const resolvePromise = swallowLateRejection(
+              this.catalogModelResolver?.({
+                connection: initializedProbe.connection,
+                sessionId: response.sessionId,
+                models: derivedModels,
+                configOptions: transformed.configOptions,
+                runRequest: (request) => this.runACPRequest(request),
+                transformConfigOptions: (configOptions) =>
+                  this.configOptionsTransformer
+                    ? this.configOptionsTransformer(configOptions)
+                    : configOptions,
+                logger: this.logger,
+                provider: this.provider,
+              }) ?? Promise.resolve(derivedModels),
+            );
             return raceProviderRefreshAbort(
               context?.signal,
               withTimeout(
-                this.catalogModelResolver?.({
-                  connection: initializedProbe.connection,
-                  sessionId: response.sessionId,
-                  models: derivedModels,
-                  configOptions: transformed.configOptions,
-                  runRequest: (request) => this.runACPRequest(request),
-                  transformConfigOptions: (configOptions) =>
-                    this.configOptionsTransformer
-                      ? this.configOptionsTransformer(configOptions)
-                      : configOptions,
-                  logger: this.logger,
-                  provider: this.provider,
-                }) ?? Promise.resolve(derivedModels),
+                resolvePromise,
                 timeoutMs,
                 `ACP catalog.resolve timed out after ${timeoutMs}ms`,
               ),

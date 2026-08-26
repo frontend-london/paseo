@@ -502,6 +502,37 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("retains stale catalog when refresh fails after a models-only snapshot", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockResolvedValueOnce({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4" }],
+      })
+      .mockRejectedValueOnce(new Error("ACP initialize timed out after 20000ms"));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toMatchObject({
+        status: "ready",
+        stale: true,
+        models: [{ id: "gpt-5.4", label: "GPT 5.4" }],
+      });
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("clears stale metadata after a later successful refresh", async () => {
     const fetchCatalog = vi
       .fn()

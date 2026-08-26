@@ -49,6 +49,7 @@ import {
   type ProviderSelectionModelRow,
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
+import { ProviderDrillDownTrailingState } from "@/components/model-browser-drill-down-state";
 import { useProviderSettingsStore } from "@/stores/provider-settings-store";
 import { useCurrentOverlayLayer } from "@/lib/overlay-root";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
@@ -953,40 +954,15 @@ function GroupProviderButton({
   provider: ProviderSelectorProvider;
   onDrillDown: (providerId: string, providerLabel: string) => void;
 }) {
-  const { t } = useTranslation();
   const selection = provider.modelSelection;
   const handlePress = useCallback(() => {
     onDrillDown(provider.id, provider.label);
   }, [onDrillDown, provider.id, provider.label]);
 
-  const stateNode = useMemo(() => {
-    if (selection.kind === "models") {
-      const count = selection.rows.length;
-      return (
-        <Text style={styles.drillDownCount}>
-          {t(count === 1 ? "modelSelector.modelCount" : "modelSelector.modelCountPlural", {
-            count,
-          })}
-        </Text>
-      );
-    }
-    if (selection.kind === "loading") {
-      return (
-        <View style={styles.rowStateInline}>
-          <View style={styles.rowSpinner}>
-            <ThemedLoadingSpinner size={ICON_SIZE.sm} uniProps={foregroundMutedMapping} />
-          </View>
-          <Text style={styles.drillDownCount}>{t("modelSelector.loadingShort")}</Text>
-        </View>
-      );
-    }
-    return (
-      <View style={styles.rowStateInline}>
-        <ThemedAlertTriangle size={ICON_SIZE.sm} uniProps={foregroundMutedMapping} />
-        <Text style={styles.drillDownCount}>{t("modelSelector.error")}</Text>
-      </View>
-    );
-  }, [selection, t]);
+  const stateNode = useMemo(
+    () => <ProviderDrillDownTrailingState selection={selection} />,
+    [selection],
+  );
   const leadingSlot = useMemo(
     () => <ModelProviderGlyph provider={provider.id} size={ICON_SIZE.sm} />,
     [provider.id],

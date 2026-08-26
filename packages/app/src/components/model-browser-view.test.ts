@@ -7,6 +7,7 @@ import {
   resolveInitialModelBrowserView,
   resolveModelBrowserAllView,
   groupProfilesByProviderModel,
+  resolveProviderDrillDownState,
 } from "./model-browser-view";
 
 function provider(
@@ -217,5 +218,31 @@ describe("model browser all view", () => {
         isSearchFocused: true,
       }),
     ).toEqual({ kind: "noSearchMatches" });
+  });
+});
+
+describe("provider drill-down state", () => {
+  it("marks stale ready catalogs as degraded while preserving model count", () => {
+    expect(
+      resolveProviderDrillDownState({
+        kind: "models",
+        stale: true,
+        refreshError: "ACP initialize timed out after 20000ms",
+        rows: [modelRow("codex", "Codex", "gpt-5.4", "GPT 5.4")],
+      }),
+    ).toEqual({
+      kind: "stale",
+      modelCount: 1,
+      refreshError: "ACP initialize timed out after 20000ms",
+    });
+  });
+
+  it("keeps healthy catalogs on the normal model-count path", () => {
+    expect(
+      resolveProviderDrillDownState({
+        kind: "models",
+        rows: [modelRow("codex", "Codex", "gpt-5.4", "GPT 5.4")],
+      }),
+    ).toEqual({ kind: "healthy", modelCount: 1 });
   });
 });

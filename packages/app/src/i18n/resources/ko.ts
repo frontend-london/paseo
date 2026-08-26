@@ -1492,6 +1492,7 @@ export const ko: TranslationResources = {
     editProfilesCount: "프로필 편집 ({{count}})",
     modelCount: "모델 {{count}}개",
     modelCountPlural: "모델 {{count}}개",
+    stale: "만료됨",
     retry: "다시 시도",
     retrying: "다시 시도 중...",
     noMatches: "검색과 일치하는 모델이 없습니다",

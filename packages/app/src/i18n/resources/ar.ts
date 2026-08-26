@@ -1482,6 +1482,7 @@ export const ar: TranslationResources = {
     editProfilesCount: "تحرير الملفات الشخصية ({{count}})",
     modelCount: "{{count}} نموذج",
     modelCountPlural: "{{count}} نماذج",
+    stale: "قديم",
     retry: "أعد المحاولة",
     retrying: "جارٍ إعادة المحاولة...",
     noMatches: "لا توجد نماذج تطابق بحثك",

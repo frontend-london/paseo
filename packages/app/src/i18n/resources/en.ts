@@ -1492,6 +1492,7 @@ export const en = {
     editProfilesCount: "Edit profiles ({{count}})",
     modelCount: "{{count}} model",
     modelCountPlural: "{{count}} models",
+    stale: "Stale",
     retry: "Retry",
     retrying: "Retrying...",
     noMatches: "No models match your search",

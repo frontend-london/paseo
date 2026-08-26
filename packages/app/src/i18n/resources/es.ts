@@ -1526,6 +1526,7 @@ export const es: TranslationResources = {
     editProfilesCount: "Editar perfiles ({{count}})",
     modelCount: "{{count}} modelo",
     modelCountPlural: "{{count}} modelos",
+    stale: "Obsoleto",
     retry: "Rever",
     retrying: "Reintentando...",
     noMatches: "Ningún modelo coincide con tu búsqueda",

@@ -1465,6 +1465,7 @@ export const zhCN: TranslationResources = {
     editProfilesCount: "编辑配置文件 ({{count}})",
     modelCount: "{{count}} 个模型",
     modelCountPlural: "{{count}} 个模型",
+    stale: "已过期",
     retry: "重试",
     retrying: "正在重试...",
     noMatches: "没有匹配的模型",

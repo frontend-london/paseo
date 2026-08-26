@@ -1509,6 +1509,7 @@ export const ru: TranslationResources = {
     editProfilesCount: "Изменить профили ({{count}})",
     modelCount: "{{count}} модель",
     modelCountPlural: "{{count}} моделей",
+    stale: "Устарел",
     retry: "Повторить попытку",
     retrying: "Повторная попытка...",
     noMatches: "Ни одна модель не соответствует вашему запросу",

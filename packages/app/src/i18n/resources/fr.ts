@@ -1530,6 +1530,7 @@ export const fr: TranslationResources = {
     editProfilesCount: "Modifier les profils ({{count}})",
     modelCount: "{{count}} modèle",
     modelCountPlural: "{{count}} modèles",
+    stale: "Périmé",
     retry: "Réessayer",
     retrying: "Nouvelle tentative...",
     noMatches: "Aucun modèle ne correspond à votre recherche",
