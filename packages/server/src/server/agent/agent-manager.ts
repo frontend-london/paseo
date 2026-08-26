@@ -675,6 +675,7 @@ export class AgentManager {
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
+  private readonly terminalErrorCloses = new Set<string>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
   private readonly foregroundMutationTails = new Map<string, Promise<void>>();
   private readonly runs = new AgentRunState();
@@ -1481,16 +1482,21 @@ export class AgentManager {
   // tracked background task: the caller is mid-way through finalizing a turn
   // and must not block on (or fail because of) process teardown.
   private closeAgentAfterTerminalError(agentId: string): void {
-    // Defer past the in-flight session-event queue task. closeAgentRuntime drains
-    // that queue first; invoking it from finalizeForegroundTurn (still inside
-    // handleStreamEvent) deadlocks on the current tail promise.
-    queueMicrotask(() => {
-      const task = this.closeAgent(agentId).catch((error: unknown) => {
-        this.logger.warn(
-          { err: error, agentId },
-          "Failed to close agent runtime after terminal error",
-        );
-      });
+    // Defer past the in-flight session-event queue task and any foreground-run
+    // finally handlers. closeAgentRuntime drains that queue first; invoking it
+    // while turn_failed is still on the stack deadlocks on the current tail.
+    setImmediate(() => {
+      this.terminalErrorCloses.add(agentId);
+      const task = this.closeAgent(agentId)
+        .catch((error: unknown) => {
+          this.logger.warn(
+            { err: error, agentId },
+            "Failed to close agent runtime after terminal error",
+          );
+        })
+        .finally(() => {
+          this.terminalErrorCloses.delete(agentId);
+        });
       this.trackBackgroundTask(task);
     });
   }
@@ -3495,6 +3501,9 @@ export class AgentManager {
    * manager state so call order remains authoritative.
    */
   private async drainSessionEvents(agentId: string): Promise<void> {
+    if (this.terminalErrorCloses.has(agentId)) {
+      return;
+    }
     while (true) {
       const tail = this.sessionEventTails.get(agentId);
       if (!tail) {
