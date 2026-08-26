@@ -1,6 +1,7 @@
 import {
   filterAndRankModelRows,
   getAllProviderModelRows,
+  type ProviderModelSelection,
   type ProviderSelectionModelRow,
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
@@ -98,4 +99,30 @@ export function resolveInitialModelBrowserView({
   }
 
   return { kind: "all" };
+}
+
+export type ProviderDrillDownState =
+  | { kind: "healthy"; modelCount: number }
+  | { kind: "stale"; modelCount: number; refreshError?: string }
+  | { kind: "loading" }
+  | { kind: "error" };
+
+/** Maps provider model selection into the drill-down row state shown in the model browser. */
+export function resolveProviderDrillDownState(
+  selection: ProviderModelSelection,
+): ProviderDrillDownState {
+  if (selection.kind === "loading") {
+    return { kind: "loading" };
+  }
+  if (selection.kind === "error") {
+    return { kind: "error" };
+  }
+  if (selection.stale) {
+    return {
+      kind: "stale",
+      modelCount: selection.rows.length,
+      ...(selection.refreshError ? { refreshError: selection.refreshError } : {}),
+    };
+  }
+  return { kind: "healthy", modelCount: selection.rows.length };
 }

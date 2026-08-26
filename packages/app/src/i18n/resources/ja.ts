@@ -1497,6 +1497,7 @@ export const ja: TranslationResources = {
     editProfilesCount: "プロファイルを編集（{{count}}）",
     modelCount: "{{count}}つのモデル",
     modelCountPlural: "{{count}}つのモデル",
+    stale: "古い",
     retry: "再試行",
     retrying: "再試行中...",
     noMatches: "検索に一致するモデルがありません",

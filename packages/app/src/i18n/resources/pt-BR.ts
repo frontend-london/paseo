@@ -1512,6 +1512,7 @@ export const ptBR: TranslationResources = {
     editProfilesCount: "Editar perfis ({{count}})",
     modelCount: "{{count}} modelo",
     modelCountPlural: "{{count}} modelos",
+    stale: "Desatualizado",
     retry: "Tentar novamente",
     retrying: "Tentando novamente...",
     noMatches: "Nenhum modelo corresponde à sua busca",

@@ -994,7 +994,7 @@ export class ProviderSnapshotManager {
       });
     } catch (error) {
       const cached = snapshot.get(provider);
-      if (cached?.fetchedAt && cached.models && cached.modes) {
+      if (cached?.fetchedAt && (cached.models?.length ?? 0) > 0) {
         const emitted = setEntry({
           ...base,
           status: "ready",
