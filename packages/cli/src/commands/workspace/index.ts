@@ -4,6 +4,7 @@ import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 import { runArchiveCommand } from "./archive.js";
 import { runCreateCommand } from "./create.js";
 import { runLsCommand } from "./ls.js";
+import { runRemoveCommand } from "./remove.js";
 import { runRenameCommand } from "./rename.js";
 
 export function createWorkspaceCommand(): Command {
@@ -51,6 +52,13 @@ export function createWorkspaceCommand(): Command {
       .description("Archive a workspace and everything it owns")
       .argument("<workspace-id>", "Workspace id"),
   ).action(withOutput(runArchiveCommand));
+
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("remove")
+      .description("Remove an orphaned workspace record from the registry")
+      .argument("<workspace-id>", "Workspace id"),
+  ).action(withOutput(runRemoveCommand));
 
   return workspace;
 }
