@@ -206,7 +206,7 @@ describe("CursorACPAgentClient resolveCreateConfig", () => {
     const result = client.resolveCreateConfig(makeInput(undefined));
 
     expect(result).toEqual({
-      modeId: undefined,
+      modeId: "agent",
       featureValues: { auto_accept: true },
     });
   });
@@ -253,23 +253,34 @@ describe("CursorACPAgentClient resolveCreateConfig", () => {
     });
 
     expect(result).toEqual({
-      modeId: undefined,
+      modeId: "agent",
       featureValues: { auto_accept: false },
     });
   });
 
-  test("does not auto-accept non-cursor providers", () => {
+  test("does not auto-accept an explicit non-unattended ACP mode", () => {
     const client = new CursorACPAgentClient({
       logger: createTestLogger(),
       command: ["cursor-agent", "acp"],
     });
 
-    const result = client.resolveCreateConfig(makeInput(undefined, "claude"));
+    const result = client.resolveCreateConfig(makeInput("plan", "generic-acp"));
 
     expect(result).toEqual({
-      modeId: undefined,
+      modeId: "plan",
       featureValues: undefined,
     });
+  });
+
+  test("rejects an unknown ACP provider with no explicit mode", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    expect(() => client.resolveCreateConfig(makeInput(undefined, "unknown-acp"))).toThrow(
+      "Provider 'unknown-acp' has no unattended/no-prompts mode and cannot be started without an explicit mode.",
+    );
   });
 
   test("inherits auto-accept from an unattended parent", () => {

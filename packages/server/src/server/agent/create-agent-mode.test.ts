@@ -35,7 +35,7 @@ describe("resolveAndValidateCreateAgentMode", () => {
     );
   });
 
-  it("returns undefined (provider default) when no mode and no caller", () => {
+  it("defaults top-level Claude to its unattended bypassPermissions mode", () => {
     const resolved = resolveAndValidateCreateAgentMode({
       requestedMode: undefined,
       targetProvider: "claude",
@@ -43,7 +43,55 @@ describe("resolveAndValidateCreateAgentMode", () => {
       unattended: false,
       availableModes: CLAUDE_MODES,
     });
+    expect(resolved).toBe("bypassPermissions");
+  });
+
+  it("defaults top-level Codex to its unattended full-access mode", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: undefined,
+      targetProvider: "codex",
+      parent: null,
+      unattended: false,
+      availableModes: CODEX_MODES,
+    });
+    expect(resolved).toBe("full-access");
+  });
+
+  it("rejects top-level providers with no unattended/no-prompts mode", () => {
+    expect(() =>
+      resolveAndValidateCreateAgentMode({
+        requestedMode: undefined,
+        targetProvider: "opencode",
+        parent: null,
+        unattended: false,
+        availableModes: OPENCODE_MODES,
+      }),
+    ).toThrow(
+      "Provider 'opencode' has no unattended/no-prompts mode and cannot be started without an explicit mode. Available modes: build, plan",
+    );
+  });
+
+  it("allows providers with no mode concept to use their own default", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: undefined,
+      targetProvider: "pi",
+      parent: null,
+      unattended: false,
+      availableModes: [],
+      targetUnattendedMode: undefined,
+    });
     expect(resolved).toBeUndefined();
+  });
+
+  it("respects an explicit non-unattended mode over the default", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: "plan",
+      targetProvider: "claude",
+      parent: null,
+      unattended: false,
+      availableModes: CLAUDE_MODES,
+    });
+    expect(resolved).toBe("plan");
   });
 
   it("inherits the caller mode when caller and target share a provider", () => {
@@ -55,94 +103,6 @@ describe("resolveAndValidateCreateAgentMode", () => {
       availableModes: CLAUDE_MODES,
     });
     expect(resolved).toBe("bypassPermissions");
-  });
-
-  it("returns undefined when same-provider caller has no mode", () => {
-    const resolved = resolveAndValidateCreateAgentMode({
-      requestedMode: undefined,
-      targetProvider: "claude",
-      parent: agentParent("claude", null),
-      unattended: false,
-      availableModes: CLAUDE_MODES,
-    });
-    expect(resolved).toBeUndefined();
-  });
-
-  it("refuses cross-provider inheritance with the target provider's modes in the message", () => {
-    expect(() =>
-      resolveAndValidateCreateAgentMode({
-        requestedMode: undefined,
-        targetProvider: "opencode",
-        parent: agentParent("claude", "bypassPermissions"),
-        unattended: false,
-        availableModes: OPENCODE_MODES,
-      }),
-    ).toThrow(
-      "cannot inherit mode 'bypassPermissions' from caller (provider 'claude') for new agent (provider 'opencode'). Pass an explicit mode. Available modes for 'opencode': build, plan",
-    );
-  });
-
-  it("refuses cross-provider inheritance even when the caller mode is null", () => {
-    expect(() =>
-      resolveAndValidateCreateAgentMode({
-        requestedMode: undefined,
-        targetProvider: "codex",
-        parent: agentParent("opencode", null),
-        unattended: false,
-        availableModes: CODEX_MODES,
-      }),
-    ).toThrow(
-      "cannot inherit mode '<none>' from caller (provider 'opencode') for new agent (provider 'codex'). Pass an explicit mode. Available modes for 'codex': auto, full-access",
-    );
-  });
-
-  it("uses the provider default when the cross-provider target has no modes", () => {
-    const resolved = resolveAndValidateCreateAgentMode({
-      requestedMode: undefined,
-      targetProvider: "pi",
-      parent: agentParent("codex", "auto"),
-      unattended: false,
-      availableModes: [],
-      targetUnattendedMode: undefined,
-    });
-
-    expect(resolved).toBeUndefined();
-  });
-
-  it("uses the provider default when an unattended parent targets a provider with no modes", () => {
-    const resolved = resolveAndValidateCreateAgentMode({
-      requestedMode: undefined,
-      targetProvider: "pi",
-      parent: agentParent("claude", "bypassPermissions", true),
-      unattended: false,
-      availableModes: [],
-      targetUnattendedMode: undefined,
-    });
-
-    expect(resolved).toBeUndefined();
-  });
-
-  it("passes through an explicit mode when the target provider's modes are unknown", () => {
-    const resolved = resolveAndValidateCreateAgentMode({
-      requestedMode: "default",
-      targetProvider: "zai-custom",
-      parent: null,
-      unattended: false,
-      availableModes: undefined,
-    });
-    expect(resolved).toBe("default");
-  });
-
-  it("renders 'unknown' in cross-provider error when target modes are unknown", () => {
-    expect(() =>
-      resolveAndValidateCreateAgentMode({
-        requestedMode: undefined,
-        targetProvider: "zai-custom",
-        parent: agentParent("claude", "default"),
-        unattended: false,
-        availableModes: undefined,
-      }),
-    ).toThrow("Available modes for 'zai-custom': unknown");
   });
 
   it("inherits target's unattended mode when caller is unattended cross-provider", () => {
@@ -157,7 +117,7 @@ describe("resolveAndValidateCreateAgentMode", () => {
     expect(resolved).toBe("full-access");
   });
 
-  it("inherits target's unattended mode for unattended creation without a parent", () => {
+  it("defaults to target's unattended mode when unattended and no parent", () => {
     const resolved = resolveAndValidateCreateAgentMode({
       requestedMode: undefined,
       targetProvider: "codex",
@@ -209,5 +169,40 @@ describe("resolveAndValidateCreateAgentMode", () => {
       targetUnattendedMode: "full-access",
     });
     expect(resolved).toBe("auto");
+  });
+
+  it("passes through an explicit mode when the target provider's modes are unknown", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: "default",
+      targetProvider: "zai-custom",
+      parent: null,
+      unattended: false,
+      availableModes: undefined,
+    });
+    expect(resolved).toBe("default");
+  });
+
+  it("uses the provider default when the cross-provider target has no modes", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: undefined,
+      targetProvider: "pi",
+      parent: agentParent("codex", "auto"),
+      unattended: false,
+      availableModes: [],
+      targetUnattendedMode: undefined,
+    });
+    expect(resolved).toBeUndefined();
+  });
+
+  it("uses the provider default when an unattended parent targets a provider with no modes", () => {
+    const resolved = resolveAndValidateCreateAgentMode({
+      requestedMode: undefined,
+      targetProvider: "pi",
+      parent: agentParent("claude", "bypassPermissions", true),
+      unattended: false,
+      availableModes: [],
+      targetUnattendedMode: undefined,
+    });
+    expect(resolved).toBeUndefined();
   });
 });

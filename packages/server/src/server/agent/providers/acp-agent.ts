@@ -127,6 +127,17 @@ import {
 import { withTimeout } from "../../../utils/promise-timeout.js";
 
 const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
+
+// Operator policy (2026-08-31): ACP-style providers started through Agents/Paseo
+// default to their native no-prompts / unattended mode. This map records the
+// provider-specific mode id for each ACP provider; it is an implementation
+// detail behind the unified "default to unattended" policy. Providers not in
+// this map and with non-empty dynamic mode lists must be started with an
+// explicit mode (or an ACP caller may pass one).
+const ACP_UNATTENDED_MODE_BY_PROVIDER: Readonly<Record<string, string>> = {
+  cursor: "agent",
+};
+
 // ProviderSnapshotManager has a longer outer deadline for non-ACP catalog work.
 // ACP catalog probes must fail fast so create_agent cannot sit behind a hung CLI.
 const ACP_CATALOG_STAGE_TIMEOUT_MS = 20_000;
@@ -772,32 +783,47 @@ function resolveACPCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
   const isUnattendedCreate = input.unattended || input.parent?.isUnattended === true;
-  // Operator policy (2026-08-31): top-level Cursor "agent" sessions are
-  // always no-questions / Bypass for normal agent work. Cursor's ACP server
-  // still emits permission prompts for tool calls in "agent" mode, so use the
-  // ACP "auto_accept" feature to make those sessions run without prompts.
-  // Explicit "plan" / "ask" modes stay read-only / Q&A and are not forced to
-  // auto-accept. Child agents inherit auto-accept from an unattended parent.
-  const isCursorAgentUnattendedByDefault =
-    input.provider === "cursor" &&
-    input.parent === null &&
-    (input.requestedMode === undefined || input.requestedMode === "agent");
-  const shouldAutoAccept = isUnattendedCreate || isCursorAgentUnattendedByDefault;
+  const unattendedModeId = ACP_UNATTENDED_MODE_BY_PROVIDER[input.provider];
+
+  // Operator policy (2026-08-31): ACP providers started through Agents/Paseo
+  // default to their native unattended/no-prompts mode. The map above records
+  // the provider-specific mode id; everything else is shared policy.
+  // An explicit requestedMode always overrides the default.
+  let requestedMode = input.requestedMode;
+  let defaultedToUnattended = false;
+  if (requestedMode === undefined && input.parent === null) {
+    if (unattendedModeId !== undefined) {
+      requestedMode = unattendedModeId;
+      defaultedToUnattended = true;
+    } else if (input.availableModes && input.availableModes.length > 0) {
+      throw new Error(
+        `Provider '${input.provider}' has no unattended/no-prompts mode and cannot be started without an explicit mode.`,
+      );
+    }
+  }
+
+  const isUnattendedMode = unattendedModeId !== undefined && requestedMode === unattendedModeId;
+  const shouldAutoAccept =
+    isUnattendedCreate ||
+    defaultedToUnattended ||
+    (isUnattendedMode && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined);
   const featureValues =
     shouldAutoAccept && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined
       ? { ...input.featureValues, [ACP_AUTO_ACCEPT_FEATURE_ID]: true }
       : input.featureValues;
 
-  if (
-    input.requestedMode === undefined &&
-    isUnattendedCreate &&
-    input.parent !== null &&
-    input.parent.provider !== input.provider
-  ) {
+  if (input.requestedMode === undefined && isUnattendedCreate && input.parent !== null) {
+    // Cross-provider inheritance: the child provider should pick its own
+    // default mode (which will be the unattended one for known ACP providers)
+    // and auto-accept because the parent is unattended.
     return { modeId: undefined, featureValues };
   }
 
-  return resolveDefaultAgentCreateConfig({ ...input, featureValues });
+  return resolveDefaultAgentCreateConfig({
+    ...input,
+    requestedMode,
+    featureValues,
+  });
 }
 
 function isACPCreateConfigUnattended(input: AgentCreateConfigUnattendedInput): boolean {
