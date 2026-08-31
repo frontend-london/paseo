@@ -81,6 +81,7 @@ export function asTerminalManager(stub: {
   [K in keyof NonNullable<SessionOptions["terminalManager"]>]?: unknown;
 }): NonNullable<SessionOptions["terminalManager"]> {
   return createStub<NonNullable<SessionOptions["terminalManager"]>>({
+    subscribeTerminalsChanged: () => () => {},
     subscribeTerminalWorkspaceContributionChanged: () => () => {},
     ...stub,
   });

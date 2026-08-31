@@ -168,6 +168,7 @@ export interface PaseoWorkspaceActions {
     workspace: string | PaseoWorkspaceHandle,
     requestId?: string,
   ): Promise<PaseoWorkspaceArchiveResult>;
+  remove(workspace: string | PaseoWorkspaceHandle, requestId?: string): Promise<void>;
   /**
    * Local event subscription over the low-level driver's workspace_update stream.
    * The returned function only removes this SDK listener.
@@ -473,6 +474,8 @@ export function createPaseoApi(daemonClient: DaemonClient): PaseoApi {
       },
       archive: (workspace, requestId) =>
         daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), requestId),
+      remove: (workspace, requestId) =>
+        daemonClient.removeWorkspace(resolveWorkspaceId(workspace), requestId),
       subscribe: (handler) =>
         daemonClient.on("workspace_update", (message) => {
           handler(message.payload);

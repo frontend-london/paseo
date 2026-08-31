@@ -3091,6 +3091,80 @@ test("sends project.remove.request", async () => {
   await expect(removePromise).resolves.toEqual({ removedWorkspaceIds: ["ws-main"] });
 });
 
+test("sends workspace.remove.request", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const removePromise = client.removeWorkspace("ws-orphan", "req-remove-workspace");
+
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "workspace.remove.request",
+    requestId: "req-remove-workspace",
+    workspaceId: "ws-orphan",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.remove.response",
+      payload: {
+        requestId: "req-remove-workspace",
+        workspaceId: "ws-orphan",
+        accepted: true,
+        error: null,
+      },
+    }),
+  );
+
+  await expect(removePromise).resolves.toBeUndefined();
+});
+
+test("sends workspace.remove.request and throws on rejection", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const removePromise = client.removeWorkspace("ws-active", "req-remove-workspace-reject");
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.remove.response",
+      payload: {
+        requestId: "req-remove-workspace-reject",
+        workspaceId: "ws-active",
+        accepted: false,
+        error: "Workspace has active agents",
+      },
+    }),
+  );
+
+  await expect(removePromise).rejects.toThrow("Workspace has active agents");
+});
+
 test("sends worktree base-ref fields in create_paseo_worktree_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

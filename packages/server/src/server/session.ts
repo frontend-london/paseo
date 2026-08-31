@@ -26,6 +26,7 @@ import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
 } from "../terminal/terminal-manager.js";
+import type { TerminalSession } from "../terminal/terminal.js";
 import { TerminalSessionController } from "../terminal/terminal-session-controller.js";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { BinaryFrame } from "@getpaseo/protocol/binary-frames/index";
@@ -604,6 +605,7 @@ interface WorkspaceUpdateOptions {
   dedupeGitState?: boolean;
   removedProjectId?: string;
   optimisticStatus?: WorkspaceDescriptorPayload["status"];
+  forceRemove?: boolean;
 }
 
 function resolveDirectorySync(service: DirectorySyncService | undefined): DirectorySyncService {
@@ -738,6 +740,10 @@ export class Session {
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private readonly workspaceAndProjectMessageHandlers: Map<
+    string,
+    (msg: SessionInboundMessage) => Promise<void> | undefined
+  >;
 
   constructor(options: SessionOptions) {
     const {
@@ -1053,6 +1059,7 @@ export class Session {
       spawnWorkspaceScript,
       globalServicePorts: loadPersistedConfig(this.paseoHome).worktrees?.servicePorts,
     });
+    this.workspaceAndProjectMessageHandlers = this.buildWorkspaceAndProjectMessageHandlers();
     this.subscribeToOptionalManagers();
     this.workspaceDirectory = new WorkspaceDirectory({
       logger: this.sessionLogger,
@@ -2458,52 +2465,179 @@ export class Session {
     }
   }
 
+  private buildWorkspaceAndProjectMessageHandlers(): Map<
+    string,
+    (msg: SessionInboundMessage) => Promise<void> | undefined
+  > {
+    return new Map([
+      [
+        "fetch_workspaces_request",
+        (msg) =>
+          this.handleFetchWorkspacesRequest(
+            msg as Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>,
+          ),
+      ],
+      [
+        "project.list.request",
+        (msg) =>
+          this.handleProjectListRequest(
+            msg as Extract<SessionInboundMessage, { type: "project.list.request" }>,
+          ),
+      ],
+      [
+        "paseo_worktree_list_request",
+        (msg) =>
+          this.handlePaseoWorktreeListRequest(
+            msg as Extract<SessionInboundMessage, { type: "paseo_worktree_list_request" }>,
+          ),
+      ],
+      [
+        "paseo_worktree_archive_request",
+        (msg) =>
+          this.handlePaseoWorktreeArchiveRequest(
+            msg as Extract<SessionInboundMessage, { type: "paseo_worktree_archive_request" }>,
+          ),
+      ],
+      [
+        "create_paseo_worktree_request",
+        (msg) =>
+          this.handleCreatePaseoWorktreeRequest(
+            msg as Extract<SessionInboundMessage, { type: "create_paseo_worktree_request" }>,
+          ),
+      ],
+      [
+        "workspace_setup_status_request",
+        (msg) =>
+          this.handleWorkspaceSetupStatusRequest(
+            msg as Extract<SessionInboundMessage, { type: "workspace_setup_status_request" }>,
+          ),
+      ],
+      [
+        "list_available_editors_request",
+        (msg) =>
+          this.handleLegacyListAvailableEditorsRequest(
+            msg as Extract<SessionInboundMessage, { type: "list_available_editors_request" }>,
+          ),
+      ],
+      [
+        "open_in_editor_request",
+        (msg) =>
+          this.handleLegacyOpenInEditorRequest(
+            msg as Extract<SessionInboundMessage, { type: "open_in_editor_request" }>,
+          ),
+      ],
+      [
+        "open_project_request",
+        (msg) =>
+          this.handleOpenProjectRequest(
+            msg as Extract<SessionInboundMessage, { type: "open_project_request" }>,
+          ),
+      ],
+      [
+        "project.add.request",
+        (msg) =>
+          this.handleProjectAddRequest(
+            msg as Extract<SessionInboundMessage, { type: "project.add.request" }>,
+          ),
+      ],
+      [
+        "project.create_directory.request",
+        (msg) =>
+          this.handleProjectCreateDirectoryRequest(
+            msg as Extract<SessionInboundMessage, { type: "project.create_directory.request" }>,
+          ),
+      ],
+      [
+        "workspace.github.search_repositories.request",
+        (msg) =>
+          this.handleWorkspaceGithubSearchRepositoriesRequest(
+            msg as Extract<
+              SessionInboundMessage,
+              { type: "workspace.github.search_repositories.request" }
+            >,
+          ),
+      ],
+      [
+        "project.github.clone.request",
+        (msg) =>
+          this.handleProjectGithubCloneRequest(
+            msg as Extract<SessionInboundMessage, { type: "project.github.clone.request" }>,
+          ),
+      ],
+      [
+        "archive_workspace_request",
+        (msg) =>
+          this.handleArchiveWorkspaceRequest(
+            msg as Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
+          ),
+      ],
+      [
+        "project.remove.request",
+        (msg) =>
+          this.handleProjectRemoveRequest(
+            msg as Extract<SessionInboundMessage, { type: "project.remove.request" }>,
+          ),
+      ],
+      [
+        "workspace.remove.request",
+        (msg) =>
+          this.handleWorkspaceRemoveRequest(
+            msg as Extract<SessionInboundMessage, { type: "workspace.remove.request" }>,
+          ),
+      ],
+      [
+        "workspace.create.request",
+        (msg) =>
+          this.handleWorkspaceCreateRequest(
+            msg as Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+          ),
+      ],
+      [
+        "workspace.clear_attention.request",
+        (msg) =>
+          this.handleWorkspaceClearAttentionRequest(
+            msg as Extract<SessionInboundMessage, { type: "workspace.clear_attention.request" }>,
+          ),
+      ],
+      [
+        "workspace.title.set.request",
+        (msg) => {
+          const typed = msg as Extract<
+            SessionInboundMessage,
+            { type: "workspace.title.set.request" }
+          >;
+          return this.handleWorkspaceTitleSetRequest(
+            typed.workspaceId,
+            typed.title,
+            typed.requestId,
+          );
+        },
+      ],
+      [
+        "workspace.pin.set.request",
+        (msg) => {
+          const typed = msg as Extract<
+            SessionInboundMessage,
+            { type: "workspace.pin.set.request" }
+          >;
+          return this.handleWorkspacePinSetRequest(
+            typed.workspaceId,
+            typed.pinned,
+            typed.requestId,
+          );
+        },
+      ],
+    ]);
+  }
+
   private dispatchWorkspaceAndProjectMessage(
     msg: SessionInboundMessage,
   ): Promise<void> | undefined {
-    switch (msg.type) {
-      case "fetch_workspaces_request":
-        return this.handleFetchWorkspacesRequest(msg);
-      case "project.list.request":
-        return this.handleProjectListRequest(msg);
-      case "paseo_worktree_list_request":
-        return this.handlePaseoWorktreeListRequest(msg);
-      case "paseo_worktree_archive_request":
-        return this.handlePaseoWorktreeArchiveRequest(msg);
-      case "create_paseo_worktree_request":
-        return this.handleCreatePaseoWorktreeRequest(msg);
-      case "workspace_setup_status_request":
-        return this.handleWorkspaceSetupStatusRequest(msg);
-      // COMPAT(desktopEditorBridge): added in v0.1.88, remove after 2026-12-03 once old clients no longer call daemon editor RPCs.
-      case "list_available_editors_request":
-        return this.handleLegacyListAvailableEditorsRequest(msg);
-      case "open_in_editor_request":
-        return this.handleLegacyOpenInEditorRequest(msg);
-      case "open_project_request":
-        return this.handleOpenProjectRequest(msg);
-      case "project.add.request":
-        return this.handleProjectAddRequest(msg);
-      case "project.create_directory.request":
-        return this.handleProjectCreateDirectoryRequest(msg);
-      case "workspace.github.search_repositories.request":
-        return this.handleWorkspaceGithubSearchRepositoriesRequest(msg);
-      case "project.github.clone.request":
-        return this.handleProjectGithubCloneRequest(msg);
-      case "archive_workspace_request":
-        return this.handleArchiveWorkspaceRequest(msg);
-      case "project.remove.request":
-        return this.handleProjectRemoveRequest(msg);
-      case "workspace.create.request":
-        return this.handleWorkspaceCreateRequest(msg);
-      case "workspace.clear_attention.request":
-        return this.handleWorkspaceClearAttentionRequest(msg);
-      case "workspace.title.set.request":
-        return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
-      case "workspace.pin.set.request":
-        return this.handleWorkspacePinSetRequest(msg.workspaceId, msg.pinned, msg.requestId);
-      default:
-        return undefined;
+    const handler = this.workspaceAndProjectMessageHandlers.get(msg.type);
+    if (!handler) {
+      return undefined;
     }
+    return handler(msg);
   }
 
   private dispatchWorkspaceLabelMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -3246,6 +3380,138 @@ export class Session {
         },
       });
     }
+  }
+
+  private async handleWorkspaceRemoveRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.remove.request" }>,
+  ): Promise<void> {
+    const { workspaceId, requestId } = request;
+    this.sessionLogger.info({ workspaceId, requestId }, "session: workspace.remove.request");
+
+    try {
+      const workspace = await this.workspaceRegistry.get(workspaceId);
+      if (!workspace) {
+        this.emit({
+          type: "workspace.remove.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            error: `Workspace not found: ${workspaceId}`,
+          },
+        });
+        return;
+      }
+
+      const liveAgents = await this.findLiveAgentsForWorkspace(workspaceId);
+      if (liveAgents.length > 0) {
+        this.emit({
+          type: "workspace.remove.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            error: `Workspace has active agents: ${liveAgents.map((agent) => agent.id).join(", ")}`,
+          },
+        });
+        return;
+      }
+
+      const liveTerminals = await this.findLiveTerminalsForWorkspace(workspaceId);
+      if (liveTerminals.length > 0) {
+        this.emit({
+          type: "workspace.remove.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            error: `Workspace has active terminals: ${liveTerminals.map((terminal) => terminal.id).join(", ")}`,
+          },
+        });
+        return;
+      }
+
+      if (this.scriptRuntimeStore) {
+        const runningScripts = this.scriptRuntimeStore
+          .listForWorkspace(workspaceId)
+          .filter((entry) => entry.lifecycle === "running");
+        if (runningScripts.length > 0) {
+          this.emit({
+            type: "workspace.remove.response",
+            payload: {
+              requestId,
+              workspaceId,
+              accepted: false,
+              error: `Workspace has running scripts: ${runningScripts
+                .map((entry) => entry.scriptName)
+                .join(", ")}`,
+            },
+          });
+          return;
+        }
+      }
+
+      await this.workspaceRegistry.remove(workspaceId);
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], { forceRemove: true });
+
+      this.emit({
+        type: "workspace.remove.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: true,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, workspaceId, requestId },
+        "session: workspace.remove.request error",
+      );
+      this.emit({
+        type: "workspace.remove.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          error: getErrorMessageOr(error, "Failed to remove workspace"),
+        },
+      });
+    }
+  }
+
+  private async findLiveAgentsForWorkspace(workspaceId: string): Promise<StoredAgentRecord[]> {
+    const persistedAgents = await this.agentStorage.listByWorkspace(workspaceId);
+    const nonArchivedPersisted = persistedAgents.filter((agent) => !agent.archivedAt);
+
+    const inMemoryAgents = this.agentManager
+      .listAgents()
+      .filter((agent) => agent.workspaceId === workspaceId && agent.lifecycle !== "closed");
+
+    const liveById = new Map<string, StoredAgentRecord>();
+    for (const agent of nonArchivedPersisted) {
+      liveById.set(agent.id, agent);
+    }
+    for (const agent of inMemoryAgents) {
+      const stored = await this.agentStorage.get(agent.id);
+      if (stored) {
+        liveById.set(agent.id, stored);
+      }
+    }
+
+    return Array.from(liveById.values());
+  }
+
+  private async findLiveTerminalsForWorkspace(workspaceId: string): Promise<TerminalSession[]> {
+    if (!this.terminalManager) {
+      return [];
+    }
+
+    const directories = this.terminalManager.listDirectories();
+    const terminalsByDirectory = await Promise.all(
+      directories.map((cwd) => this.terminalManager!.getTerminals(cwd, { workspaceId })),
+    );
+    return terminalsByDirectory.flat();
   }
 
   private async handleWorkspaceTitleSetRequest(
@@ -5332,7 +5598,7 @@ export class Session {
       }
       this.workspaceGitObserver.recordDescriptorState(workspaceId, nextWorkspace);
       if (!nextWorkspace) {
-        if (this.shouldSkipWorkspaceRemoval(lastEmitted, options?.removedProjectId)) {
+        if (this.shouldSkipWorkspaceRemoval(lastEmitted, options)) {
           continue;
         }
         if (this.workspaceUpdatesSubscription !== subscription) {
@@ -5386,8 +5652,12 @@ export class Session {
 
   private shouldSkipWorkspaceRemoval(
     lastEmitted: WorkspaceUpdatePayload | undefined,
-    removedProjectId: string | undefined,
+    options: WorkspaceUpdateOptions | undefined,
   ): boolean {
+    if (options?.forceRemove) {
+      return false;
+    }
+    const removedProjectId = options?.removedProjectId;
     if (lastEmitted?.kind === "remove") {
       return !removedProjectId || lastEmitted.removedProjectId === removedProjectId;
     }

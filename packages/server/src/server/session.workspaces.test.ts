@@ -9477,3 +9477,240 @@ test("workspace.create.request reports an archived explicit project", async () =
     errorCode: "archived_project",
   });
 });
+
+test("workspace.remove.request removes an orphaned workspace record without side effects", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-remove-orphan",
+    projectId: "proj-remove-orphan",
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "orphan",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspaces = new Map<string, PersistedWorkspaceRecord>([
+    [workspace.workspaceId, workspace],
+  ]);
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(workspaces.values()),
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+      update: async (workspaceId, updater) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return null;
+        const next = updater(existing);
+        workspaces.set(workspaceId, next);
+        return next;
+      },
+      upsert: async (record) => {
+        workspaces.set(record.workspaceId, record);
+      },
+      archive: async (workspaceId, archivedAt) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return;
+        workspaces.set(workspaceId, { ...existing, updatedAt: archivedAt, archivedAt });
+      },
+      remove: async (workspaceId) => {
+        workspaces.delete(workspaceId);
+      },
+    },
+    agentStorage: asAgentStorage({
+      listByWorkspace: async () => [],
+    }),
+    agentManager: asAgentManager({
+      listAgents: () => [],
+    }),
+    terminalManager: asTerminalManager({
+      listDirectories: () => [],
+      getTerminals: async () => [],
+    }),
+  });
+
+  session.workspaceUpdatesSubscription = {
+    subscriptionId: "sub-remove-orphan",
+    filter: undefined,
+    isBootstrapping: false,
+    pendingUpdatesByWorkspaceId: new Map(),
+    lastEmittedByWorkspaceId: new Map(),
+  };
+
+  await session.handleMessage({
+    type: "workspace.remove.request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-remove-orphan",
+  });
+
+  expect(workspaces.has(workspace.workspaceId)).toBe(false);
+  expect(findByType(emitted, "workspace.remove.response")?.payload).toEqual({
+    requestId: "req-remove-orphan",
+    workspaceId: workspace.workspaceId,
+    accepted: true,
+    error: null,
+  });
+  const update = findByType(emitted, "workspace_update");
+  expect(update?.payload).toMatchObject({
+    kind: "remove",
+    id: workspace.workspaceId,
+  });
+});
+
+test("workspace.remove.request rejects when the workspace has an active agent", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-remove-active-agent",
+    projectId: "proj-remove-active-agent",
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "active-agent",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspaces = new Map<string, PersistedWorkspaceRecord>([
+    [workspace.workspaceId, workspace],
+  ]);
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(workspaces.values()),
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+      update: async (workspaceId, updater) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return null;
+        const next = updater(existing);
+        workspaces.set(workspaceId, next);
+        return next;
+      },
+      upsert: async (record) => {
+        workspaces.set(record.workspaceId, record);
+      },
+      archive: async (workspaceId, archivedAt) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return;
+        workspaces.set(workspaceId, { ...existing, updatedAt: archivedAt, archivedAt });
+      },
+      remove: async (workspaceId) => {
+        workspaces.delete(workspaceId);
+      },
+    },
+    agentStorage: asAgentStorage({
+      listByWorkspace: async () => [
+        {
+          id: "agent-active",
+          workspaceId: workspace.workspaceId,
+          archivedAt: null,
+        } as StoredAgentRecord,
+      ],
+    }),
+    agentManager: asAgentManager({
+      listAgents: () => [],
+    }),
+  });
+
+  session.workspaceUpdatesSubscription = {
+    subscriptionId: "sub-remove-active-agent",
+    filter: undefined,
+    isBootstrapping: false,
+    pendingUpdatesByWorkspaceId: new Map(),
+    lastEmittedByWorkspaceId: new Map(),
+  };
+
+  await session.handleMessage({
+    type: "workspace.remove.request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-remove-active-agent",
+  });
+
+  expect(workspaces.has(workspace.workspaceId)).toBe(true);
+  expect(findByType(emitted, "workspace.remove.response")?.payload).toMatchObject({
+    requestId: "req-remove-active-agent",
+    workspaceId: workspace.workspaceId,
+    accepted: false,
+    error: expect.stringContaining("active agents"),
+  });
+});
+
+test("workspace.remove.request rejects when the workspace has a live terminal", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-remove-live-terminal",
+    projectId: "proj-remove-live-terminal",
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "live-terminal",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspaces = new Map<string, PersistedWorkspaceRecord>([
+    [workspace.workspaceId, workspace],
+  ]);
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(workspaces.values()),
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+      update: async (workspaceId, updater) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return null;
+        const next = updater(existing);
+        workspaces.set(workspaceId, next);
+        return next;
+      },
+      upsert: async (record) => {
+        workspaces.set(record.workspaceId, record);
+      },
+      archive: async (workspaceId, archivedAt) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return;
+        workspaces.set(workspaceId, { ...existing, updatedAt: archivedAt, archivedAt });
+      },
+      remove: async (workspaceId) => {
+        workspaces.delete(workspaceId);
+      },
+    },
+    agentStorage: asAgentStorage({
+      listByWorkspace: async () => [],
+    }),
+    agentManager: asAgentManager({
+      listAgents: () => [],
+    }),
+    terminalManager: asTerminalManager({
+      listDirectories: () => ["/tmp/terminals"],
+      getTerminals: async (_cwd, options) => {
+        if (options?.workspaceId === workspace.workspaceId) {
+          return [{ id: "terminal-live" }] as TerminalSession[];
+        }
+        return [];
+      },
+    }),
+  });
+
+  session.workspaceUpdatesSubscription = {
+    subscriptionId: "sub-remove-live-terminal",
+    filter: undefined,
+    isBootstrapping: false,
+    pendingUpdatesByWorkspaceId: new Map(),
+    lastEmittedByWorkspaceId: new Map(),
+  };
+
+  await session.handleMessage({
+    type: "workspace.remove.request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-remove-live-terminal",
+  });
+
+  expect(workspaces.has(workspace.workspaceId)).toBe(true);
+  expect(findByType(emitted, "workspace.remove.response")?.payload).toMatchObject({
+    requestId: "req-remove-live-terminal",
+    workspaceId: workspace.workspaceId,
+    accepted: false,
+    error: expect.stringContaining("active terminals"),
+  });
+});
