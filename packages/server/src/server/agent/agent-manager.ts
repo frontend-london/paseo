@@ -677,6 +677,7 @@ export class AgentManager {
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
+  private readonly terminalErrorCloses = new Set<string>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
   private readonly foregroundMutationTails = new Map<string, Promise<void>>();
   private readonly runs = new AgentRunState();
@@ -1471,6 +1472,35 @@ export class AgentManager {
         clearTimeout(timer);
       }
     }
+  }
+
+  // Terminal `error` leaves the provider process (and any MCP/ACP children it
+  // spawned) alive with nothing tearing it down: the agent record shows
+  // "error" forever while `devin acp` and friends keep running under it,
+  // accumulating until the host runs out of memory. Route error the same way
+  // archive/reload already do -- through closeAgent's tree-kill teardown --
+  // so retrying goes through the normal resume-from-persistence path instead
+  // of reusing a session that has no live process backing it. Runs as a
+  // tracked background task: the caller is mid-way through finalizing a turn
+  // and must not block on (or fail because of) process teardown.
+  private closeAgentAfterTerminalError(agentId: string): void {
+    // Defer past the in-flight session-event queue task and any foreground-run
+    // finally handlers. closeAgentRuntime drains that queue first; invoking it
+    // while turn_failed is still on the stack deadlocks on the current tail.
+    setImmediate(() => {
+      this.terminalErrorCloses.add(agentId);
+      const task = this.closeAgent(agentId)
+        .catch((error: unknown) => {
+          this.logger.warn(
+            { err: error, agentId },
+            "Failed to close agent runtime after terminal error",
+          );
+        })
+        .finally(() => {
+          this.terminalErrorCloses.delete(agentId);
+        });
+      this.trackBackgroundTask(task);
+    });
   }
 
   closeAgent(agentId: string): Promise<void> {
@@ -2353,6 +2383,9 @@ export class AgentManager {
     if (!shouldHoldBusyForReplacement) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
+    }
+    if (nextLifecycle === "error") {
+      this.closeAgentAfterTerminalError(mutableAgent.id);
     }
   }
 
@@ -3479,6 +3512,9 @@ export class AgentManager {
    * manager state so call order remains authoritative.
    */
   private async drainSessionEvents(agentId: string): Promise<void> {
+    if (this.terminalErrorCloses.has(agentId)) {
+      return;
+    }
     while (true) {
       const tail = this.sessionEventTails.get(agentId);
       if (!tail) {
@@ -4142,9 +4178,6 @@ export class AgentManager {
       "handleStreamEvent: turn_failed",
     );
     if (terminalDisposition === "stale") return;
-    if (!isForegroundEvent && !agent.activeForegroundTurnId) {
-      agent.lifecycle = "error";
-    }
     agent.lastError = event.error;
     await this.appendSystemErrorTimelineMessage(
       agent,
@@ -4153,9 +4186,16 @@ export class AgentManager {
       options,
     );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
-    if (!isForegroundEvent && !agent.activeForegroundTurnId) {
+    if (!isForegroundEvent) {
+      agent.lifecycle = "error";
       this.emitState(agent);
     }
+    // Always reap the runtime for terminal turn_failed. A race can leave
+    // activeForegroundTurnId set while isForegroundEvent is still false
+    // (session event processed before streamAgent published the foreground
+    // turn), which previously skipped both finalizeForegroundTurn and the
+    // autonomous close guard.
+    this.closeAgentAfterTerminalError(agent.id);
   }
 
   private onStreamTurnCanceled(params: {
