@@ -1,16 +1,25 @@
 import type { Command } from "commander";
-import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
+import type {
+  AgentMetadata,
+  AgentPermissionRequest,
+  AgentPermissionRequestKind,
+} from "@getpaseo/protocol/agent-types";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema, CommandError } from "../../output/index.js";
 
-/** Permission list item for display */
+/** Permission list item for display and JSON output */
 export interface PermissionListItem {
   id: string;
+  requestId: string;
   agentId: string;
   agentShortId: string;
   name: string;
   description: string;
+  kind: AgentPermissionRequestKind;
+  title: string | null;
+  input: AgentMetadata | null;
+  metadata: AgentMetadata | null;
 }
 
 /** Schema for permit ls output */
@@ -25,16 +34,21 @@ export const permitLsSchema: OutputSchema<PermissionListItem> = {
 };
 
 /** Transform agent snapshot + permission to list item */
-function toListItem(
+export function toListItem(
   agent: AgentSnapshotPayload,
   permission: AgentPermissionRequest,
 ): PermissionListItem {
   return {
     id: permission.id.slice(0, 8),
+    requestId: permission.id,
     agentId: agent.id,
     agentShortId: agent.id.slice(0, 7),
     name: permission.name,
     description: permission.description ?? "-",
+    kind: permission.kind,
+    title: permission.title ?? null,
+    input: permission.input ?? null,
+    metadata: permission.metadata ?? null,
   };
 }
 
