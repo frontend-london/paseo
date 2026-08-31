@@ -414,6 +414,265 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("retains the last valid catalog when a later provider refresh fails", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockResolvedValueOnce({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4" }],
+        modes: [],
+      })
+      .mockRejectedValueOnce(new Error("ACP initialize timed out after 20000ms"));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toMatchObject({
+        status: "ready",
+        stale: true,
+        refreshError: "ACP initialize timed out after 20000ms",
+        models: [{ id: "gpt-5.4" }],
+      });
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("bounds broad warm-up while a direct provider read stays independent", async () => {
+    const releases: Array<() => void> = [];
+    const slowCatalog = async () => {
+      await new Promise<void>((release) => releases.push(release));
+      return { models: [], modes: [] };
+    };
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+        claude: createExtraClient("claude", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+        pi: createExtraClient("pi", { isAvailable: async () => true, fetchCatalog: slowCatalog }),
+        opencode: createExtraClient("opencode", {
+          isAvailable: async () => true,
+          fetchCatalog: async () => ({ models: [], modes: [] }),
+        }),
+      },
+    });
+    try {
+      const warmUp = manager.listProviders({
+        cwd: "/tmp/project",
+        providers: ["codex", "claude", "pi"],
+        wait: true,
+      });
+      await vi.waitFor(() => expect(releases).toHaveLength(2));
+
+      // Same cwd: foreground create for an unrelated provider must not wait on warm-up slots.
+      const healthy = manager.resolveCreateConfig({
+        cwd: "/tmp/project",
+        provider: "opencode",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+      });
+
+      await healthy;
+      expect(releases).toHaveLength(2);
+
+      for (const release of releases.splice(0)) release();
+      await vi.waitFor(() => expect(releases).toHaveLength(1));
+      for (const release of releases.splice(0)) release();
+      await warmUp;
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("retains stale catalog when refresh fails after a models-only snapshot", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockResolvedValueOnce({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4" }],
+      })
+      .mockRejectedValueOnce(new Error("ACP initialize timed out after 20000ms"));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toMatchObject({
+        status: "ready",
+        stale: true,
+        models: [{ id: "gpt-5.4", label: "GPT 5.4" }],
+      });
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("clears stale metadata after a later successful refresh", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockResolvedValueOnce({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4" }],
+        modes: [],
+      })
+      .mockRejectedValueOnce(new Error("ACP initialize timed out after 20000ms"))
+      .mockResolvedValueOnce({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4 refreshed" }],
+        modes: [{ id: "default", label: "Default" }],
+      });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toMatchObject({ status: "ready", stale: true });
+
+      await manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+      const recovered = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider: "codex",
+        wait: false,
+      });
+      expect(recovered).toMatchObject({
+        status: "ready",
+        models: [{ id: "gpt-5.4", label: "GPT 5.4 refreshed" }],
+      });
+      expect(recovered.stale).toBeUndefined();
+      expect(recovered.refreshError).toBeUndefined();
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("parallel force refreshes keep only the current load result", async () => {
+    let releaseFirst!: () => void;
+    let secondStarted = false;
+    const fetchCatalog = vi.fn().mockImplementation(async () => {
+      if (fetchCatalog.mock.calls.length === 1) {
+        await new Promise<void>((finish) => {
+          releaseFirst = finish;
+        });
+        return {
+          models: [{ provider: "codex", id: "first", label: "First" }],
+          modes: [],
+        };
+      }
+      secondStarted = true;
+      return {
+        models: [{ provider: "codex", id: "second", label: "Second" }],
+        modes: [],
+      };
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    try {
+      const first = manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+      await vi.waitFor(() => expect(fetchCatalog).toHaveBeenCalledTimes(1));
+      const second = manager.refreshSnapshotForCwd({ cwd: "/tmp/project", providers: ["codex"] });
+      await vi.waitFor(() => expect(secondStarted).toBe(true));
+      releaseFirst();
+      await Promise.all([first, second]);
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toMatchObject({
+        status: "ready",
+        models: [{ id: "second" }],
+      });
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("shared background limit caps concurrent probes across warm-up batches", async () => {
+    const releases: Array<() => void> = [];
+    const slowCatalog = async () => {
+      await new Promise<void>((release) => releases.push(release));
+      return { models: [], modes: [] };
+    };
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+        claude: createExtraClient("claude", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+        pi: createExtraClient("pi", { isAvailable: async () => true, fetchCatalog: slowCatalog }),
+        opencode: createExtraClient("opencode", {
+          isAvailable: async () => true,
+          fetchCatalog: slowCatalog,
+        }),
+      },
+    });
+    try {
+      const warmA = manager.listProviders({
+        cwd: "/tmp/project-a",
+        providers: ["codex", "claude"],
+        wait: true,
+      });
+      const warmB = manager.listProviders({
+        cwd: "/tmp/project-b",
+        providers: ["pi", "opencode"],
+        wait: true,
+      });
+      await vi.waitFor(() => expect(releases.length).toBeGreaterThanOrEqual(1));
+      await new Promise((finish) => setTimeout(finish, 30));
+      expect(releases.length).toBeLessThanOrEqual(2);
+
+      while (releases.length > 0) {
+        for (const release of releases.splice(0)) release();
+        await new Promise((finish) => setTimeout(finish, 10));
+      }
+      await Promise.all([warmA, warmB]);
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("refreshTimeoutMs option overrides the default and yields a timeout error", async () => {
     // never-resolving isAvailable forces the timeout path
     const isAvailable = vi.fn(waitUntilAborted);

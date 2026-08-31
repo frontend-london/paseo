@@ -122,6 +122,10 @@ export interface ProviderSnapshotEntry {
   models?: AgentModelDefinition[];
   modes?: AgentMode[];
   fetchedAt?: string;
+  /** Catalog is retained in-memory after a failed refresh of the same provider. */
+  stale?: boolean;
+  /** Refresh error associated with a retained stale catalog. */
+  refreshError?: string;
   label?: string;
   description?: string;
   defaultModeId?: string | null;

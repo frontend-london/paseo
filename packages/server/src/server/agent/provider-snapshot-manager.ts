@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import type { Logger } from "pino";
+import pLimit from "p-limit";
 
 import { expandTilde } from "../../utils/path.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
@@ -49,25 +50,33 @@ import {
 const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
 const MAX_REFRESH_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 120_000;
-const PROVIDER_REFRESH_DEADLINE_ENV = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
+const REFRESH_TIMEOUT_ENV_VAR = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
+// Catalog discovery launches external provider CLIs. Keep broad snapshot warm-ups
+// small so a cold workspace cannot fan out into a burst of ACP child processes.
+const PROVIDER_REFRESH_CONCURRENCY = 2;
 export const GLOBAL_PROVIDER_SNAPSHOT_KEY = "paseo:global";
 
-function validRefreshDeadline(value: unknown): number | undefined {
-  return typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value > 0 &&
-    value <= MAX_REFRESH_TIMEOUT_MS
-    ? value
-    : undefined;
-}
-
-function providerRefreshDeadline(configured: number | undefined): number {
-  const explicit = validRefreshDeadline(configured);
-  if (explicit !== undefined) return explicit;
-  return (
-    validRefreshDeadline(Number(process.env[PROVIDER_REFRESH_DEADLINE_ENV])) ??
-    DEFAULT_REFRESH_TIMEOUT_MS
-  );
+// Provider refresh probes can be slow on cold starts (e.g. Copilot's first
+// `copilot --acp` invocation, OpenCode workspace probes with many MCP servers).
+// Allow operators to bump the ceiling via env var without rebuilding.
+function resolveRefreshTimeoutMs(option: number | undefined): number {
+  if (
+    typeof option === "number" &&
+    Number.isSafeInteger(option) &&
+    option > 0 &&
+    option <= MAX_REFRESH_TIMEOUT_MS
+  ) {
+    return option;
+  }
+  const fromEnv = process.env[REFRESH_TIMEOUT_ENV_VAR];
+  if (fromEnv) {
+    // Number() handles scientific notation (e.g. "6e4") which parseInt would silently truncate.
+    const parsed = Number(fromEnv);
+    if (Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_REFRESH_TIMEOUT_MS) {
+      return parsed;
+    }
+  }
+  return DEFAULT_REFRESH_TIMEOUT_MS;
 }
 
 function resolveDiagnosticTimeoutMs(option: number | undefined, refreshTimeoutMs: number): number {
@@ -178,6 +187,12 @@ interface ProviderLoadOptions {
   providers: AgentProvider[];
   catalogScope: ProviderCatalogScope;
   force: boolean;
+  /**
+   * `foreground` bypasses the shared background concurrency limit so a direct
+   * create_agent / getReadyProvider path cannot starve behind warm-up fan-out.
+   * `background` (default) shares a process-wide limit of 2 probes.
+   */
+  priority?: "foreground" | "background";
 }
 interface ProviderLoad {
   promise: Promise<void>;
@@ -204,6 +219,8 @@ export class ProviderSnapshotManager {
   private readonly snapshots = new Map<string, Map<AgentProvider, ProviderSnapshotEntry>>();
   private readonly providerLoads = new Map<string, Map<AgentProvider, ProviderLoad>>();
   private readonly events = new EventEmitter();
+  /** Shared across all background warm-up/refresh batches for this manager. */
+  private readonly backgroundRefreshLimit = pLimit(PROVIDER_REFRESH_CONCURRENCY);
   private destroyed = false;
   private refreshTimeoutMs: number;
   private diagnosticTimeoutMs: number;
@@ -230,7 +247,7 @@ export class ProviderSnapshotManager {
     this.runtimeSettings = options.runtimeSettings;
     this.providerOverrides = options.providerOverrides;
     this.baseProviderOverrides = options.providerOverrides;
-    this.refreshTimeoutMs = providerRefreshDeadline(options.refreshTimeoutMs);
+    this.refreshTimeoutMs = resolveRefreshTimeoutMs(options.refreshTimeoutMs);
     this.diagnosticTimeoutMs = resolveDiagnosticTimeoutMs(
       options.diagnosticTimeoutMs,
       this.refreshTimeoutMs,
@@ -249,7 +266,7 @@ export class ProviderSnapshotManager {
     const snapshotCwd = resolveSnapshotCwd(options.cwd);
     const target = createWorkspaceSnapshotTarget(snapshotCwd);
     const providers = this.resolveRefreshProviders(options.providers);
-    this.resetSnapshotToLoading(snapshotCwd, providers, { preserveExisting: false });
+    this.resetSnapshotToLoading(snapshotCwd, providers, { preserveExisting: true });
     this.emitChange(snapshotCwd);
     await this.refreshProviders(target, providers ?? this.getProviderIds());
   }
@@ -280,7 +297,11 @@ export class ProviderSnapshotManager {
     if (providersToWarm.length === 0) {
       return;
     }
-    await this.warmUp(target, providersToWarm);
+    // Awaited reads (create_agent / getReadyProvider) use foreground so a single
+    // requested provider is not queued behind unrelated background warm-up slots.
+    // Multi-provider awaited warm-ups still share the background concurrency limit.
+    const priority = providersToWarm.length === 1 ? "foreground" : "background";
+    await this.warmUp(target, providersToWarm, priority);
   }
 
   async refresh(options: ProviderSnapshotRefreshOptions): Promise<void> {
@@ -558,7 +579,7 @@ export class ProviderSnapshotManager {
   }
 
   setRefreshTimeoutMs(refreshTimeoutMs: number | undefined): void {
-    this.refreshTimeoutMs = providerRefreshDeadline(refreshTimeoutMs);
+    this.refreshTimeoutMs = resolveRefreshTimeoutMs(refreshTimeoutMs);
     this.diagnosticTimeoutMs = resolveDiagnosticTimeoutMs(undefined, this.refreshTimeoutMs);
   }
 
@@ -668,7 +689,7 @@ export class ProviderSnapshotManager {
   ): Promise<ProviderSnapshotEntry> {
     try {
       const target = createGlobalSnapshotTarget();
-      this.resetSnapshotToLoading(target.snapshotCwd, [provider], { preserveExisting: false });
+      this.resetSnapshotToLoading(target.snapshotCwd, [provider], { preserveExisting: true });
       this.emitChange(target.snapshotCwd);
       await this.refreshProviders(target, [provider]);
       return await this.getProvider({ provider, wait: false });
@@ -771,7 +792,11 @@ export class ProviderSnapshotManager {
     return entries;
   }
 
-  private async warmUp(target: ProviderSnapshotTarget, providers?: AgentProvider[]): Promise<void> {
+  private async warmUp(
+    target: ProviderSnapshotTarget,
+    providers?: AgentProvider[],
+    priority: "foreground" | "background" = "background",
+  ): Promise<void> {
     const providersToRefresh = providers ?? this.getProviderIds();
 
     await this.loadProviders({
@@ -779,6 +804,7 @@ export class ProviderSnapshotManager {
       catalogScope: target.catalogScope,
       providers: providersToRefresh,
       force: false,
+      priority,
     });
   }
 
@@ -791,6 +817,8 @@ export class ProviderSnapshotManager {
       catalogScope: target.catalogScope,
       providers,
       force: true,
+      // Single-provider refreshes (diagnostics / create waits) stay foreground.
+      priority: providers.length === 1 ? "foreground" : "background",
     });
   }
 
@@ -852,8 +880,13 @@ export class ProviderSnapshotManager {
   }
 
   private async loadProviders(options: ProviderLoadOptions): Promise<void> {
+    const run = (provider: AgentProvider) => this.loadProvider({ ...options, provider });
+    if (options.priority === "foreground") {
+      await Promise.allSettled(options.providers.map((provider) => run(provider)));
+      return;
+    }
     await Promise.allSettled(
-      options.providers.map((provider) => this.loadProvider({ ...options, provider })),
+      options.providers.map((provider) => this.backgroundRefreshLimit(() => run(provider))),
     );
   }
 
@@ -961,8 +994,30 @@ export class ProviderSnapshotManager {
         models: catalog.models,
         modes: catalog.modes,
         fetchedAt: new Date().toISOString(),
+        stale: undefined,
+        refreshError: undefined,
       });
     } catch (error) {
+      const cached = snapshot.get(provider);
+      if (cached?.fetchedAt && (cached.models?.length ?? 0) > 0) {
+        const emitted = setEntry({
+          ...base,
+          status: "ready",
+          enabled: true,
+          models: cached.models,
+          modes: cached.modes,
+          fetchedAt: cached.fetchedAt,
+          stale: true,
+          refreshError: toErrorMessage(error),
+        });
+        if (emitted) {
+          this.logger.warn(
+            { err: error, provider, cwd: snapshotCwd, fetchedAt: cached.fetchedAt },
+            "Failed to refresh provider snapshot; serving last valid catalog",
+          );
+        }
+        return;
+      }
       const emitted = setEntry({
         ...base,
         status: "error",

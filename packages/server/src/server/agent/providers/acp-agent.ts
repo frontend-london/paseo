@@ -127,6 +127,15 @@ import {
 import { withTimeout } from "../../../utils/promise-timeout.js";
 
 const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
+// ProviderSnapshotManager has a longer outer deadline for non-ACP catalog work.
+// ACP catalog probes must fail fast so create_agent cannot sit behind a hung CLI.
+const ACP_CATALOG_STAGE_TIMEOUT_MS = 20_000;
+const ACP_CATALOG_PROBE_TIMEOUT_MS = 45_000;
+
+function swallowLateRejection<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => undefined);
+  return promise;
+}
 
 function assertChildWithPipes(
   child: ChildProcess,
@@ -438,6 +447,10 @@ interface ACPAgentClientOptions {
   extensionCommandsParser?: ACPExtensionCommandsParser;
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
+  /** Per-stage catalog probe deadline (initialize / session/new / resolve). */
+  catalogStageTimeoutMs?: number;
+  /** Hard budget for an entire ACP catalog probe. */
+  catalogProbeTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
 }
 
@@ -826,6 +839,8 @@ export class ACPAgentClient implements AgentClient {
   private readonly waitForInitialCommands: boolean;
   private readonly initialCommandsWaitTimeoutMs: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
+  private readonly catalogStageTimeoutMs: number;
+  private readonly catalogProbeTimeoutMs: number;
   protected readonly terminateProcess: ProcessTerminator;
 
   constructor(options: ACPAgentClientOptions) {
@@ -854,6 +869,18 @@ export class ACPAgentClient implements AgentClient {
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
+    this.catalogStageTimeoutMs =
+      typeof options.catalogStageTimeoutMs === "number" && options.catalogStageTimeoutMs > 0
+        ? options.catalogStageTimeoutMs
+        : ACP_CATALOG_STAGE_TIMEOUT_MS;
+    this.catalogProbeTimeoutMs =
+      typeof options.catalogProbeTimeoutMs === "number" && options.catalogProbeTimeoutMs > 0
+        ? options.catalogProbeTimeoutMs
+        : ACP_CATALOG_PROBE_TIMEOUT_MS;
+  }
+
+  private catalogStageBudgetMs(probeDeadlineAt: number): number {
+    return Math.max(1, Math.min(this.catalogStageTimeoutMs, probeDeadlineAt - Date.now()));
   }
 
   async createSession(
@@ -949,6 +976,10 @@ export class ACPAgentClient implements AgentClient {
     const cwd = options.scope === "global" ? homedir() : options.cwd;
     let probe: UninitializedACPProcess | null = null;
     let closePromise: Promise<void> | null = null;
+    let stage: "spawn" | "initialize" | "session/new" | "catalog.resolve" = "spawn";
+    const startedAt = Date.now();
+    const probeDeadlineAt = startedAt + this.catalogProbeTimeoutMs;
+    let failure: unknown;
     const closeProbe = (): Promise<void> => {
       if (!probe) return Promise.resolve();
       closePromise ??= this.closeProbe(probe);
@@ -962,25 +993,45 @@ export class ACPAgentClient implements AgentClient {
         raceProviderRefreshAbort(
           context?.signal,
           this.spawnProcess(PROBE_ENV, {
+            initializeTimeoutMs: this.catalogStageBudgetMs(probeDeadlineAt),
             onSpawned: (spawned) => {
               probe = spawned;
+              stage = "initialize";
+              this.logger.info(
+                {
+                  provider: this.provider,
+                  pid: spawned.child.pid,
+                  stage,
+                  elapsedMs: Date.now() - startedAt,
+                },
+                "Started ACP catalog probe",
+              );
               if (context?.signal.aborted) void closeProbe().catch(() => undefined);
             },
           }),
         ),
       );
       probe = initializedProbe;
-      const response = await runProviderRefreshActivity(context, "session/new", () =>
-        raceProviderRefreshAbort(
-          context?.signal,
+      stage = "session/new";
+      const response = await runProviderRefreshActivity(context, "session/new", () => {
+        const timeoutMs = this.catalogStageBudgetMs(probeDeadlineAt);
+        const newSessionPromise = swallowLateRejection(
           this.runACPRequest(() =>
             initializedProbe.connection.newSession({
               cwd,
               mcpServers: [],
             }),
           ),
-        ),
-      );
+        );
+        return raceProviderRefreshAbort(
+          context?.signal,
+          withTimeout(
+            newSessionPromise,
+            timeoutMs,
+            `ACP session/new timed out after ${timeoutMs}ms`,
+          ),
+        );
+      });
       const transformed = this.transformSessionResponse(response);
       const derivedModels = deriveModelDefinitionsFromACP(
         this.provider,
@@ -988,9 +1039,10 @@ export class ACPAgentClient implements AgentClient {
         transformed.configOptions,
       );
       const models = this.catalogModelResolver
-        ? await runProviderRefreshActivity(context, "catalog.resolve", () =>
-            raceProviderRefreshAbort(
-              context?.signal,
+        ? await runProviderRefreshActivity(context, "catalog.resolve", () => {
+            stage = "catalog.resolve";
+            const timeoutMs = this.catalogStageBudgetMs(probeDeadlineAt);
+            const resolvePromise = swallowLateRejection(
               this.catalogModelResolver?.({
                 connection: initializedProbe.connection,
                 sessionId: response.sessionId,
@@ -1004,8 +1056,16 @@ export class ACPAgentClient implements AgentClient {
                 logger: this.logger,
                 provider: this.provider,
               }) ?? Promise.resolve(derivedModels),
-            ),
-          )
+            );
+            return raceProviderRefreshAbort(
+              context?.signal,
+              withTimeout(
+                resolvePromise,
+                timeoutMs,
+                `ACP catalog.resolve timed out after ${timeoutMs}ms`,
+              ),
+            );
+          })
         : derivedModels;
       const modeInfo = deriveModesFromACP(
         this.defaultModes,
@@ -1016,9 +1076,27 @@ export class ACPAgentClient implements AgentClient {
         models: this.modelTransformer ? this.modelTransformer(models) : models,
         modes: modeInfo.modes,
       };
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
       context?.signal.removeEventListener("abort", handleAbort);
       await closeProbe();
+      if (failure) {
+        this.logger.warn(
+          {
+            err: failure,
+            provider: this.provider,
+            pid: probe?.child.pid,
+            stage,
+            elapsedMs: Date.now() - startedAt,
+            stderr: probe?.stderrChunks?.join("").trim() || undefined,
+            exitCode: probe?.child.exitCode,
+            signalCode: probe?.child.signalCode,
+          },
+          "ACP catalog probe failed",
+        );
+      }
     }
   }
 
@@ -1188,17 +1266,23 @@ export class ACPAgentClient implements AgentClient {
         })
       : null;
 
+    const initializePromise = transport.connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: buildACPClientCapabilities(
+        this.clientCapabilityMeta,
+        this.clientCapabilities,
+      ),
+      clientInfo: { name: "Paseo", version: "dev" },
+    });
+    // Losing Promise.race legs can still reject after the child is killed; swallow to
+    // avoid unhandledRejection noise without changing the winner's result.
+    void initializePromise.catch(() => undefined);
+    void transport.spawnError.catch(() => undefined);
+
     try {
       return await this.runACPRequest(() =>
         Promise.race([
-          transport.connection.initialize({
-            protocolVersion: PROTOCOL_VERSION,
-            clientCapabilities: buildACPClientCapabilities(
-              this.clientCapabilityMeta,
-              this.clientCapabilities,
-            ),
-            clientInfo: { name: "Paseo", version: "dev" },
-          }),
+          initializePromise,
           transport.spawnError,
           ...(initializeTimeoutPromise ? [initializeTimeoutPromise] : []),
         ]),

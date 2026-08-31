@@ -368,6 +368,8 @@ export const ProviderSnapshotEntrySchema = z.object({
   models: z.array(AgentModelDefinitionSchema).optional(),
   modes: z.array(AgentModeSchema).optional(),
   fetchedAt: z.string().optional(),
+  stale: z.boolean().optional(),
+  refreshError: z.string().optional(),
   label: z.string().optional(),
   description: z.string().optional(),
   defaultModeId: z.string().nullable().optional(),
