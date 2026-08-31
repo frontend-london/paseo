@@ -35,6 +35,7 @@ function toImportResult(agent: AgentSnapshotPayload): AgentRunResult {
     provider: agent.provider,
     cwd: agent.cwd,
     title: agent.title,
+    mode: agent.currentModeId ?? null,
   };
 }
 

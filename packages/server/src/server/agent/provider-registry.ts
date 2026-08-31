@@ -596,13 +596,20 @@ function createRegistryEntry(
 
   const decorateModes = (modes: AgentMode[]): AgentMode[] =>
     modes.map((mode) => {
-      if (mode.icon && mode.colorTier) return mode;
       const definitionMode = resolved.definition.modes.find((d) => d.id === mode.id);
       if (!definitionMode) return mode;
-      return Object.assign({}, mode, {
-        icon: mode.icon ?? definitionMode.icon,
-        colorTier: mode.colorTier ?? definitionMode.colorTier,
-      });
+      const updates: Partial<AgentMode> = {};
+      if (mode.icon === undefined && definitionMode.icon !== undefined) {
+        updates.icon = definitionMode.icon;
+      }
+      if (mode.colorTier === undefined && definitionMode.colorTier !== undefined) {
+        updates.colorTier = definitionMode.colorTier;
+      }
+      if (mode.isUnattended === undefined && definitionMode.isUnattended !== undefined) {
+        updates.isUnattended = definitionMode.isUnattended;
+      }
+      if (Object.keys(updates).length === 0) return mode;
+      return Object.assign({}, mode, updates);
     });
 
   const hasStaticModes = resolved.definition.modes.length > 0;

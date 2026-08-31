@@ -17,6 +17,7 @@ import {
   type DiagnosticEntry,
   toDiagnosticErrorMessage,
 } from "./diagnostic-utils.js";
+import type { AgentMode } from "../agent-sdk-types.js";
 
 export const GenericACPProviderParamsSchema = z
   .object({
@@ -44,6 +45,7 @@ interface GenericACPAgentClientOptions {
   providerId?: string;
   label?: string;
   providerParams?: unknown;
+  defaultModes?: AgentMode[];
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   diagnosticPhaseTimeoutMs?: number;
@@ -68,6 +70,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
         env: options.env,
       },
       defaultCommand: options.command,
+      defaultModes: options.defaultModes,
       capabilities: buildGenericACPCapabilities(providerParams),
       waitForInitialCommands: options.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: options.initialCommandsWaitTimeoutMs,

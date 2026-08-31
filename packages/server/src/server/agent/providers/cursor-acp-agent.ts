@@ -1,7 +1,19 @@
 import type { Logger } from "pino";
 
+import type { AgentMode } from "../agent-sdk-types.js";
 import type { ACPConfigFeatureOption } from "./acp-agent.js";
 import { GenericACPAgentClient } from "./generic-acp-agent.js";
+
+const CURSOR_MODES: AgentMode[] = [
+  {
+    id: "agent",
+    label: "Agent",
+    description: "Cursor's unattended agent mode",
+    isUnattended: true,
+  },
+  { id: "plan", label: "Plan", description: "Cursor's plan mode" },
+  { id: "ask", label: "Ask", description: "Cursor's ask mode" },
+];
 
 interface CursorACPAgentClientOptions {
   logger: Logger;
@@ -35,6 +47,7 @@ export class CursorACPAgentClient extends GenericACPAgentClient {
       providerId: options.providerId,
       label: options.label,
       providerParams: options.providerParams,
+      defaultModes: CURSOR_MODES,
       // cursor-agent publishes slash commands asynchronously via available_commands_update.
       waitForInitialCommands: true,
       initialCommandsWaitTimeoutMs: CURSOR_INITIAL_COMMANDS_WAIT_TIMEOUT_MS,

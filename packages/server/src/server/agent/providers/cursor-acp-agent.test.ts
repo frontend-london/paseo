@@ -178,7 +178,7 @@ describe("CursorACPAgentClient model discovery", () => {
 
 describe("CursorACPAgentClient resolveCreateConfig", () => {
   const availableModes: AgentMode[] = [
-    { id: "agent", label: "Agent" },
+    { id: "agent", label: "Agent", isUnattended: true },
     { id: "plan", label: "Plan" },
     { id: "ask", label: "Ask" },
   ];
@@ -278,7 +278,17 @@ describe("CursorACPAgentClient resolveCreateConfig", () => {
       command: ["cursor-agent", "acp"],
     });
 
-    expect(() => client.resolveCreateConfig(makeInput(undefined, "unknown-acp"))).toThrow(
+    expect(() =>
+      client.resolveCreateConfig({
+        ...makeInput(undefined, "unknown-acp"),
+        // Unlike `availableModes` above, this catalog has no mode marked
+        // `isUnattended`, so there is nothing to prove an unattended default.
+        availableModes: [
+          { id: "plan", label: "Plan" },
+          { id: "ask", label: "Ask" },
+        ],
+      }),
+    ).toThrow(
       "Provider 'unknown-acp' has no unattended/no-prompts mode and cannot be started without an explicit mode.",
     );
   });
@@ -318,6 +328,48 @@ describe("CursorACPAgentClient resolveCreateConfig", () => {
     expect(result).toEqual({
       modeId: "agent",
       featureValues: { auto_accept: false },
+    });
+  });
+
+  test("same-provider parent inheritance preserves the parent mode", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      provider: "cursor",
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: { provider: "cursor", modeId: "plan", isUnattended: false },
+      unattended: false,
+      availableModes,
+    });
+
+    expect(result).toEqual({
+      modeId: "plan",
+      featureValues: undefined,
+    });
+  });
+
+  test("empty catalog still defaults to auto-accept for top-level creation", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      provider: "cursor",
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: null,
+      unattended: false,
+      availableModes: [],
+    });
+
+    expect(result).toEqual({
+      modeId: undefined,
+      featureValues: { auto_accept: true },
     });
   });
 });

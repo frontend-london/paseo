@@ -399,4 +399,58 @@ describe("OpenCode auto_accept feature", () => {
 
     await session.close();
   });
+
+  test("top-level default uses no-prompts via auto_accept even when unattended is false", () => {
+    const client = new OpenCodeAgentClient(createTestLogger());
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "opencode",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "build", label: "Build" },
+          { id: "plan", label: "Plan" },
+        ],
+      }),
+    ).toEqual({ modeId: undefined, featureValues: { auto_accept: true } });
+  });
+
+  test("explicit OpenCode mode is preserved without auto_accept", () => {
+    const client = new OpenCodeAgentClient(createTestLogger());
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "opencode",
+        requestedMode: "build",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "build", label: "Build" },
+          { id: "plan", label: "Plan" },
+        ],
+      }),
+    ).toEqual({ modeId: "build", featureValues: undefined });
+  });
+
+  test("explicit auto_accept=false is honored for top-level default", () => {
+    const client = new OpenCodeAgentClient(createTestLogger());
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "opencode",
+        requestedMode: undefined,
+        featureValues: { auto_accept: false },
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "build", label: "Build" },
+          { id: "plan", label: "Plan" },
+        ],
+      }),
+    ).toEqual({ modeId: undefined, featureValues: { auto_accept: false } });
+  });
 });

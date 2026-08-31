@@ -105,6 +105,7 @@ import {
   isDefaultAgentCreateConfigUnattended,
   resolveDefaultAgentCreateConfig,
 } from "../create-agent-mode.js";
+import { getUnattendedModeId } from "@getpaseo/protocol/provider-manifest";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
   checkProviderLaunchAvailable,
@@ -127,16 +128,6 @@ import {
 import { withTimeout } from "../../../utils/promise-timeout.js";
 
 const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
-
-// Operator policy (2026-08-31): ACP-style providers started through Agents/Paseo
-// default to their native no-prompts / unattended mode. This map records the
-// provider-specific mode id for each ACP provider; it is an implementation
-// detail behind the unified "default to unattended" policy. Providers not in
-// this map and with non-empty dynamic mode lists must be started with an
-// explicit mode (or an ACP caller may pass one).
-const ACP_UNATTENDED_MODE_BY_PROVIDER: Readonly<Record<string, string>> = {
-  cursor: "agent",
-};
 
 // ProviderSnapshotManager has a longer outer deadline for non-ACP catalog work.
 // ACP catalog probes must fail fast so create_agent cannot sit behind a hung CLI.
@@ -675,13 +666,19 @@ export function deriveModesFromACP(
   modeState?: { availableModes?: SessionMode[] | null; currentModeId?: string | null } | null,
   configOptions?: SessionConfigOption[] | null,
 ): { modes: AgentMode[]; currentModeId: string | null } {
+  const fallbackById = new Map(fallbackModes.map((mode) => [mode.id, mode]));
+
   if (modeState?.availableModes?.length) {
     return {
-      modes: modeState.availableModes.map((mode) => ({
-        id: mode.id,
-        label: mode.name,
-        description: mode.description ?? undefined,
-      })),
+      modes: modeState.availableModes.map((mode) => {
+        const fallback = fallbackById.get(mode.id);
+        return {
+          id: mode.id,
+          label: mode.name,
+          description: mode.description ?? undefined,
+          isUnattended: fallback?.isUnattended,
+        };
+      }),
       currentModeId: modeState.currentModeId ?? null,
     };
   }
@@ -690,17 +687,21 @@ export function deriveModesFromACP(
   if (modeOption) {
     const flatOptions = flattenSelectOptions(modeOption.options);
     return {
-      modes: flatOptions.map((option) => ({
-        id: option.value,
-        label: option.name,
-        description: option.description ?? undefined,
-      })),
+      modes: flatOptions.map((option) => {
+        const fallback = fallbackById.get(option.value);
+        return {
+          id: option.value,
+          label: option.name,
+          description: option.description ?? undefined,
+          isUnattended: fallback?.isUnattended,
+        };
+      }),
       currentModeId: modeOption.currentValue,
     };
   }
 
   return {
-    modes: fallbackModes,
+    modes: [],
     currentModeId: null,
   };
 }
@@ -779,28 +780,44 @@ function buildACPAutoAcceptFeature(config: AgentSessionConfig): AgentFeature {
   };
 }
 
+// Resolves the top-level (no parent, no explicit mode) default mode for an
+// ACP provider. Prefers a dynamic catalog mode explicitly marked as
+// unattended, then falls back to the static provider manifest for built-in
+// ACP providers. This replaces the previous cursor-only hardcoded map and
+// lets generic/custom ACP providers declare their unattended mode through
+// their own catalog.
+function resolveACPTopLevelDefaultMode(input: ResolveAgentCreateConfigInput): {
+  requestedMode: string | undefined;
+  unattendedModeId: string | undefined;
+  defaultedToUnattended: boolean;
+} {
+  const catalogUnattendedMode = input.availableModes?.find((mode) => mode.isUnattended === true);
+  const manifestUnattendedModeId = getUnattendedModeId(input.provider);
+  const unattendedModeId = catalogUnattendedMode?.id ?? manifestUnattendedModeId;
+
+  if (input.requestedMode !== undefined || input.parent !== null) {
+    return { requestedMode: input.requestedMode, unattendedModeId, defaultedToUnattended: false };
+  }
+  if (unattendedModeId !== undefined) {
+    return { requestedMode: unattendedModeId, unattendedModeId, defaultedToUnattended: true };
+  }
+  if (input.availableModes && input.availableModes.length > 0) {
+    throw new Error(
+      `Provider '${input.provider}' has no unattended/no-prompts mode and cannot be started without an explicit mode.`,
+    );
+  }
+  // Empty catalog: the provider has no mode concept. ACP still defaults to
+  // auto-accept, which is the ACP-level no-prompts mechanism.
+  return { requestedMode: input.requestedMode, unattendedModeId, defaultedToUnattended: true };
+}
+
 function resolveACPCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
   const isUnattendedCreate = input.unattended || input.parent?.isUnattended === true;
-  const unattendedModeId = ACP_UNATTENDED_MODE_BY_PROVIDER[input.provider];
 
-  // Operator policy (2026-08-31): ACP providers started through Agents/Paseo
-  // default to their native unattended/no-prompts mode. The map above records
-  // the provider-specific mode id; everything else is shared policy.
-  // An explicit requestedMode always overrides the default.
-  let requestedMode = input.requestedMode;
-  let defaultedToUnattended = false;
-  if (requestedMode === undefined && input.parent === null) {
-    if (unattendedModeId !== undefined) {
-      requestedMode = unattendedModeId;
-      defaultedToUnattended = true;
-    } else if (input.availableModes && input.availableModes.length > 0) {
-      throw new Error(
-        `Provider '${input.provider}' has no unattended/no-prompts mode and cannot be started without an explicit mode.`,
-      );
-    }
-  }
+  const { requestedMode, unattendedModeId, defaultedToUnattended } =
+    resolveACPTopLevelDefaultMode(input);
 
   const isUnattendedMode = unattendedModeId !== undefined && requestedMode === unattendedModeId;
   const shouldAutoAccept =

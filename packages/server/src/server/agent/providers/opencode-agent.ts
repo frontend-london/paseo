@@ -250,6 +250,7 @@ function resolveOpenCodeCreateConfig(
   const legacyFullAccess = input.requestedMode === OPENCODE_LEGACY_FULL_ACCESS_MODE_ID;
   const parent = input.parent;
   const isUnattendedCreate = input.unattended || parent?.isUnattended === true;
+  const isTopLevelDefault = input.requestedMode === undefined && parent === null;
   const inheritsUnattended = input.requestedMode === undefined && isUnattendedCreate;
   const inheritedOpenCodeMode =
     inheritsUnattended && parent?.provider === input.provider
@@ -258,15 +259,15 @@ function resolveOpenCodeCreateConfig(
   const requestedMode = legacyFullAccess
     ? OPENCODE_BUILD_MODE_ID
     : (input.requestedMode ?? inheritedOpenCodeMode);
+  const shouldAutoAccept = legacyFullAccess || isUnattendedCreate || isTopLevelDefault;
   const featureValues =
-    legacyFullAccess ||
-    (isUnattendedCreate && input.featureValues?.[OPENCODE_AUTO_ACCEPT_FEATURE_ID] === undefined)
+    shouldAutoAccept && input.featureValues?.[OPENCODE_AUTO_ACCEPT_FEATURE_ID] === undefined
       ? withOpenCodeAutoAcceptFeature(input.featureValues, true)
       : input.featureValues;
 
-  if (inheritsUnattended && requestedMode === undefined) {
+  if ((inheritsUnattended || isTopLevelDefault) && requestedMode === undefined) {
     // Unattendedness for OpenCode is carried by auto_accept (set above), not
-    // by any particular agent. Leave the mode unset so OpenCode uses its own
+    // by any particular mode. Leave the mode unset so OpenCode uses its own
     // default agent — `build` may not exist in the user's OpenCode config.
     return { modeId: undefined, featureValues };
   }
