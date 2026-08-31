@@ -130,7 +130,13 @@ import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
-import { attachAgentStoragePersistence } from "./persistence-hooks.js";
+import { readAgentResumeLedger, writeAgentResumeLedger } from "./agent/agent-resume-ledger.js";
+import {
+  attachAgentStoragePersistence,
+  buildConfigOverrides,
+  extractTimestamps,
+  toAgentPersistenceHandle,
+} from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import {
   createPaseoToolCatalog,
@@ -560,6 +566,64 @@ function createInitialMutableDaemonConfig(config: PaseoDaemonConfig): MutableDae
   }
 
   return initialConfig;
+}
+
+async function rehydrateResumableAgents(
+  paseoHome: string,
+  agentManager: AgentManager,
+  agentStorage: AgentStorage,
+  logger: Logger,
+): Promise<void> {
+  const resumeAgentIds = await readAgentResumeLedger(paseoHome);
+  if (!resumeAgentIds || resumeAgentIds.length === 0) {
+    return;
+  }
+
+  logger.info(
+    { count: resumeAgentIds.length },
+    "Resuming active agents from previous daemon session",
+  );
+
+  const validProviders = new Set(agentManager.getRegisteredProviderIds());
+
+  await Promise.all(
+    resumeAgentIds.map(async (agentId) => {
+      try {
+        const record = await agentStorage.get(agentId);
+        if (!record) {
+          logger.warn({ agentId }, "Resume ledger referenced missing agent record; skipping");
+          return;
+        }
+        if (record.archivedAt) {
+          logger.debug({ agentId }, "Resume ledger agent is archived; skipping");
+          return;
+        }
+
+        const handle = toAgentPersistenceHandle(validProviders, record.persistence);
+        if (!handle) {
+          logger.warn(
+            { agentId },
+            "Resume ledger referenced agent without a resumable persistence handle; skipping",
+          );
+          return;
+        }
+
+        const overrides = buildConfigOverrides(record);
+        const timestamps = extractTimestamps(record);
+        await agentManager.resumeAgentFromPersistence(handle, overrides ?? undefined, agentId, {
+          createdAt: timestamps.createdAt,
+          updatedAt: timestamps.updatedAt,
+          lastUserMessageAt: timestamps.lastUserMessageAt,
+          labels: timestamps.labels,
+          workspaceId: timestamps.workspaceId,
+          owner: timestamps.owner,
+        });
+        logger.info({ agentId }, "Resumed agent after daemon restart");
+      } catch (error) {
+        logger.error({ err: error, agentId }, "Failed to resume agent after daemon restart");
+      }
+    }),
+  );
 }
 
 export async function createPaseoDaemon(
@@ -1682,6 +1746,7 @@ export async function createPaseoDaemon(
             );
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
+            await rehydrateResumableAgents(config.paseoHome, agentManager, agentStorage, logger);
             wsServer.beginAcceptingConnections();
             relayRuntime = createRelayRuntime({
               config: {
@@ -1744,6 +1809,8 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
+    const liveAgentIds = agentManager.listAgents().map((agent) => agent.id);
+    await writeAgentResumeLedger(config.paseoHome, liveAgentIds);
     await closeAllAgents(logger, agentManager);
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
