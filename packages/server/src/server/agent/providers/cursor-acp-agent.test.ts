@@ -271,4 +271,42 @@ describe("CursorACPAgentClient resolveCreateConfig", () => {
       featureValues: undefined,
     });
   });
+
+  test("inherits auto-accept from an unattended parent", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      provider: "cursor",
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: { provider: "claude", modeId: "bypassPermissions", isUnattended: true },
+      unattended: false,
+      availableModes,
+    });
+
+    expect(result).toEqual({
+      modeId: undefined,
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("explicit auto_accept=false is honored even for cursor agent", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      ...makeInput("agent"),
+      featureValues: { auto_accept: false },
+    });
+
+    expect(result).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: false },
+    });
+  });
 });

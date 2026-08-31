@@ -772,14 +772,12 @@ function resolveACPCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
   const isUnattendedCreate = input.unattended || input.parent?.isUnattended === true;
-  // Paseo 0.7.0-beta.3 exposes Cursor's only autonomous mode as "agent",
-  // but Cursor's ACP server still emits permission prompts for tool calls in
-  // that mode. The ACP "auto_accept" feature is the supported way to make a
-  // Cursor session run without prompts. Default top-level Cursor "agent"
-  // sessions (requested or inferred) to auto-accept so that callers such as
-  // the Agents Control Plane that ask for the provider's no-questions mode
-  // actually get a bypass session. Explicit "plan" / "ask" modes stay
-  // read-only / Q&A and do not auto-accept.
+  // Operator policy (2026-08-31): top-level Cursor "agent" sessions are
+  // always no-questions / Bypass for normal agent work. Cursor's ACP server
+  // still emits permission prompts for tool calls in "agent" mode, so use the
+  // ACP "auto_accept" feature to make those sessions run without prompts.
+  // Explicit "plan" / "ask" modes stay read-only / Q&A and are not forced to
+  // auto-accept. Child agents inherit auto-accept from an unattended parent.
   const isCursorAgentUnattendedByDefault =
     input.provider === "cursor" &&
     input.parent === null &&
