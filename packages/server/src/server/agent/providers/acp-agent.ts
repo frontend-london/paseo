@@ -1138,6 +1138,7 @@ export class ACPAgentClient implements AgentClient {
         overlays: [launchEnv],
       }),
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
     });
     assertChildWithPipes(child);
 
@@ -2219,7 +2220,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.terminalEntries.clear();
 
     if (this.child) {
-      await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+      await this.terminateProcess(this.child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+        useProcessGroup: true,
+      });
     }
 
     this.subscribers.clear();
@@ -2488,6 +2493,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         overlays: [this.launchEnv],
       }),
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
     });
     assertChildWithPipes(child);
 
@@ -2499,6 +2505,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       if (this.closed) {
         return;
       }
+      void this.terminateProcess(child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+        useProcessGroup: true,
+      }).catch((error: unknown) => {
+        this.logger.warn({ err: error }, "ACP child group cleanup failed after exit");
+      });
       if (this.activeForegroundTurnId) {
         this.synthesizeCanceledToolCalls();
         this.finishTurn({
@@ -3674,7 +3687,11 @@ async function terminateChildProcess(
   terminate: ProcessTerminator,
 ): Promise<void> {
   try {
-    await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
+    await terminate(child, {
+      gracefulTimeoutMs: timeoutMs,
+      forceTimeoutMs: timeoutMs,
+      useProcessGroup: true,
+    });
   } finally {
     child.stdin.destroy();
     child.stdout.destroy();

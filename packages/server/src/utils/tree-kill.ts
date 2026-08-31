@@ -14,6 +14,7 @@ export interface TerminateWithTreeKillOptions {
   gracefulTimeoutMs: number;
   forceTimeoutMs?: number;
   onForceSignal?: () => void;
+  useProcessGroup?: boolean;
 }
 
 export type TerminateWithTreeKillResult =
@@ -33,6 +34,11 @@ export async function terminateWithTreeKill(
   child: TreeKillTarget,
   options: TerminateWithTreeKillOptions,
 ): Promise<TerminateWithTreeKillResult> {
+  const pid = child.pid;
+  if (options.useProcessGroup && typeof pid === "number" && pid > 0) {
+    return terminateProcessGroup(child, options, pid);
+  }
+
   if (isProcessExited(child)) {
     return "already-exited";
   }
@@ -51,6 +57,42 @@ export async function terminateWithTreeKill(
   return (await waitForExitOrTimeout(exitPromise, options.forceTimeoutMs))
     ? "killed"
     : "kill-timeout";
+}
+
+async function terminateProcessGroup(
+  child: TreeKillTarget,
+  options: TerminateWithTreeKillOptions,
+  pid: number,
+): Promise<TerminateWithTreeKillResult> {
+  if (isProcessExited(child) && !isProcessGroupAlive(pid)) {
+    return "already-exited";
+  }
+
+  await signalProcessGroup(pid, options.gracefulSignal ?? "SIGTERM");
+  if (await waitForProcessGroupExit(pid, options.gracefulTimeoutMs)) {
+    return "terminated";
+  }
+
+  options.onForceSignal?.();
+  await signalProcessGroup(pid, options.forceSignal ?? "SIGKILL");
+  if (options.forceTimeoutMs === undefined) {
+    return "killed";
+  }
+  return (await waitForProcessGroupExit(pid, options.forceTimeoutMs)) ? "killed" : "kill-timeout";
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      process.kill(-pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        // Ignore cleanup races and permission errors. The group may contain
+        // processes we cannot signal; that is not a reason to fail cleanup.
+      }
+    }
+    resolve();
+  });
 }
 
 export function signalProcessTree(child: TreeKillTarget, signal: NodeJS.Signals): Promise<void> {
@@ -100,6 +142,30 @@ function waitForProcessExit(child: TreeKillTarget): Promise<void> {
   return new Promise((resolve) => {
     child.once?.("exit", resolve);
   });
+}
+
+function isProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM") {
+      return true;
+    }
+    return false;
+  }
+}
+
+async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessGroupAlive(pid)) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return true;
 }
 
 async function waitForExitOrTimeout(
