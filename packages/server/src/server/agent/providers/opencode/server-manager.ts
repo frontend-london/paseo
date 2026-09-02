@@ -505,6 +505,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     const result = await this.terminateProcess(server.process, {
       gracefulTimeoutMs: OPENCODE_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: OPENCODE_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS,
+      useProcessGroup: process.platform !== "win32",
       onForceSignal: () => {
         this.logger.warn(
           { timeoutMs: OPENCODE_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS },

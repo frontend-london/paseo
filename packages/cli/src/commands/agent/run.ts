@@ -92,6 +92,7 @@ export interface AgentRunResult {
   provider: string;
   cwd: string;
   title: string | null;
+  mode: string | null;
 }
 
 /** Schema for agent run output */
@@ -101,6 +102,7 @@ export const agentRunSchema: OutputSchema<AgentRunResult> = {
     { header: "AGENT ID", field: "agentId", width: 12 },
     { header: "STATUS", field: "status", width: 10 },
     { header: "PROVIDER", field: "provider", width: 10 },
+    { header: "MODE", field: "mode", width: 12 },
     { header: "CWD", field: "cwd", width: 30 },
     { header: "TITLE", field: "title", width: 20 },
   ],
@@ -162,6 +164,7 @@ function toRunResult(
     provider: agent.provider,
     cwd: agent.cwd,
     title: agent.title,
+    mode: agent.currentModeId ?? null,
   };
 }
 

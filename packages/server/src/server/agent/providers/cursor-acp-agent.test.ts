@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { SpawnedACPProcess, SessionStateResponse } from "./acp-agent.js";
+import type { AgentMode, ResolveAgentCreateConfigInput } from "../agent-sdk-types.js";
 import { CURSOR_FAST_FEATURE_OPTION, CursorACPAgentClient } from "./cursor-acp-agent.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 
@@ -172,5 +173,203 @@ describe("CursorACPAgentClient model discovery", () => {
         ],
       },
     ]);
+  });
+});
+
+describe("CursorACPAgentClient resolveCreateConfig", () => {
+  const availableModes: AgentMode[] = [
+    { id: "agent", label: "Agent", isUnattended: true },
+    { id: "plan", label: "Plan" },
+    { id: "ask", label: "Ask" },
+  ];
+
+  function makeInput(
+    requestedMode: string | undefined,
+    provider = "cursor",
+  ): ResolveAgentCreateConfigInput {
+    return {
+      provider,
+      requestedMode,
+      featureValues: undefined,
+      parent: null,
+      unattended: false,
+      availableModes,
+    };
+  }
+
+  test("defaults top-level cursor agent mode to auto-accept", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig(makeInput(undefined));
+
+    expect(result).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("auto-accepts an explicit cursor agent mode", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig(makeInput("agent"));
+
+    expect(result).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("does not auto-accept cursor plan or ask modes", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    expect(client.resolveCreateConfig(makeInput("plan"))).toEqual({
+      modeId: "plan",
+      featureValues: undefined,
+    });
+    expect(client.resolveCreateConfig(makeInput("ask"))).toEqual({
+      modeId: "ask",
+      featureValues: undefined,
+    });
+  });
+
+  test("preserves an explicit auto_accept override", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      ...makeInput(undefined),
+      featureValues: { auto_accept: false },
+    });
+
+    expect(result).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: false },
+    });
+  });
+
+  test("does not auto-accept an explicit non-unattended ACP mode", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig(makeInput("plan", "generic-acp"));
+
+    expect(result).toEqual({
+      modeId: "plan",
+      featureValues: undefined,
+    });
+  });
+
+  test("rejects an unknown ACP provider with no explicit mode", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    expect(() =>
+      client.resolveCreateConfig({
+        ...makeInput(undefined, "unknown-acp"),
+        // Unlike `availableModes` above, this catalog has no mode marked
+        // `isUnattended`, so there is nothing to prove an unattended default.
+        availableModes: [
+          { id: "plan", label: "Plan" },
+          { id: "ask", label: "Ask" },
+        ],
+      }),
+    ).toThrow(
+      "Provider 'unknown-acp' has no unattended/no-prompts mode and cannot be started without an explicit mode.",
+    );
+  });
+
+  test("inherits auto-accept from an unattended parent", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      provider: "cursor",
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: { provider: "claude", modeId: "bypassPermissions", isUnattended: true },
+      unattended: false,
+      availableModes,
+    });
+
+    expect(result).toEqual({
+      modeId: undefined,
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("explicit auto_accept=false is honored even for cursor agent", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      ...makeInput("agent"),
+      featureValues: { auto_accept: false },
+    });
+
+    expect(result).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: false },
+    });
+  });
+
+  test("same-provider parent inheritance preserves the parent mode", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      provider: "cursor",
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: { provider: "cursor", modeId: "plan", isUnattended: false },
+      unattended: false,
+      availableModes,
+    });
+
+    expect(result).toEqual({
+      modeId: "plan",
+      featureValues: undefined,
+    });
+  });
+
+  test("empty catalog still defaults to auto-accept for top-level creation", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    const result = client.resolveCreateConfig({
+      provider: "cursor",
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: null,
+      unattended: false,
+      availableModes: [],
+    });
+
+    expect(result).toEqual({
+      modeId: undefined,
+      featureValues: { auto_accept: true },
+    });
   });
 });

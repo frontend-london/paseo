@@ -4032,3 +4032,199 @@ describe("ACP session/load invariant — cwd and mcpServers always passed", () =
     });
   });
 });
+
+describe("ACPAgentClient resolveCreateConfig regression", () => {
+  test("generic ACP provider with a catalog-proven unattended mode defaults to it", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "plan", label: "Plan" },
+          { id: "agent", label: "Agent", isUnattended: true },
+        ],
+      }),
+    ).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("generic ACP provider with a non-empty catalog lacking an unattended mode fails closed", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(() =>
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "plan", label: "Plan" },
+          { id: "ask", label: "Ask" },
+        ],
+      }),
+    ).toThrow(
+      "Provider 'generic-acp' has no unattended/no-prompts mode and cannot be started without an explicit mode.",
+    );
+  });
+
+  test("empty catalog still defaults to ACP auto-accept for top-level creation", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [],
+      }),
+    ).toEqual({
+      modeId: undefined,
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("explicit mode override wins and is validated", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: "plan",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "plan", label: "Plan" },
+          { id: "agent", label: "Agent", isUnattended: true },
+        ],
+      }),
+    ).toEqual({
+      modeId: "plan",
+      featureValues: undefined,
+    });
+  });
+
+  test("explicit auto_accept=false is never overwritten", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: undefined,
+        featureValues: { auto_accept: false },
+        parent: null,
+        unattended: false,
+        availableModes: [{ id: "agent", label: "Agent", isUnattended: true }],
+      }),
+    ).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: false },
+    });
+  });
+
+  test("same-provider parent inheritance preserves the parent mode", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: {
+          provider: "generic-acp",
+          modeId: "plan",
+          isUnattended: false,
+        },
+        unattended: false,
+        availableModes: [
+          { id: "plan", label: "Plan" },
+          { id: "agent", label: "Agent", isUnattended: true },
+        ],
+      }),
+    ).toEqual({
+      modeId: "plan",
+      featureValues: undefined,
+    });
+  });
+
+  test("cross-provider unattended parent gives auto-accept without forcing a mode", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: {
+          provider: "claude",
+          modeId: "bypassPermissions",
+          isUnattended: true,
+        },
+        unattended: false,
+        availableModes: [{ id: "agent", label: "Agent", isUnattended: true }],
+      }),
+    ).toEqual({
+      modeId: undefined,
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("Copilot top-level default resolves to allow-all and auto-accept", () => {
+    const client = new CopilotACPAgentClient({
+      logger: createTestLogger(),
+      runtimeSettings: { command: { mode: "replace", argv: ["copilot", "--acp"] } },
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "copilot",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: COPILOT_MODES,
+      }),
+    ).toEqual({
+      modeId: COPILOT_ALLOW_ALL_MODE_ID,
+      featureValues: { auto_accept: true },
+    });
+  });
+});

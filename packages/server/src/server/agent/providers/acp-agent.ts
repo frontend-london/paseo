@@ -105,6 +105,7 @@ import {
   isDefaultAgentCreateConfigUnattended,
   resolveDefaultAgentCreateConfig,
 } from "../create-agent-mode.js";
+import { getUnattendedModeId } from "@getpaseo/protocol/provider-manifest";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
   checkProviderLaunchAvailable,
@@ -127,6 +128,7 @@ import {
 import { withTimeout } from "../../../utils/promise-timeout.js";
 
 const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
+
 // ProviderSnapshotManager has a longer outer deadline for non-ACP catalog work.
 // ACP catalog probes must fail fast so create_agent cannot sit behind a hung CLI.
 const ACP_CATALOG_STAGE_TIMEOUT_MS = 20_000;
@@ -664,13 +666,19 @@ export function deriveModesFromACP(
   modeState?: { availableModes?: SessionMode[] | null; currentModeId?: string | null } | null,
   configOptions?: SessionConfigOption[] | null,
 ): { modes: AgentMode[]; currentModeId: string | null } {
+  const fallbackById = new Map(fallbackModes.map((mode) => [mode.id, mode]));
+
   if (modeState?.availableModes?.length) {
     return {
-      modes: modeState.availableModes.map((mode) => ({
-        id: mode.id,
-        label: mode.name,
-        description: mode.description ?? undefined,
-      })),
+      modes: modeState.availableModes.map((mode) => {
+        const fallback = fallbackById.get(mode.id);
+        return {
+          id: mode.id,
+          label: mode.name,
+          description: mode.description ?? undefined,
+          isUnattended: fallback?.isUnattended,
+        };
+      }),
       currentModeId: modeState.currentModeId ?? null,
     };
   }
@@ -679,17 +687,21 @@ export function deriveModesFromACP(
   if (modeOption) {
     const flatOptions = flattenSelectOptions(modeOption.options);
     return {
-      modes: flatOptions.map((option) => ({
-        id: option.value,
-        label: option.name,
-        description: option.description ?? undefined,
-      })),
+      modes: flatOptions.map((option) => {
+        const fallback = fallbackById.get(option.value);
+        return {
+          id: option.value,
+          label: option.name,
+          description: option.description ?? undefined,
+          isUnattended: fallback?.isUnattended,
+        };
+      }),
       currentModeId: modeOption.currentValue,
     };
   }
 
   return {
-    modes: fallbackModes,
+    modes: [],
     currentModeId: null,
   };
 }
@@ -768,25 +780,67 @@ function buildACPAutoAcceptFeature(config: AgentSessionConfig): AgentFeature {
   };
 }
 
+// Resolves the top-level (no parent, no explicit mode) default mode for an
+// ACP provider. Prefers a dynamic catalog mode explicitly marked as
+// unattended, then falls back to the static provider manifest for built-in
+// ACP providers. This replaces the previous cursor-only hardcoded map and
+// lets generic/custom ACP providers declare their unattended mode through
+// their own catalog.
+function resolveACPTopLevelDefaultMode(input: ResolveAgentCreateConfigInput): {
+  requestedMode: string | undefined;
+  unattendedModeId: string | undefined;
+  defaultedToUnattended: boolean;
+} {
+  const catalogUnattendedMode = input.availableModes?.find((mode) => mode.isUnattended === true);
+  const manifestUnattendedModeId = getUnattendedModeId(input.provider);
+  const unattendedModeId = catalogUnattendedMode?.id ?? manifestUnattendedModeId;
+
+  if (input.requestedMode !== undefined || input.parent !== null) {
+    return { requestedMode: input.requestedMode, unattendedModeId, defaultedToUnattended: false };
+  }
+  if (unattendedModeId !== undefined) {
+    return { requestedMode: unattendedModeId, unattendedModeId, defaultedToUnattended: true };
+  }
+  if (input.availableModes && input.availableModes.length > 0) {
+    throw new Error(
+      `Provider '${input.provider}' has no unattended/no-prompts mode and cannot be started without an explicit mode.`,
+    );
+  }
+  // Empty catalog: the provider has no mode concept. ACP still defaults to
+  // auto-accept, which is the ACP-level no-prompts mechanism.
+  return { requestedMode: input.requestedMode, unattendedModeId, defaultedToUnattended: true };
+}
+
 function resolveACPCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
   const isUnattendedCreate = input.unattended || input.parent?.isUnattended === true;
+
+  const { requestedMode, unattendedModeId, defaultedToUnattended } =
+    resolveACPTopLevelDefaultMode(input);
+
+  const isUnattendedMode = unattendedModeId !== undefined && requestedMode === unattendedModeId;
+  const shouldAutoAccept =
+    isUnattendedCreate ||
+    defaultedToUnattended ||
+    (isUnattendedMode && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined);
   const featureValues =
-    isUnattendedCreate && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined
+    shouldAutoAccept && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined
       ? { ...input.featureValues, [ACP_AUTO_ACCEPT_FEATURE_ID]: true }
       : input.featureValues;
 
-  if (
-    input.requestedMode === undefined &&
-    isUnattendedCreate &&
-    input.parent !== null &&
-    input.parent.provider !== input.provider
-  ) {
+  if (input.requestedMode === undefined && isUnattendedCreate && input.parent !== null) {
+    // Cross-provider inheritance: the child provider should pick its own
+    // default mode (which will be the unattended one for known ACP providers)
+    // and auto-accept because the parent is unattended.
     return { modeId: undefined, featureValues };
   }
 
-  return resolveDefaultAgentCreateConfig({ ...input, featureValues });
+  return resolveDefaultAgentCreateConfig({
+    ...input,
+    requestedMode,
+    featureValues,
+  });
 }
 
 function isACPCreateConfigUnattended(input: AgentCreateConfigUnattendedInput): boolean {

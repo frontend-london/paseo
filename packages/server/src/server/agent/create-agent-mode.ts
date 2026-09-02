@@ -1,3 +1,5 @@
+import { getUnattendedModeId } from "@getpaseo/protocol/provider-manifest";
+
 import type {
   AgentCreateConfigParent,
   AgentCreateConfigUnattendedInput,
@@ -44,6 +46,15 @@ export function resolveAndValidateCreateAgentMode(
   input: ResolveCreateAgentModeInput,
 ): string | undefined {
   const { requestedMode, targetProvider, parent, availableModes } = input;
+  const fallbackUnattendedMode = getUnattendedModeId(targetProvider);
+  let targetUnattendedMode = input.targetUnattendedMode;
+  if (targetUnattendedMode === undefined && fallbackUnattendedMode !== undefined) {
+    if (availableModes === undefined) {
+      targetUnattendedMode = fallbackUnattendedMode;
+    } else if (availableModes.length > 0 && availableModes.includes(fallbackUnattendedMode)) {
+      targetUnattendedMode = fallbackUnattendedMode;
+    }
+  }
 
   if (requestedMode !== undefined) {
     if (availableModes !== undefined && !availableModes.includes(requestedMode)) {
@@ -55,8 +66,13 @@ export function resolveAndValidateCreateAgentMode(
   }
 
   if (!parent) {
-    if (input.unattended && input.targetUnattendedMode !== undefined) {
-      return input.targetUnattendedMode;
+    if (targetUnattendedMode !== undefined) {
+      return targetUnattendedMode;
+    }
+    if (availableModes !== undefined && availableModes.length > 0) {
+      throw new Error(
+        `Provider '${targetProvider}' has no unattended/no-prompts mode and cannot be started without an explicit mode. Available modes: ${listModes(availableModes)}`,
+      );
     }
     return undefined;
   }
@@ -67,9 +83,9 @@ export function resolveAndValidateCreateAgentMode(
 
   if (
     (input.unattended || isUnattendedCreateConfigParent(parent)) &&
-    input.targetUnattendedMode !== undefined
+    targetUnattendedMode !== undefined
   ) {
-    return input.targetUnattendedMode;
+    return targetUnattendedMode;
   }
 
   if (availableModes?.length === 0) {
@@ -85,6 +101,10 @@ export function resolveDefaultAgentCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
   const availableModeIds = input.availableModes?.map((mode) => mode.id);
+  const targetUnattendedMode =
+    input.availableModes === undefined
+      ? getUnattendedModeId(input.provider)
+      : input.availableModes.find(isUnattendedMode)?.id;
   return {
     modeId: resolveAndValidateCreateAgentMode({
       requestedMode: input.requestedMode,
@@ -92,7 +112,7 @@ export function resolveDefaultAgentCreateConfig(
       parent: input.parent,
       unattended: input.unattended,
       availableModes: availableModeIds,
-      targetUnattendedMode: input.availableModes?.find(isUnattendedMode)?.id,
+      targetUnattendedMode,
     }),
     featureValues: input.featureValues,
   };
