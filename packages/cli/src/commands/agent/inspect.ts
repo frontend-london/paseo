@@ -46,6 +46,7 @@ interface AgentInspect {
   }>;
   Worktree: string | null;
   ParentAgentId: string | null;
+  Labels: Record<string, string>;
 }
 
 /** Key-value row for table display */
@@ -151,6 +152,7 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     })),
     Worktree: snapshot.labels?.["paseo.worktree"] ?? null,
     ParentAgentId: snapshot.labels?.[PARENT_AGENT_ID_LABEL] ?? null,
+    Labels: snapshot.labels ?? {},
   };
 }
 
