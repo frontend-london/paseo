@@ -1523,6 +1523,20 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
 
+      const authMethods = spawned.initialize.authMethods ?? [];
+      if (authMethods.length > 0) {
+        try {
+          await this.runACPRequest(() =>
+            this.connection!.authenticate({ methodId: authMethods[0].id }),
+          );
+        } catch (error) {
+          this.logger.debug(
+            { err: error },
+            `ACP authenticate for method ${authMethods[0].id} failed, proceeding to session/new`,
+          );
+        }
+      }
+
       const response = await this.runACPRequest(() =>
         this.connection!.newSession({
           cwd: this.config.cwd,
@@ -1556,6 +1570,21 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.child = spawned.child;
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+
+      const authMethods = spawned.initialize.authMethods ?? [];
+      if (authMethods.length > 0) {
+        try {
+          await this.runACPRequest(() =>
+            this.connection!.authenticate({ methodId: authMethods[0].id }),
+          );
+        } catch (error) {
+          this.logger.debug(
+            { err: error },
+            `ACP authenticate for method ${authMethods[0].id} failed, proceeding to session/load`,
+          );
+        }
+      }
+
       this.sessionId = handle.sessionId;
       this.bootstrapThreadEventPending = true;
 
