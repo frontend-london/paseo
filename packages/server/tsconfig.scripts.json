@@ -19,6 +19,12 @@
     "declaration": false,
     "sourceMap": true
   },
-  "include": ["scripts/supervisor-entrypoint.ts", "scripts/dev-runner.ts", "scripts/supervisor.ts"],
+  "include": [
+    "scripts/supervisor-entrypoint.ts",
+    "scripts/dev-runner.ts",
+    "scripts/supervisor.ts",
+    "scripts/command-code-acp.ts",
+    "src/server/agent/providers/command-code-acp-bridge.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }
