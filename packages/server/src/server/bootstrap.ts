@@ -530,7 +530,6 @@ function resolveExpressTrustProxySetting(config: PaseoDaemonConfig): true | stri
   return config.trustedProxies ?? ["loopback"];
 }
 
-
 async function rehydrateResumableAgents(
   paseoHome: string,
   agentManager: AgentManager,

@@ -9581,7 +9581,6 @@ test("workspace.remove.request removes an orphaned workspace record without side
   });
 });
 
-
 test("workspace.remove.request rejects when the workspace has an active agent", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const workspace = createPersistedWorkspaceRecord({
@@ -9658,7 +9657,6 @@ test("workspace.remove.request rejects when the workspace has an active agent", 
     error: expect.stringContaining("active agents"),
   });
 });
-
 
 test("workspace.remove.request rejects when the workspace has a live terminal", async () => {
   const emitted: SessionOutboundMessage[] = [];

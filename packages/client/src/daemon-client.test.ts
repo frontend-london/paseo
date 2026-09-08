@@ -3278,7 +3278,6 @@ test("sends workspace.remove.request", async () => {
   await expect(removePromise).resolves.toBeUndefined();
 });
 
-
 test("sends workspace.remove.request and throws on rejection", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
@@ -3312,7 +3311,6 @@ test("sends workspace.remove.request and throws on rejection", async () => {
 
   await expect(removePromise).rejects.toThrow("Workspace has active agents");
 });
-
 
 test("sends worktree base-ref fields in create_paseo_worktree_request", async () => {
   const logger = createMockLogger();

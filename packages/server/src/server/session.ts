@@ -3335,7 +3335,6 @@ export class Session {
     }
   }
 
-
   private async handleWorkspaceRemoveRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.remove.request" }>,
   ): Promise<void> {

@@ -1600,7 +1600,6 @@ export class AgentManager {
     }
   }
 
-
   // Terminal `error` leaves provider/ACP/MCP children alive. Route through closeAgent.
   private closeAgentAfterTerminalError(agentId: string): void {
     const task = this.closeAgent(agentId).catch((error: unknown) => {
@@ -2513,9 +2512,9 @@ export class AgentManager {
     if (!shouldHoldBusyForReplacement) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
-    if (nextLifecycle === "error") {
-      this.closeAgentAfterTerminalError(mutableAgent.id);
-    }
+      if (nextLifecycle === "error") {
+        this.closeAgentAfterTerminalError(mutableAgent.id);
+      }
     }
   }
 

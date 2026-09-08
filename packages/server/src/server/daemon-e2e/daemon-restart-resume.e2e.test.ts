@@ -128,5 +128,4 @@ describe("daemon restart resume", () => {
       rmSync(paseoHomeRoot, { recursive: true, force: true });
     }
   }, 60_000);
-
 });
