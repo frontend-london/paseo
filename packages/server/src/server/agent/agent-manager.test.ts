@@ -1809,6 +1809,50 @@ test("normalizeConfig strips legacy 'default' model id", async () => {
   expect(snapshot.config.modeId).toBeUndefined();
 });
 
+test("normalizeConfig preserves provider-native model id 'default' (Cursor Auto)", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cursor-auto-default-"));
+  class CursorAutoClient extends TestAgentClient {
+    override async fetchCatalog() {
+      return {
+        models: [
+          {
+            provider: "cursor",
+            id: "default",
+            label: "Auto",
+            isDefault: true,
+          },
+          {
+            provider: "cursor",
+            id: "claude-opus-5",
+            label: "Claude Opus 5",
+            isDefault: false,
+          },
+        ],
+        modes: [],
+      };
+    }
+  }
+  const manager = new AgentManager({
+    clients: {
+      cursor: new CursorAutoClient("cursor"),
+    },
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000103",
+  });
+
+  const snapshot = await manager.createAgent(
+    {
+      provider: "cursor",
+      cwd: workdir,
+      model: "default",
+    },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  expect(snapshot.config.model).toBe("default");
+});
+
 test("listDraftCommands returns no commands without guessing a missing model", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-draft-commands-"));
   const storagePath = join(workdir, "agents");
