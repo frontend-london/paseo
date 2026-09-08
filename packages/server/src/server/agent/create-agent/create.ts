@@ -466,6 +466,14 @@ async function sendInitialPrompt(
     return { started: true, liveSnapshot };
   } catch (error) {
     if (resolved.promptFailure === "throw") {
+      try {
+        await dependencies.agentManager.archiveAgent(snapshot.id);
+      } catch (archiveError) {
+        dependencies.logger.warn(
+          { err: archiveError, agentId: snapshot.id },
+          "Failed to archive agent after initial prompt startup failure",
+        );
+      }
       throw error;
     }
     if (resolved.promptFailure === "return-error") {
