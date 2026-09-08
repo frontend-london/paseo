@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
 import {
   buildCommandCodeArgs,
   parseCommandCodeModels,
@@ -7,52 +8,59 @@ import {
 
 describe("Command Code ACP bridge", () => {
   test("parses the dynamic model catalog without headings and examples", () => {
-    expect(
-      parseCommandCodeModels(`Available models  ·  2 models
-
-OpenAI
-
-gpt-5.6-sol                            frontier model
-deepseek/deepseek-v4-flash             fast reasoning (default)
-
-Docs: https://example.test`),
-    ).toEqual([
+    const catalog = [
+      "Available models  ·  2 models",
+      "",
+      "OpenAI",
+      "",
+      "gpt-5.6-sol                            frontier model",
+      "deepseek/deepseek-v4-flash             fast reasoning (default)",
+      "",
+      "Docs: https://example.test",
+    ].join("\n");
+    assert.deepEqual(parseCommandCodeModels(catalog), [
       { id: "gpt-5.6-sol", description: "frontier model" },
       { id: "deepseek/deepseek-v4-flash", description: "fast reasoning (default)" },
     ]);
   });
 
-  test.each([
+  for (const [mode, expected] of [
     ["standard", []],
     ["auto-accept", ["--auto-accept"]],
     ["bypass", ["--yolo"]],
-  ] as const)("maps %s to exact unattended CLI flags", (mode, expected) => {
-    const args = buildCommandCodeArgs({ model: "gpt-5.6-sol", mode, prompt: "hello" });
-    expect(args).toContain("--tools-all");
-    expect(args).toContain("--skip-onboarding");
-    expect(args).toContain("--no-auto-update");
-    for (const flag of expected) expect(args).toContain(flag);
-  });
+  ] as const) {
+    test(`maps ${mode} to exact unattended CLI flags`, () => {
+      const args = buildCommandCodeArgs({ model: "gpt-5.6-sol", mode, prompt: "hello" });
+      assert.ok(args.includes("--tools-all"));
+      assert.ok(args.includes("--skip-onboarding"));
+      assert.ok(args.includes("--no-auto-update"));
+      for (const flag of expected) assert.ok(args.includes(flag));
+    });
+  }
 
   test("adds the native session id only on follow-up turns", () => {
     const args = buildCommandCodeArgs({
-        model: "gpt-5.6-sol",
-        mode: "bypass",
-        prompt: "next",
-        nativeSessionId: "native-1",
-      });
-    expect(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2)).toEqual([
+      model: "gpt-5.6-sol",
+      mode: "bypass",
+      prompt: "next",
+      nativeSessionId: "native-1",
+    });
+    assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), [
       "--session",
       "native-1",
     ]);
   });
 
   test("unwraps NDJSON events used for model verification and persistence", () => {
-    expect(
+    assert.deepEqual(
       unwrapCommandCodeEvent(
-        JSON.stringify({ type: "event", event: { type: "model_request_start", model: "gpt-5.6-sol" } }),
+        JSON.stringify({
+          type: "event",
+          event: { type: "model_request_start", model: "gpt-5.6-sol" },
+        }),
       ),
-    ).toEqual({ type: "model_request_start", model: "gpt-5.6-sol" });
-    expect(unwrapCommandCodeEvent("not-json")).toBeNull();
+      { type: "model_request_start", model: "gpt-5.6-sol" },
+    );
+    assert.equal(unwrapCommandCodeEvent("not-json"), null);
   });
 });
