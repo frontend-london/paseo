@@ -4930,6 +4930,26 @@ export class AgentManager {
     return this.applyProviderConfiguration(normalized);
   }
 
+  private async providerCatalogHasModelId(
+    config: AgentSessionConfig,
+    modelId: string,
+  ): Promise<boolean> {
+    const client = this.clients.get(config.provider);
+    if (!client) {
+      return false;
+    }
+    try {
+      const catalog = await client.fetchCatalog({
+        scope: "workspace",
+        cwd: config.cwd,
+        force: false,
+      });
+      return catalog.models.some((model) => model.id === modelId);
+    } catch {
+      return false;
+    }
+  }
+
   private applyProviderConfiguration(config: AgentSessionConfig): AgentSessionConfig {
     const definition = this.providerDefinitions.get(config.provider);
     if (config.providerOptions !== undefined && !definition?.validateOptions) {
