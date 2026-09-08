@@ -4748,7 +4748,17 @@ export class AgentManager {
 
     if (typeof normalized.model === "string") {
       const trimmed = normalized.model.trim();
-      normalized.model = trimmed.length > 0 && trimmed !== "default" ? trimmed : undefined;
+      if (trimmed.length === 0) {
+        normalized.model = undefined;
+      } else if (trimmed === "default") {
+        // Legacy callers used model "default" as "unspecified". Cursor Auto's
+        // real provider-native id is also "default". Preserve it when the
+        // provider catalog lists that id; otherwise treat as unspecified.
+        const catalogHasDefaultId = await this.providerCatalogHasModelId(normalized, "default");
+        normalized.model = catalogHasDefaultId ? "default" : undefined;
+      } else {
+        normalized.model = trimmed;
+      }
     }
 
     const shouldResolveDefaultModel = options.resolveDefaultModel ?? true;
@@ -4760,6 +4770,26 @@ export class AgentManager {
     }
 
     return this.applyProviderConfiguration(normalized);
+  }
+
+  private async providerCatalogHasModelId(
+    config: AgentSessionConfig,
+    modelId: string,
+  ): Promise<boolean> {
+    const client = this.clients.get(config.provider);
+    if (!client) {
+      return false;
+    }
+    try {
+      const catalog = await client.fetchCatalog({
+        scope: "workspace",
+        cwd: config.cwd,
+        force: false,
+      });
+      return catalog.models.some((model) => model.id === modelId);
+    } catch {
+      return false;
+    }
   }
 
   private applyProviderConfiguration(config: AgentSessionConfig): AgentSessionConfig {
