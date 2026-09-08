@@ -1,9 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import {
-  loadMcpServersConfigFile,
-  mergeMcpServers,
-  resolveAgentsMcpConfigPath,
-} from "../shared/mcp-config.ts";
+import { mergeMcpServers, resolveAgentsMcpConfigPath } from "../shared/mcp-config.ts";
+import { loadMcpServersConfigFile } from "./mcp-config-load.ts";
 
 /**
  * Inject Agents/Apify MCP servers into every agent.create via before hook.

@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-
 export type McpServerConfig =
   | {
       type: "stdio";
@@ -29,11 +27,9 @@ export function resolveAgentsMcpConfigPath(
   return raw.length > 0 ? raw : undefined;
 }
 
-export function loadMcpServersConfigFile(path: string): McpServersConfig {
-  const source = readFileSync(path, "utf8");
-  const parsed: unknown = JSON.parse(source);
+export function parseMcpServersConfig(parsed: unknown, sourceLabel: string): McpServersConfig {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`MCP config must be a JSON object: ${path}`);
+    throw new Error(`MCP config must be a JSON object: ${sourceLabel}`);
   }
   const out: McpServersConfig = {};
   for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
