@@ -1600,6 +1600,18 @@ export class AgentManager {
     }
   }
 
+
+  // Terminal `error` leaves provider/ACP/MCP children alive. Route through closeAgent.
+  private closeAgentAfterTerminalError(agentId: string): void {
+    const task = this.closeAgent(agentId).catch((error: unknown) => {
+      this.logger.warn(
+        { err: error, agentId },
+        "Failed to close agent runtime after terminal error",
+      );
+    });
+    this.trackBackgroundTask(task);
+  }
+
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
@@ -2501,6 +2513,9 @@ export class AgentManager {
     if (!shouldHoldBusyForReplacement) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
+    if (nextLifecycle === "error") {
+      this.closeAgentAfterTerminalError(mutableAgent.id);
+    }
     }
   }
 
@@ -4313,6 +4328,9 @@ export class AgentManager {
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
+      if (agent.lifecycle === "error") {
+        this.closeAgentAfterTerminalError(agent.id);
+      }
     }
   }
 
@@ -4888,7 +4906,17 @@ export class AgentManager {
 
     if (typeof normalized.model === "string") {
       const trimmed = normalized.model.trim();
-      normalized.model = trimmed.length > 0 && trimmed !== "default" ? trimmed : undefined;
+      if (trimmed.length === 0) {
+        normalized.model = undefined;
+      } else if (trimmed === "default") {
+        // Legacy callers used model "default" as "unspecified". Cursor Auto's
+        // real provider-native id is also "default". Preserve it when the
+        // provider catalog lists that id; otherwise treat as unspecified.
+        const catalogHasDefaultId = await this.providerCatalogHasModelId(normalized, "default");
+        normalized.model = catalogHasDefaultId ? "default" : undefined;
+      } else {
+        normalized.model = trimmed;
+      }
     }
 
     const shouldResolveDefaultModel = options.resolveDefaultModel ?? true;
