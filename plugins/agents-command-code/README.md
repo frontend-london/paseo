@@ -13,3 +13,15 @@ Migrates `agents/command-code` core files into a Paseo 0.8 plugin using
 paseo plugin install /absolute/path/to/plugins/agents-command-code
 paseo reload --json
 ```
+
+## Apify / Agents MCP injection
+
+Set one of:
+
+- `AGENTS_MCP_CONFIG`
+- `APIFY_MCP_CONFIG`
+- `PASEO_MCP_CONFIG`
+
+to a JSON file mapping MCP server names to configs (`stdio` / `http` / `sse`).
+The plugin merges them into every `agent.create` via `server.before("agent.create")`.
+No core CLI `--mcp-config` flag is required.

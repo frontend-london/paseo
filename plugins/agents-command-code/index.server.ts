@@ -2,10 +2,12 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { runAcpProvider } from "@getpaseo/plugin/server/acp";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { registerApifyMcpInjection } from "./server/apify-mcp-inject.ts";
 
 /**
- * Agents Command Code provider for Paseo 0.8 via runAcpProvider ACP shim.
- * Requires COMMAND_CODE_CLI_PATH in the daemon environment.
+ * Agents plugin for Paseo 0.8:
+ * - Command Code provider via runAcpProvider ACP shim
+ * - Apify/Agents MCP injection via before("agent.create")
  */
 export default function contribute(server: PluginServerContext) {
   const here = path.dirname(fileURLToPath(import.meta.url));
@@ -20,5 +22,8 @@ export default function contribute(server: PluginServerContext) {
     }),
   );
 
-  return () => {};
+  const disposeApify = registerApifyMcpInjection(server);
+  return () => {
+    disposeApify();
+  };
 }
