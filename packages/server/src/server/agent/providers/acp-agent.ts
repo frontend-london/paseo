@@ -106,6 +106,7 @@ import {
   resolveDefaultAgentCreateConfig,
 } from "../create-agent-mode.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import {
   checkProviderLaunchAvailable,
   createProviderEnvSpec,
@@ -442,6 +443,7 @@ interface ACPAgentClientOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  managedProcesses?: ManagedProcessRegistry;
   now?: () => number;
 }
 
@@ -476,6 +478,7 @@ interface ACPAgentSessionOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  managedProcesses?: ManagedProcessRegistry;
 }
 
 export interface SpawnedACPProcess {
@@ -905,6 +908,7 @@ export class ACPAgentClient implements AgentClient {
   private readonly importPromptCache = new Map<string, ACPImportPromptCacheEntry>();
   private readonly now: () => number;
   protected readonly terminateProcess: ProcessTerminator;
+  private readonly managedProcesses?: ManagedProcessRegistry;
 
   constructor(options: ACPAgentClientOptions) {
     this.provider = options.provider;
@@ -933,6 +937,7 @@ export class ACPAgentClient implements AgentClient {
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
     this.now = options.now ?? Date.now;
+    this.managedProcesses = options.managedProcesses;
   }
 
   async createSession(
@@ -965,6 +970,7 @@ export class ACPAgentClient implements AgentClient {
         extensionCommandsParser: this.extensionCommandsParser,
         waitForInitialCommands: this.waitForInitialCommands,
         initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+        managedProcesses: this.managedProcesses,
       },
     );
     await session.initializeNewSession();
@@ -1016,6 +1022,7 @@ export class ACPAgentClient implements AgentClient {
       extensionCommandsParser: this.extensionCommandsParser,
       waitForInitialCommands: this.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+      managedProcesses: this.managedProcesses,
     });
     await session.initializeResumedSession();
     return session;
@@ -1685,6 +1692,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
+  private readonly managedProcesses?: ManagedProcessRegistry;
+  private managedProcessRecordId: string | null = null;
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
@@ -1721,6 +1730,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
+    this.managedProcesses = options.managedProcesses;
   }
 
   get id(): string | null {
@@ -2450,6 +2460,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.child) {
       await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
     }
+    await this.removeManagedProcessRecord();
 
     this.subscribers.clear();
     this.connection = null;
@@ -2725,6 +2736,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       stderrChunks.push(chunk.toString());
     });
     child.once("exit", (code, signal) => {
+      void this.removeManagedProcessRecord();
       if (this.closed) {
         return;
       }
@@ -2761,7 +2773,51 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }),
     );
 
+    await this.recordManagedProcess(child, command, args);
     return { child, connection, initialize };
+  }
+
+  private async recordManagedProcess(
+    child: ChildProcessWithoutNullStreams,
+    command: string,
+    args: string[],
+  ): Promise<void> {
+    const pid = child.pid;
+    if (!this.managedProcesses || typeof pid !== "number" || pid <= 0) {
+      return;
+    }
+    try {
+      const record = await this.managedProcesses.record({
+        owner: { provider: this.provider, kind: "acp-agent" },
+        pid,
+        command,
+        args,
+        metadata: {
+          agentId: this.agentId ?? null,
+          sessionId: this.sessionId ?? null,
+          cwd: this.config.cwd,
+        },
+      });
+      this.managedProcessRecordId = record.id;
+    } catch (error) {
+      this.logger.warn(
+        { err: error, pid },
+        "Failed to record ACP agent process in the managed process ledger",
+      );
+    }
+  }
+
+  private async removeManagedProcessRecord(): Promise<void> {
+    const recordId = this.managedProcessRecordId;
+    this.managedProcessRecordId = null;
+    if (!recordId || !this.managedProcesses) {
+      return;
+    }
+    try {
+      await this.managedProcesses.remove(recordId);
+    } catch (error) {
+      this.logger.warn({ err: error, id: recordId }, "Failed to remove ACP agent process record");
+    }
   }
 
   private async runACPRequest<T>(request: () => Promise<T>): Promise<T> {
