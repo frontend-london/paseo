@@ -1,7 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { SpawnedACPProcess, SessionStateResponse } from "./acp-agent.js";
-import { CURSOR_FAST_FEATURE_OPTION, CursorACPAgentClient } from "./cursor-acp-agent.js";
+import {
+  CURSOR_AGENT_MODE_ID,
+  CURSOR_FAST_FEATURE_OPTION,
+  CursorACPAgentClient,
+  resolveCursorCreateConfig,
+} from "./cursor-acp-agent.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 
 describe("CursorACPAgentClient model discovery", () => {
@@ -172,5 +177,106 @@ describe("CursorACPAgentClient model discovery", () => {
         ],
       },
     ]);
+  });
+});
+
+describe("Cursor unattended auto_accept", () => {
+  const cursorModes = [
+    { id: "agent", label: "Agent" },
+    { id: "plan", label: "Plan" },
+    { id: "ask", label: "Ask" },
+  ];
+
+  test("maps agent mode to agent plus auto_accept (Agents bypass path)", () => {
+    const client = new CursorACPAgentClient({
+      logger: createTestLogger(),
+      command: ["cursor-agent", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "acp",
+        requestedMode: CURSOR_AGENT_MODE_ID,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: cursorModes,
+      }),
+    ).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("exported resolver keeps agent mode and enables auto_accept", () => {
+    expect(
+      resolveCursorCreateConfig({
+        provider: "acp",
+        requestedMode: "agent",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: cursorModes,
+      }),
+    ).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("does not enable auto_accept for plan or ask modes", () => {
+    expect(
+      resolveCursorCreateConfig({
+        provider: "acp",
+        requestedMode: "plan",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: cursorModes,
+      }),
+    ).toEqual({ modeId: "plan", featureValues: undefined });
+
+    expect(
+      resolveCursorCreateConfig({
+        provider: "acp",
+        requestedMode: "ask",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: cursorModes,
+      }),
+    ).toEqual({ modeId: "ask", featureValues: undefined });
+  });
+
+  test("unattended create without mode selects agent and auto_accept", () => {
+    expect(
+      resolveCursorCreateConfig({
+        provider: "acp",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: true,
+        availableModes: cursorModes,
+      }),
+    ).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: true },
+    });
+  });
+
+  test("preserves an explicit auto_accept=false override", () => {
+    expect(
+      resolveCursorCreateConfig({
+        provider: "acp",
+        requestedMode: "agent",
+        featureValues: { auto_accept: false },
+        parent: null,
+        unattended: false,
+        availableModes: cursorModes,
+      }),
+    ).toEqual({
+      modeId: "agent",
+      featureValues: { auto_accept: false },
+    });
   });
 });
