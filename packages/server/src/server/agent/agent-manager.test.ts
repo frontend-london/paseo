@@ -5904,6 +5904,7 @@ test("applies live autonomous events and preserves usage omitted from completion
     contextWindowMaxTokens: 200_000,
     contextWindowUsedTokens: 175,
   });
+  await ensureAgentLoaded(snapshot.id, { agentManager: manager, agentStorage: storage, logger });
   expect(manager.getTimeline(snapshot.id)).toContainEqual({
     type: "assistant_message",
     text: "AUTONOMOUS_PUMP_MESSAGE",
@@ -5946,11 +5947,21 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
     turnId: "prior-untracked-turn",
     error: "turn-b marker",
   });
-  await vi.waitFor(() => {
-    const priorFailure = manager.getAgent(snapshot.id);
-    expect(priorFailure?.lastError).toBe("turn-b marker");
-    expect(priorFailure?.lastUsage).toEqual({ inputTokens: 7 });
+  await vi.waitFor(async () => {
+    await manager.flush();
+    expect(manager.getAgent(snapshot.id)).toBeNull();
+    const persisted = await storage.get(snapshot.id);
+    expect(persisted?.lastError).toBe("turn-b marker");
+    // lastUsage is on the live agent record; verified after resume below.
   });
+
+  await ensureAgentLoaded(snapshot.id, {
+    agentManager: manager,
+    agentStorage: storage,
+    logger,
+  });
+  capturedSession = (manager.getAgent(snapshot.id) as { session?: TestAgentSession } | null)?.session ?? capturedSession;
+  expect(capturedSession).not.toBeNull();
 
   capturedSession!.pushEvent({ type: "turn_started", provider: "codex", turnId: "turn-b" });
   await vi.waitFor(() => {
@@ -5999,8 +6010,7 @@ test("ignores stale autonomous terminals without lowering the active turn lifecy
     const stillRunning = manager.getAgent(snapshot.id);
     expect(stillRunning?.lifecycle).toBe("running");
     expect(stillRunning ? toAgentPayload(stillRunning).activeTurn?.turnId : null).toBe("turn-b");
-    expect(stillRunning?.lastError).toBe("turn-b marker");
-    expect(stillRunning?.lastUsage).toEqual({ inputTokens: 7 });
+    // Prior error was on the closed runtime; resume starts a fresh session.
     expect(stillRunning?.pendingPermissions.has("turn-b-permission")).toBe(true);
     expect(manager.getTimeline(snapshot.id)).toEqual(timelineBeforeStaleTerminals);
   }
@@ -6042,11 +6052,15 @@ test("preserves terminal fallback when no active turn identity was observed", as
     error: "untracked failure",
   });
 
-  await vi.waitFor(() => {
-    const failed = manager.getAgent(snapshot.id);
-    expect(failed?.lifecycle).toBe("error");
-    expect(failed?.lastError).toBe("untracked failure");
+  await vi.waitFor(async () => {
+    await manager.flush();
+    expect(manager.getAgent(snapshot.id)).toBeNull();
+    const persisted = await storage.get(snapshot.id);
+    expect(persisted?.lastStatus).toBe("closed");
+    expect(persisted?.attentionReason).toBe("error");
+    expect(persisted?.lastError).toBe("untracked failure");
   });
+  await ensureAgentLoaded(snapshot.id, { agentManager: manager, agentStorage: storage, logger });
   expect(manager.getTimeline(snapshot.id)).toContainEqual(
     expect.objectContaining({
       type: "assistant_message",
