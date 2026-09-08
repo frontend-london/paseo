@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import type { AgentCapabilityFlags } from "../agent-sdk-types.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import { checkProviderLaunchAvailable, resolveProviderLaunch } from "../provider-launch-config.js";
 import {
   ACPAgentClient,

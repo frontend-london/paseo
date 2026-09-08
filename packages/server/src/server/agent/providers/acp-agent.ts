@@ -106,6 +106,7 @@ import {
   resolveDefaultAgentCreateConfig,
 } from "../create-agent-mode.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import {
   checkProviderLaunchAvailable,
   createProviderEnvSpec,
@@ -435,6 +436,7 @@ interface ACPAgentClientOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  managedProcesses?: ManagedProcessRegistry;
 }
 
 interface ACPAgentSessionOptions {
@@ -468,6 +470,7 @@ interface ACPAgentSessionOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  managedProcesses?: ManagedProcessRegistry;
 }
 
 export interface SpawnedACPProcess {
@@ -823,6 +826,7 @@ export class ACPAgentClient implements AgentClient {
   private readonly initialCommandsWaitTimeoutMs: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   protected readonly terminateProcess: ProcessTerminator;
+  private readonly managedProcesses?: ManagedProcessRegistry;
 
   constructor(options: ACPAgentClientOptions) {
     this.provider = options.provider;
@@ -850,6 +854,7 @@ export class ACPAgentClient implements AgentClient {
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
+    this.managedProcesses = options.managedProcesses;
   }
 
   async createSession(
@@ -882,6 +887,7 @@ export class ACPAgentClient implements AgentClient {
         extensionCommandsParser: this.extensionCommandsParser,
         waitForInitialCommands: this.waitForInitialCommands,
         initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+        managedProcesses: this.managedProcesses,
       },
     );
     await session.initializeNewSession();
@@ -933,6 +939,7 @@ export class ACPAgentClient implements AgentClient {
       extensionCommandsParser: this.extensionCommandsParser,
       waitForInitialCommands: this.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+      managedProcesses: this.managedProcesses,
     });
     await session.initializeResumedSession();
     return session;
@@ -1458,6 +1465,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
+  private readonly managedProcesses?: ManagedProcessRegistry;
+  private managedProcessRecordId: string | null = null;
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
@@ -1494,6 +1503,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
+    this.managedProcesses = options.managedProcesses;
   }
 
   get id(): string | null {
@@ -2223,6 +2233,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.child) {
       await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
     }
+    await this.removeManagedProcessRecord();
 
     this.subscribers.clear();
     this.connection = null;
@@ -2523,15 +2534,99 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     // close the process even when the ACP handshake itself rejects.
     this.child = child;
     this.connection = connection;
-    const initialize = await this.runACPRequest(() =>
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: buildACPClientCapabilities(
-          this.clientCapabilityMeta,
-          this.clientCapabilities,
-        ),
-        clientInfo: { name: "Paseo", version: "dev" },
-      }),
+    let initialize: InitializeResponse;
+    try {
+      initialize = await this.runACPRequest(() =>
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: buildACPClientCapabilities(
+            this.clientCapabilityMeta,
+            this.clientCapabilities,
+          ),
+          clientInfo: { name: "Paseo", version: "dev" },
+        }),
+      );
+    } catch (error) {
+      await terminateChildProcess(child, 2_000, this.terminateProcess);
+      throw error;
+    }
+
+    await this.recordManagedProcess(child, command, args);
+    return { child, connection, initialize };
+  }
+
+  private async recordManagedProcess(
+    child: ChildProcessWithoutNullStreams,
+    command: string,
+    args: string[],
+  ): Promise<void> {
+    const pid = child.pid;
+    if (!this.managedProcesses || typeof pid !== "number" || pid <= 0) {
+      return;
+    }
+    try {
+      const record = await this.managedProcesses.record({
+        owner: { provider: this.provider, kind: "acp-agent" },
+        pid,
+        command,
+        args,
+        metadata: {
+          agentId: this.agentId ?? null,
+          sessionId: this.sessionId ?? null,
+          cwd: this.config.cwd,
+        },
+      });
+      this.managedProcessRecordId = record.id;
+    } catch (error) {
+      this.logger.warn(
+        { err: error, pid },
+        "Failed to record ACP agent process in the managed process ledger",
+      );
+    }
+  }
+
+  private async removeManagedProcessRecord(): Promise<void> {
+    const recordId = this.managedProcessRecordId;
+    this.managedProcessRecordId = null;
+    if (!recordId || !this.managedProcesses) {
+      return;
+    }
+    try {
+      await this.managedProcesses.remove(recordId);
+    } catch (error) {
+      this.logger.warn({ err: error, id: recordId }, "Failed to remove ACP agent process record");
+    }
+  }
+
+  /**
+   * Reconcile session state with a process exit, expected or not. The child
+   * reference doubles as the generation guard: an exit event from a replaced
+   * process must not tear down the current one.
+   */
+  private handleProcessExit(
+    child: ChildProcessWithoutNullStreams,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    stderrChunks: string[],
+  ): void {
+    if (this.child !== child) {
+      return;
+    }
+
+    const expected = this.closed || this.processState === "stopping";
+    this.processState = "dead";
+    this.processExit = { code, signal, at: Date.now() };
+    this.child = null;
+    this.connection = null;
+    void this.removeManagedProcessRecord();
+
+    if (expected) {
+      return;
+    }
+
+    this.logger.warn(
+      { agentId: this.agentId, sessionId: this.sessionId, exitCode: code, signal },
+      "ACP agent process exited unexpectedly",
     );
 
     return { child, connection, initialize };
