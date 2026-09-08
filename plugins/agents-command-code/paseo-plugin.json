@@ -1,6 +1,5 @@
 {
   "id": "agents-command-code",
-  "name": "Agents Command Code",
   "requirements": {
     "paseo": ">=0.8.0-beta.1"
   }
