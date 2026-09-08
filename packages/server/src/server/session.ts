@@ -28,6 +28,7 @@ import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
 } from "../terminal/terminal-manager.js";
+import type { TerminalSession } from "../terminal/terminal.js";
 import { TerminalSessionController } from "../terminal/terminal-session-controller.js";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { BinaryFrame } from "@getpaseo/protocol/binary-frames/index";
@@ -617,6 +618,7 @@ interface WorkspaceUpdateOptions {
   dedupeGitState?: boolean;
   removedProjectId?: string;
   optimisticStatus?: WorkspaceDescriptorPayload["status"];
+  forceRemove?: boolean;
 }
 
 function resolveDirectorySync(service: DirectorySyncService | undefined): DirectorySyncService {
@@ -2566,6 +2568,8 @@ export class Session {
         return this.handleArchiveWorkspaceRequest(msg);
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
+      case "workspace.remove.request":
+        return this.handleWorkspaceRemoveRequest(msg);
       case "workspace.create.request":
         return this.handleWorkspaceCreateRequest(msg);
       case "workspace.clear_attention.request":
@@ -3329,6 +3333,139 @@ export class Session {
         },
       });
     }
+  }
+
+
+  private async handleWorkspaceRemoveRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.remove.request" }>,
+  ): Promise<void> {
+    const { workspaceId, requestId } = request;
+    this.sessionLogger.info({ workspaceId, requestId }, "session: workspace.remove.request");
+
+    try {
+      const workspace = await this.workspaceRegistry.get(workspaceId);
+      if (!workspace) {
+        this.emit({
+          type: "workspace.remove.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            error: `Workspace not found: ${workspaceId}`,
+          },
+        });
+        return;
+      }
+
+      const liveAgents = await this.findLiveAgentsForWorkspace(workspaceId);
+      if (liveAgents.length > 0) {
+        this.emit({
+          type: "workspace.remove.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            error: `Workspace has active agents: ${liveAgents.map((agent) => agent.id).join(", ")}`,
+          },
+        });
+        return;
+      }
+
+      const liveTerminals = await this.findLiveTerminalsForWorkspace(workspaceId);
+      if (liveTerminals.length > 0) {
+        this.emit({
+          type: "workspace.remove.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            error: `Workspace has active terminals: ${liveTerminals.map((terminal) => terminal.id).join(", ")}`,
+          },
+        });
+        return;
+      }
+
+      if (this.scriptRuntimeStore) {
+        const runningScripts = this.scriptRuntimeStore
+          .listForWorkspace(workspaceId)
+          .filter((entry) => entry.lifecycle === "running");
+        if (runningScripts.length > 0) {
+          this.emit({
+            type: "workspace.remove.response",
+            payload: {
+              requestId,
+              workspaceId,
+              accepted: false,
+              error: `Workspace has running scripts: ${runningScripts
+                .map((entry) => entry.scriptName)
+                .join(", ")}`,
+            },
+          });
+          return;
+        }
+      }
+
+      await this.workspaceRegistry.remove(workspaceId);
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], { forceRemove: true });
+
+      this.emit({
+        type: "workspace.remove.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: true,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, workspaceId, requestId },
+        "session: workspace.remove.request error",
+      );
+      this.emit({
+        type: "workspace.remove.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          error: getErrorMessageOr(error, "Failed to remove workspace"),
+        },
+      });
+    }
+  }
+
+  private async findLiveAgentsForWorkspace(workspaceId: string): Promise<StoredAgentRecord[]> {
+    const persistedAgents = await this.agentStorage.listByWorkspace(workspaceId);
+    const nonArchivedPersisted = persistedAgents.filter((agent) => !agent.archivedAt);
+
+    const inMemoryAgents = this.agentManager
+      .listAgents()
+      .filter((agent) => agent.workspaceId === workspaceId && agent.lifecycle !== "closed");
+
+    const liveById = new Map<string, StoredAgentRecord>();
+    for (const agent of nonArchivedPersisted) {
+      liveById.set(agent.id, agent);
+    }
+    for (const agent of inMemoryAgents) {
+      const stored = await this.agentStorage.get(agent.id);
+      if (stored) {
+        liveById.set(agent.id, stored);
+      }
+    }
+
+    return Array.from(liveById.values());
+  }
+
+  private async findLiveTerminalsForWorkspace(workspaceId: string): Promise<TerminalSession[]> {
+    if (!this.terminalManager) {
+      return [];
+    }
+
+    const directories = this.terminalManager.listDirectories();
+    const terminalsByDirectory = await Promise.all(
+      directories.map((cwd) => this.terminalManager!.getTerminals(cwd, { workspaceId })),
+    );
+    return terminalsByDirectory.flat();
   }
 
   private async handleWorkspaceTitleSetRequest(
@@ -5445,7 +5582,7 @@ export class Session {
       }
       this.workspaceGitObserver.recordDescriptorState(workspaceId, nextWorkspace);
       if (!nextWorkspace) {
-        if (this.shouldSkipWorkspaceRemoval(lastEmitted, options?.removedProjectId)) {
+        if (this.shouldSkipWorkspaceRemoval(lastEmitted, options)) {
           continue;
         }
         if (this.workspaceUpdatesSubscription !== subscription) {
@@ -5499,8 +5636,12 @@ export class Session {
 
   private shouldSkipWorkspaceRemoval(
     lastEmitted: WorkspaceUpdatePayload | undefined,
-    removedProjectId: string | undefined,
+    options: WorkspaceUpdateOptions | undefined,
   ): boolean {
+    if (options?.forceRemove) {
+      return false;
+    }
+    const removedProjectId = options?.removedProjectId;
     if (lastEmitted?.kind === "remove") {
       return !removedProjectId || lastEmitted.removedProjectId === removedProjectId;
     }
