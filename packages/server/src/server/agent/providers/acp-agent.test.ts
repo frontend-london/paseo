@@ -817,6 +817,40 @@ describe("deriveModesFromACP", () => {
     });
   });
 
+  test("preserves fallback unattended metadata on config-option ACP modes", () => {
+    const result = deriveModesFromACP(
+      [{ id: "auto-high", label: "Auto High", isUnattended: true }],
+      null,
+      [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: "auto-high",
+          options: [
+            { value: "normal", name: "Normal" },
+            { value: "auto-high", name: "Auto High" },
+          ],
+        },
+      ],
+    );
+
+    expect(result).toEqual({
+      modes: [
+        { id: "normal", label: "Normal", description: undefined },
+        {
+          id: "auto-high",
+          label: "Auto High",
+          description: undefined,
+          isUnattended: true,
+        },
+      ],
+      currentModeId: "auto-high",
+      source: "config",
+    });
+  });
+
   test("returns an empty mode list when fallback modes are empty and config only exposes thought levels", () => {
     const result = deriveModesFromACP([], null, [
       {
