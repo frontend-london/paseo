@@ -758,6 +758,36 @@ describe("deriveModesFromACP", () => {
     });
   });
 
+  test("preserves fallback unattended metadata on dynamically reported ACP modes", () => {
+    const result = deriveModesFromACP(
+      [{ id: "auto-high", label: "Auto High", isUnattended: true }],
+      {
+        availableModes: [
+          {
+            id: "auto-high",
+            name: "Auto High",
+            description: "Auto-approve all actions",
+          },
+        ],
+        currentModeId: "auto-high",
+      },
+      [],
+    );
+
+    expect(result).toEqual({
+      modes: [
+        {
+          id: "auto-high",
+          label: "Auto High",
+          description: "Auto-approve all actions",
+          isUnattended: true,
+        },
+      ],
+      currentModeId: "auto-high",
+      source: "legacy",
+    });
+  });
+
   test("falls back to config options when explicit mode state is absent", () => {
     const result = deriveModesFromACP([{ id: "fallback", label: "Fallback" }], null, [
       {
@@ -1991,6 +2021,28 @@ describe("ACPAgentClient config features", () => {
     ).toEqual({
       modeId: undefined,
       featureValues: { provider_feature: "kept", auto_accept: true },
+    });
+  });
+
+  test("enables Auto Accept when an explicit ACP mode is marked unattended", () => {
+    const client = new ACPAgentClient({
+      provider: "generic-acp",
+      logger: createTestLogger(),
+      defaultCommand: ["generic-acp", "acp"],
+    });
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "generic-acp",
+        requestedMode: "auto-high",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [{ id: "auto-high", label: "Auto High", isUnattended: true }],
+      }),
+    ).toEqual({
+      modeId: "auto-high",
+      featureValues: { auto_accept: true },
     });
   });
 
