@@ -86,6 +86,7 @@ describe("ACP provider catalog", () => {
 
     expect(droidPatch.providers?.["factory-droid"]?.params).toEqual({
       supportsMcpServers: false,
+      unattendedModeIds: ["auto-high"],
     });
   });
 });
