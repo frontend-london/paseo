@@ -692,7 +692,9 @@ export function resolveACPModelSelection({
 
 function mergeACPModeWithFallback(mode: AgentMode, fallbackModes: AgentMode[]): AgentMode {
   const fallback = fallbackModes.find((candidate) => candidate.id === mode.id);
-  return fallback ? { ...fallback, ...mode } : mode;
+  return fallback?.isUnattended === undefined
+    ? mode
+    : { ...mode, isUnattended: fallback.isUnattended };
 }
 
 export function deriveModesFromACP(
