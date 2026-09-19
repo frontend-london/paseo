@@ -89,6 +89,7 @@ describe("run feature transport", () => {
   });
 
   it("passes features to the structured-output agent creation", async () => {
+    process.env.PASEO_AGENT_ID = "parent-agent";
     const createAgent = vi.fn().mockResolvedValue({
       id: "agent-1",
       status: "running",
