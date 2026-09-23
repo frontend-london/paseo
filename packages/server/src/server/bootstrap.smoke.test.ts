@@ -9,6 +9,8 @@ import { WebSocket } from "ws";
 import { createPaseoDaemon, parseListenString, type PaseoDaemonConfig } from "./bootstrap.js";
 import { loadConfig } from "./config.js";
 import { AgentManagerShuttingDownError } from "./agent/agent-manager.js";
+import type { ManagedAgent } from "./agent/agent-manager.js";
+import { writeAgentResumeLedger } from "./agent/agent-resume-ledger.js";
 import { hashDaemonPassword } from "./auth.js";
 import { generateLocalPairingOffer } from "./pairing-offer.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
@@ -76,6 +78,99 @@ describe("paseo daemon bootstrap", () => {
       expect(typeof payload.timestamp).toBe("string");
     } finally {
       await daemonHandle.close();
+    }
+  });
+
+  test("accepts websocket connections after one persisted agent resume times out", async () => {
+    const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-rehydrate-timeout-"));
+    const paseoHome = path.join(paseoHomeRoot, ".paseo");
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    await mkdir(paseoHome, { recursive: true });
+    const logEntries: Array<Record<string, unknown>> = [];
+    const logger = pino(
+      { level: "info" },
+      {
+        write(line: string) {
+          logEntries.push(JSON.parse(line) as Record<string, unknown>);
+        },
+      },
+    );
+    const config: PaseoDaemonConfig = {
+      listen: "127.0.0.1:0",
+      paseoHome,
+      corsAllowedOrigins: [],
+      hostnames: true,
+      mcpEnabled: false,
+      staticDir,
+      mcpDebug: false,
+      agentClients: createTestAgentClients(),
+      agentStoragePath: path.join(paseoHome, "agents"),
+      relayEnabled: false,
+      agentRehydrationTimeoutMs: 25,
+    };
+    const daemon = await createPaseoDaemon(config, logger);
+    const stalledAgentId = "stalled-agent";
+    const resumedAgentId = "resumed-agent";
+    const now = new Date().toISOString();
+
+    for (const agentId of [stalledAgentId, resumedAgentId]) {
+      await daemon.agentStorage.upsert({
+        id: agentId,
+        provider: "codex",
+        cwd: "/tmp/project",
+        createdAt: now,
+        updatedAt: now,
+        labels: {},
+        lastStatus: "idle",
+        persistence: { provider: "codex", sessionId: agentId },
+      });
+    }
+    await writeAgentResumeLedger(paseoHome, [stalledAgentId, resumedAgentId]);
+
+    vi.spyOn(daemon.agentManager, "resumeAgentFromPersistence").mockImplementation(
+      async (handle) => {
+        if (handle.sessionId === stalledAgentId) {
+          return await new Promise<ManagedAgent>(() => {});
+        }
+        return {} as ManagedAgent;
+      },
+    );
+
+    let client: DaemonClient | null = null;
+    try {
+      await daemon.start();
+      const target = daemon.getListenTarget();
+      if (!target || target.type !== "tcp") throw new Error("Expected a TCP listener");
+      client = new DaemonClient({
+        url: `ws://127.0.0.1:${target.port}/ws`,
+        appVersion: "0.4.0",
+      });
+      await client.connect();
+
+      expect(await daemon.agentStorage.get(stalledAgentId)).not.toBeNull();
+      expect(await daemon.agentStorage.get(resumedAgentId)).not.toBeNull();
+      expect(logEntries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            agentId: resumedAgentId,
+            msg: "Resumed agent after daemon restart",
+          }),
+          expect.objectContaining({
+            agentId: stalledAgentId,
+            msg: "Failed to resume agent after daemon restart",
+            err: expect.objectContaining({
+              message: expect.stringContaining("Timed out after 25ms"),
+            }),
+          }),
+        ]),
+      );
+    } finally {
+      client?.close();
+      await daemon.stop().catch(() => undefined);
+      await Promise.all([
+        rm(paseoHomeRoot, { recursive: true, force: true }),
+        rm(staticDir, { recursive: true, force: true }),
+      ]);
     }
   });
 

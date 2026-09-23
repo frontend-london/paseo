@@ -173,6 +173,7 @@ import { createConfiguredTerminalManager } from "../terminal/terminal-manager-fa
 import { applyTerminalAgentHookSetting } from "../terminal/agent-hooks/terminal-agent-hook-setting.js";
 import { loadOrCreateDaemonKeyPair } from "./daemon-keypair.js";
 import { createRelayRuntime, type RelayRuntime } from "./relay-runtime.js";
+import { withTimeout } from "../utils/promise-timeout.js";
 import type { PushNotificationSender } from "./push/index.js";
 import { getOrCreateServerId } from "./server-id.js";
 import { resolveDaemonVersion } from "./daemon-version.js";
@@ -233,6 +234,7 @@ import {
 import { DaemonExecutions } from "./hub/daemon-executions.js";
 import { PluginService } from "./plugins/index.js";
 
+const DEFAULT_AGENT_REHYDRATION_TIMEOUT_MS = 30_000;
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
 const DOWNLOAD_OPEN_FLAGS =
@@ -447,6 +449,7 @@ export interface PaseoDaemonConfig {
   downloadTokenTtlMs?: number;
   agentProviderSettings?: AgentProviderRuntimeSettingsMap;
   providerCatalogRefreshTimeoutMs?: number;
+  agentRehydrationTimeoutMs?: number;
   metadataGeneration?: {
     providers?: Array<{
       provider: string;
@@ -579,6 +582,7 @@ async function rehydrateResumableAgents(
   agentManager: AgentManager,
   agentStorage: AgentStorage,
   logger: Logger,
+  timeoutMs: number,
 ): Promise<void> {
   const resumeAgentIds = await readAgentResumeLedger(paseoHome);
   if (!resumeAgentIds || resumeAgentIds.length === 0) {
@@ -616,13 +620,22 @@ async function rehydrateResumableAgents(
 
         const overrides = buildConfigOverrides(record);
         const timestamps = extractTimestamps(record);
-        await agentManager.resumeAgentFromPersistence(handle, overrides ?? undefined, agentId, {
-          createdAt: timestamps.createdAt,
-          updatedAt: timestamps.updatedAt,
-          lastUserMessageAt: timestamps.lastUserMessageAt,
-          labels: timestamps.labels,
-          workspaceId: timestamps.workspaceId,
-          owner: timestamps.owner,
+        await withTimeout({
+          promise: agentManager.resumeAgentFromPersistence(
+            handle,
+            overrides ?? undefined,
+            agentId,
+            {
+              createdAt: timestamps.createdAt,
+              updatedAt: timestamps.updatedAt,
+              lastUserMessageAt: timestamps.lastUserMessageAt,
+              labels: timestamps.labels,
+              workspaceId: timestamps.workspaceId,
+              owner: timestamps.owner,
+            },
+          ),
+          timeoutMs,
+          label: `resume agent ${agentId} after daemon restart`,
         });
         logger.info({ agentId }, "Resumed agent after daemon restart");
       } catch (error) {
@@ -1721,7 +1734,13 @@ export async function createPaseoDaemon(
             );
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
-            await rehydrateResumableAgents(config.paseoHome, agentManager, agentStorage, logger);
+            await rehydrateResumableAgents(
+              config.paseoHome,
+              agentManager,
+              agentStorage,
+              logger,
+              config.agentRehydrationTimeoutMs ?? DEFAULT_AGENT_REHYDRATION_TIMEOUT_MS,
+            );
             wsServer.beginAcceptingConnections();
             relayRuntime = createRelayRuntime({
               config: {
