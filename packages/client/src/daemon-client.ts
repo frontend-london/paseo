@@ -374,6 +374,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   // create-agent worktree field. Added in v0.2.0; remove after 2027-01-17.
   worktreeName?: string;
   requestId?: string;
+  idempotencyKey?: string;
   labels?: Record<string, string>;
 }
 
@@ -2502,6 +2503,7 @@ export class DaemonClient {
       ...(options.worktree ? { worktree: options.worktree } : {}),
       ...(options.autoArchive !== undefined ? { autoArchive: options.autoArchive } : {}),
       ...(options.worktreeName ? { worktreeName: options.worktreeName } : {}),
+      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
       ...(options.labels && Object.keys(options.labels).length > 0
         ? { labels: options.labels }
         : {}),

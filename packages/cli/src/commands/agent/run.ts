@@ -88,6 +88,7 @@ export function addRunOptions(cmd: Command): Command {
         "--output-schema <schema>",
         "Output JSON matching the provided schema file path or inline JSON schema",
       )
+      .option("--idempotency-key <key>", "Unique key to ensure idempotent agent creation")
   );
 }
 
@@ -138,6 +139,7 @@ export interface AgentRunOptions extends CommandOptions {
   label?: string[];
   waitTimeout?: string;
   outputSchema?: string;
+  idempotencyKey?: string;
 }
 
 function resolveNewWorkspaceKind(options: AgentRunOptions): string | undefined {
@@ -678,6 +680,7 @@ export async function runRunCommand(
             outputSchema,
             images,
             env: requestEnv,
+            idempotencyKey: options.idempotencyKey,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
           });
         } else {
@@ -749,6 +752,7 @@ export async function runRunCommand(
       initialPrompt: prompt,
       images,
       env: requestEnv,
+      idempotencyKey: options.idempotencyKey,
       labels: Object.keys(labels).length > 0 ? labels : undefined,
     });
 

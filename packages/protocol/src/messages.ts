@@ -1608,6 +1608,7 @@ export const CreateAgentRequestMessageSchema = z.object({
   worktree: CreateAgentWorktreeTargetSchema.optional(),
   autoArchive: z.boolean().optional(),
   labels: z.record(z.string(), z.string()).default({}),
+  idempotencyKey: z.string().min(1).optional(),
   requestId: z.string(),
 });
 

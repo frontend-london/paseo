@@ -220,6 +220,7 @@ import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
 } from "./agent/create-agent/create.js";
+import { CreateAgentDedupeRegistry } from "./agent/create-agent/create-agent-dedupe.js";
 import { archiveAgentCommand, cancelAgentRunCommand } from "./agent/lifecycle-command.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import {
@@ -1214,9 +1215,16 @@ export async function createPaseoDaemon(
     );
   };
 
+  const sharedCreateAgentDedupeRegistry = new CreateAgentDedupeRegistry({
+    agentManager,
+    agentStorage,
+    logger,
+  });
+
   const createAgentCommandDependencies: CreateAgentCommandDependencies = {
     agentManager,
     agentStorage,
+    createAgentDedupeRegistry: sharedCreateAgentDedupeRegistry,
     logger,
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
@@ -1438,6 +1446,7 @@ export async function createPaseoDaemon(
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
     ensureWorkspaceForCreate: createAgentCommandDependencies.ensureWorkspaceForCreate,
     createPaseoWorktree: createAgentCommandDependencies.createPaseoWorktree,
+    createAgentDedupeRegistry: sharedCreateAgentDedupeRegistry,
     browserToolsEnabled: browserToolsPolicy.isEnabled(),
     browserToolsBroker,
     paseoHome: config.paseoHome,

@@ -88,6 +88,10 @@ import type {
   ManagedAgent,
 } from "./agent/agent-manager.js";
 import { createAgentCommand } from "./agent/create-agent/create.js";
+import {
+  CreateAgentDedupeRegistry,
+  type ExecuteWithDedupeContext,
+} from "./agent/create-agent/create-agent-dedupe.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
@@ -451,6 +455,7 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
+  createAgentDedupeRegistry?: CreateAgentDedupeRegistry;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
   directorySync?: DirectorySyncService;
@@ -605,6 +610,22 @@ interface WorkspaceUpdateOptions {
   optimisticStatus?: WorkspaceDescriptorPayload["status"];
 }
 
+function resolveCreateAgentDedupeRegistry(
+  registry: CreateAgentDedupeRegistry | undefined,
+  agentManager: AgentManager,
+  agentStorage: AgentStorage,
+  logger: pino.Logger,
+): CreateAgentDedupeRegistry {
+  return (
+    registry ??
+    new CreateAgentDedupeRegistry({
+      agentManager,
+      agentStorage,
+      logger,
+    })
+  );
+}
+
 function resolveDirectorySync(service: DirectorySyncService | undefined): DirectorySyncService {
   return service ?? new DirectorySyncService();
 }
@@ -736,6 +757,7 @@ export class Session {
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private readonly createAgentDedupeRegistry: CreateAgentDedupeRegistry;
 
   constructor(options: SessionOptions) {
     const {
@@ -1026,6 +1048,12 @@ export class Session {
         this.terminalController.killTerminalsForWorkspace(workspaceId),
       logger: this.sessionLogger,
     });
+    this.createAgentDedupeRegistry = resolveCreateAgentDedupeRegistry(
+      options.createAgentDedupeRegistry,
+      this.agentManager,
+      this.agentStorage,
+      this.sessionLogger,
+    );
     this.providerSnapshotManager = providerSnapshotManager;
     this.serviceProxy = serviceProxy ?? null;
     this.scriptRuntimeStore = scriptRuntimeStore ?? null;
@@ -3404,118 +3432,192 @@ export class Session {
       images,
       attachments,
       env,
+      idempotencyKey,
     } = msg;
     this.sessionLogger.info(
-      { cwd: config.cwd, provider: config.provider, worktreeName },
+      { cwd: config.cwd, provider: config.provider, worktreeName, idempotencyKey },
       `Creating agent in ${config.cwd} (${config.provider})${
         worktreeName ? ` with worktree ${worktreeName}` : ""
-      }`,
+      }${idempotencyKey ? ` [idempotencyKey=${idempotencyKey}]` : ""}`,
     );
 
-    let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
-    let createdAgentId: string | null = null;
-    try {
-      const requestedCwd = resolve(config.cwd);
-      const needsRequestedDirectory =
-        Boolean(worktreeName || git || worktree) || (!msg.workspaceId && !msg.callerAgentId);
-      if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
-        throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
-      }
-      const trimmedPrompt = initialPrompt?.trim();
-      const { provisionalTitle } = resolveCreateAgentTitles({
-        configTitle: config.title,
-        initialPrompt: trimmedPrompt,
-      });
+    const normalizedKey = idempotencyKey?.trim() || "";
 
-      const firstAgentContext: FirstAgentContext = {
-        ...(trimmedPrompt ? { prompt: trimmedPrompt } : {}),
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-      };
-      const workspacePromptTitle = resolveFirstAgentPromptTitle(firstAgentContext);
-      const createdWorktree = await this.createAgentLifecycleDispatch.createWorktreeForRequest({
-        cwd: config.cwd,
-        target: worktree,
-        firstAgentContext,
-        hasLegacyGitOptions: Boolean(git),
-      });
-      createdWorktreeForCleanup = createdWorktree;
-      const resolvedIntent = await this.resolveSessionCreateAgentIntent({
-        request: msg,
-        createdWorktree,
-        workspacePromptTitle,
-      });
-      const resolvedCwd = resolve(resolvedIntent.config.cwd);
-      if (!(await this.filesystem.isDirectory(resolvedCwd))) {
-        throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
-      }
+    const executeCreation = async (ctx: ExecuteWithDedupeContext) => {
+      let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
+      let createdAgentId: string | null = null;
+      try {
+        const requestedCwd = resolve(config.cwd);
+        const needsRequestedDirectory =
+          Boolean(worktreeName || git || worktree) || (!msg.workspaceId && !msg.callerAgentId);
+        if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
+          throw new Error(
+            `Working directory does not exist or is not a directory: ${requestedCwd}`,
+          );
+        }
+        const trimmedPrompt = initialPrompt?.trim();
+        const { provisionalTitle } = resolveCreateAgentTitles({
+          configTitle: config.title,
+          initialPrompt: trimmedPrompt,
+        });
 
-      const { snapshot, liveSnapshot } = await createAgentCommand(
-        {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-          paseoHome: this.paseoHome,
-          worktreesRoot: this.worktreesRoot,
-          providerSnapshotManager: this.providerSnapshotManager,
-        },
-        {
-          kind: "session",
-          config: resolvedIntent.config,
-          workspaceId: resolvedIntent.intent.workspaceId,
-          worktreeName,
-          initialPrompt,
-          clientMessageId,
-          outputSchema,
-          images,
-          attachments,
-          git,
-          labels: resolvedIntent.intent.labels,
-          env,
-          provisionalTitle,
+        const firstAgentContext: FirstAgentContext = {
+          ...(trimmedPrompt ? { prompt: trimmedPrompt } : {}),
+          ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        };
+        const workspacePromptTitle = resolveFirstAgentPromptTitle(firstAgentContext);
+        const createdWorktree = await this.createAgentLifecycleDispatch.createWorktreeForRequest({
+          cwd: config.cwd,
+          target: worktree,
           firstAgentContext,
-          buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
-            this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
-        },
-      );
-      createdAgentId = snapshot.id;
-      await this.agentUpdates.forwardLiveAgent(snapshot);
-      if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
-        this.workspaceAutoName.scheduleForDirectory(
+          hasLegacyGitOptions: Boolean(git),
+        });
+        createdWorktreeForCleanup = createdWorktree;
+        const effectiveWorkspaceId = msg.workspaceId ?? ctx.provisionedWorkspaceId;
+        const effectiveMsg = effectiveWorkspaceId
+          ? { ...msg, workspaceId: effectiveWorkspaceId }
+          : msg;
+        const resolvedIntent = await this.resolveSessionCreateAgentIntent({
+          request: effectiveMsg,
+          createdWorktree,
+          workspacePromptTitle,
+        });
+        ctx.setProvisionedWorkspaceId(resolvedIntent.intent.workspaceId);
+        const resolvedCwd = resolve(resolvedIntent.config.cwd);
+        if (!(await this.filesystem.isDirectory(resolvedCwd))) {
+          throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
+        }
+
+        const { snapshot, liveSnapshot } = await createAgentCommand(
           {
-            workspaceId: resolvedIntent.intent.workspaceId,
-            cwd: resolvedIntent.config.cwd,
-            firstAgentContext,
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+            paseoHome: this.paseoHome,
+            worktreesRoot: this.worktreesRoot,
+            providerSnapshotManager: this.providerSnapshotManager,
           },
-          { currentSelection: this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd) },
+          {
+            kind: "session",
+            config: resolvedIntent.config,
+            workspaceId: resolvedIntent.intent.workspaceId,
+            worktreeName,
+            initialPrompt,
+            clientMessageId,
+            outputSchema,
+            images,
+            attachments,
+            git,
+            labels: resolvedIntent.intent.labels,
+            env,
+            provisionalTitle,
+            firstAgentContext,
+            buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctxConfig) =>
+              this.buildAgentSessionConfig(
+                sessionConfig,
+                gitOptions,
+                legacyWorktreeName,
+                ctxConfig,
+              ),
+          },
         );
+        createdAgentId = snapshot.id;
+        ctx.setCreatedAgentId(snapshot.id);
+        await this.agentUpdates.forwardLiveAgent(snapshot);
+        if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
+          this.workspaceAutoName.scheduleForDirectory(
+            {
+              workspaceId: resolvedIntent.intent.workspaceId,
+              cwd: resolvedIntent.config.cwd,
+              firstAgentContext,
+            },
+            { currentSelection: this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd) },
+          );
+        }
+        this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
+          autoArchive,
+          agentId: snapshot.id,
+          createdWorktree,
+        });
+
+        this.sessionLogger.info(
+          { agentId: snapshot.id, provider: snapshot.provider },
+          `Created agent ${snapshot.id} (${snapshot.provider})`,
+        );
+
+        return {
+          agentId: snapshot.id,
+          workspaceId: resolvedIntent.intent.workspaceId,
+          result: {
+            liveSnapshot: liveSnapshot as ManagedAgent | null,
+            storedRecord: null as StoredAgentRecord | null,
+          },
+        };
+      } catch (error) {
+        await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
+          createdWorktree: createdWorktreeForCleanup,
+          createdAgentId,
+        });
+        throw error;
       }
-      this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
-        autoArchive,
-        agentId: snapshot.id,
-        createdWorktree,
+    };
+
+    try {
+      const outcome = await this.createAgentDedupeRegistry.execute({
+        idempotencyKey: normalizedKey,
+        execute: executeCreation,
+        onSuccessReturnExisting: async (agentId: string) => {
+          const live = this.agentManager.getAgent(agentId);
+          if (live) {
+            return {
+              liveSnapshot: live,
+              storedRecord: null,
+            };
+          }
+          const stored = await this.agentStorage.get(agentId);
+          if (stored) {
+            return {
+              liveSnapshot: null,
+              storedRecord: stored,
+            };
+          }
+          return null;
+        },
+        cleanupFailedAgent: async (agentId: string) => {
+          await this.agentManager.deleteAgentState(agentId).catch(() => undefined);
+        },
       });
+
       if (requestId) {
-        const agentPayload = await this.buildAgentPayload(liveSnapshot);
+        let agentPayload: AgentSnapshotPayload;
+        if (outcome.result.liveSnapshot) {
+          const live = this.agentManager.getAgent(outcome.agentId) ?? outcome.result.liveSnapshot;
+          agentPayload = await this.buildAgentPayload(live);
+        } else if (outcome.result.storedRecord) {
+          agentPayload = this.buildStoredAgentPayload(outcome.result.storedRecord);
+        } else {
+          const live = this.agentManager.getAgent(outcome.agentId);
+          if (live) {
+            agentPayload = await this.buildAgentPayload(live);
+          } else {
+            const stored = await this.agentStorage.get(outcome.agentId);
+            agentPayload = stored
+              ? this.buildStoredAgentPayload(stored)
+              : ({} as AgentSnapshotPayload);
+          }
+        }
+
         this.emit({
           type: "status",
           payload: {
             status: "agent_created",
-            agentId: liveSnapshot.id,
+            agentId: outcome.agentId,
             requestId,
             agent: agentPayload,
           },
         });
       }
-
-      this.sessionLogger.info(
-        { agentId: snapshot.id, provider: snapshot.provider },
-        `Created agent ${snapshot.id} (${snapshot.provider})`,
-      );
     } catch (error) {
-      await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
-        createdWorktree: createdWorktreeForCleanup,
-        createdAgentId,
-      });
       const wireError = toWorktreeWireError(error);
       this.sessionLogger.error({ err: error }, "Failed to create agent");
       if (requestId) {

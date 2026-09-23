@@ -12,6 +12,7 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createAgentMcpServer } from "./mcp-server.js";
 import { AgentManager, type ManagedAgent } from "./agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
+import { CreateAgentDedupeRegistry } from "./create-agent/create-agent-dedupe.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type { AgentMode, AgentProvider, ProviderSnapshotEntry } from "./agent-sdk-types.js";
 import type { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
@@ -1176,6 +1177,7 @@ describe("create_agent MCP tool", () => {
       provider: "codex/gpt-5.4",
       title: "Short title",
       initialPrompt: "test",
+      idempotencyKey: "test-idem-key-1",
     });
     expect(ok.success).toBe(true);
   });
@@ -1356,8 +1358,69 @@ describe("create_agent MCP tool", () => {
         cwd: existingCwd,
       }),
       undefined,
-      { workspaceId: "wks_existing" },
+      expect.objectContaining({
+        workspaceId: "wks_existing",
+      }),
     );
+  });
+
+  it("deduplicates create_agent MCP calls with the same idempotencyKey", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const liveAgent = {
+      id: "agent-mcp-idem",
+      cwd: existingCwd,
+      workspaceId: "wks_existing",
+      lifecycle: "idle",
+      currentModeId: null,
+      availableModes: [],
+      config: { title: "Idempotent MCP agent" },
+    } as ManagedAgent;
+
+    spies.agentManager.createAgent.mockResolvedValue(liveAgent);
+    spies.agentManager.getAgent.mockReturnValue(liveAgent);
+
+    const dedupeRegistry = new CreateAgentDedupeRegistry({
+      agentManager,
+      agentStorage,
+      logger,
+    });
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      createAgentDedupeRegistry: dedupeRegistry,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      listActiveWorkspaces: async () => [
+        { workspaceId: "wks_existing", cwd: existingCwd, kind: "worktree" },
+      ],
+      logger,
+    });
+    const tool = registeredTool(server, "create_agent");
+
+    const response1 = await tool.handler({
+      ...detachedExistingWorkspace("wks_existing"),
+      title: "Idempotent MCP agent",
+      provider: "codex/gpt-5.4",
+      initialPrompt: "Do idempotent work",
+      idempotencyKey: "mcp-idem-1",
+      background: true,
+    });
+
+    const response2 = await tool.handler({
+      ...detachedExistingWorkspace("wks_existing"),
+      title: "Idempotent MCP agent",
+      provider: "codex/gpt-5.4",
+      initialPrompt: "Do idempotent work",
+      idempotencyKey: "mcp-idem-1",
+      background: true,
+    });
+
+    // createAgent was called only once
+    expect(spies.agentManager.createAgent).toHaveBeenCalledTimes(1);
+    const body1 = response1.structuredContent as Record<string, unknown>;
+    const body2 = response2.structuredContent as Record<string, unknown>;
+    expect(body1.agentId).toBe("agent-mcp-idem");
+    expect(body2.agentId).toBe("agent-mcp-idem");
   });
 
   it("accepts provider features and passes them through createAgent", async () => {

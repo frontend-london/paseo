@@ -32,6 +32,7 @@ import {
   type ArchiveDependencies,
 } from "../../workspace-archive-service.js";
 import { createAgentCommand, type CreateAgentFromMcpInput } from "../create-agent/create.js";
+import type { CreateAgentDedupeRegistry } from "../create-agent/create-agent-dedupe.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "../../voice-types.js";
 import type { FirstAgentContext } from "../../messages.js";
 import { everyMsToFiveFieldCron } from "@getpaseo/protocol/schedule/cadence";
@@ -96,6 +97,7 @@ import type {
 export interface PaseoToolHostDependencies {
   agentManager: AgentManager;
   agentStorage: AgentStorage;
+  createAgentDedupeRegistry?: CreateAgentDedupeRegistry;
   terminalManager?: TerminalManager | null;
   getDaemonTcpPort?: () => number | null;
   scheduleService?: ScheduleService | null;
@@ -991,6 +993,11 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       .trim()
       .min(1, "initialPrompt is required")
       .describe("Required first task to run immediately after creation."),
+    idempotencyKey: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Optional idempotency key to prevent duplicate agents/workspaces on retry."),
   };
   const legacyCreateAgentPlacementFields = {
     relationship: AgentRelationshipInputSchema.describe(
@@ -1445,6 +1452,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           terminalManager,
           providerSnapshotManager,
           createPaseoWorktree: options.createPaseoWorktree,
+          createAgentDedupeRegistry: options.createAgentDedupeRegistry,
           ...(options.ensureWorkspaceForCreate
             ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
             : {}),
@@ -1467,6 +1475,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           callerAgentId,
           callerContext,
           worktree,
+          idempotencyKey: parsedArgs.idempotencyKey?.trim() || undefined,
         },
       );
 
@@ -1545,11 +1554,16 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       };
 
   async function resolveCreateAgentToolArgs(args: unknown): Promise<ResolvedCreateAgentToolArgs> {
+    const normalizedArgs =
+      args && typeof args === "object" && "idempotency_key" in args && !("idempotencyKey" in args)
+        ? { ...args, idempotencyKey: (args as { idempotency_key: unknown }).idempotency_key }
+        : args;
+
     if (callerAgentId) {
-      if (hasLegacyCreateAgentPlacement(args)) {
+      if (hasLegacyCreateAgentPlacement(normalizedArgs)) {
         // COMPAT(nestedCreateAgentPlacement): accept the old relationship/workspace shape without
         // advertising it to models. Added in v0.2.0; remove after 2027-01-17.
-        const parsed = legacyAgentToAgentCreateAgentArgsSchema.parse(args);
+        const parsed = legacyAgentToAgentCreateAgentArgsSchema.parse(normalizedArgs);
         const { cwd, workspaceId, worktree } = await resolveCreateAgentWorkspace(parsed.workspace, {
           prompt: parsed.initialPrompt,
         });
@@ -1562,7 +1576,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           worktree,
         };
       }
-      const parsed = agentToAgentCreateAgentArgsSchema.parse(args);
+      const parsed = agentToAgentCreateAgentArgsSchema.parse(normalizedArgs);
       const { cwd, workspaceId } = await resolveCanonicalCreateAgentWorkspace(parsed.workspaceId, {
         prompt: parsed.initialPrompt,
       });
@@ -1575,10 +1589,10 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         worktree: undefined,
       };
     }
-    if (hasLegacyCreateAgentPlacement(args)) {
+    if (hasLegacyCreateAgentPlacement(normalizedArgs)) {
       // COMPAT(nestedCreateAgentPlacement): see the agent-scoped branch above.
       const parsedArgs = normalizeTopLevelCreateAgentArgs(
-        legacyTopLevelCreateAgentArgsSchema.parse(args),
+        legacyTopLevelCreateAgentArgsSchema.parse(normalizedArgs),
       );
       if (parsedArgs.relationship?.kind === "subagent") {
         throw new Error("relationship subagent requires an agent-scoped tool session");
@@ -1599,7 +1613,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         worktree,
       };
     }
-    const parsedArgs = canonicalTopLevelCreateAgentArgsSchema.parse(args);
+    const parsedArgs = canonicalTopLevelCreateAgentArgsSchema.parse(normalizedArgs);
     const { cwd, workspaceId } = await resolveCanonicalCreateAgentWorkspace(
       parsedArgs.workspaceId,
       { prompt: parsedArgs.initialPrompt },

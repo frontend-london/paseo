@@ -88,6 +88,36 @@ describe("run feature transport", () => {
     );
   });
 
+  it("forwards idempotencyKey to client.createAgent", async () => {
+    const createAgent = vi.fn().mockResolvedValue({
+      id: "agent-1",
+      status: "running",
+      provider: "cursor",
+      cwd: "/workspace",
+      title: null,
+    });
+    const client = {
+      createAgent,
+      waitForFinish: vi.fn().mockResolvedValue({ status: "idle" }),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    await runRunCommand(
+      "implement task",
+      { provider: "cursor", cwd: "/workspace", idempotencyKey: "test-idem-key" },
+      {} as never,
+    );
+
+    expect(createAgent).toHaveBeenCalledTimes(1);
+    expect(createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        initialPrompt: "implement task",
+        idempotencyKey: "test-idem-key",
+      }),
+    );
+  });
+
   it("passes features to the structured-output agent creation", async () => {
     process.env.PASEO_AGENT_ID = "parent-agent";
     const createAgent = vi.fn().mockResolvedValue({
