@@ -21,6 +21,7 @@ import { resolveCreateAgentTitles } from "../create-agent-title.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
 import { normalizeClientMessageId, resolveClientMessageId } from "../../client-message-id.js";
 import { resolveRequiredProviderModel, type ResolvedProviderModel } from "../mcp-shared.js";
+import type { CreateAgentDedupeRegistry } from "./create-agent-dedupe.js";
 import {
   appendTimelineItemIfAgentKnown,
   emitLiveTimelineItemIfAgentKnown,
@@ -44,6 +45,7 @@ export interface CreateAgentCommandDependencies {
   terminalManager?: TerminalManager | null;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "resolveCreateConfig">;
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
+  createAgentDedupeRegistry?: CreateAgentDedupeRegistry;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
 }
@@ -55,6 +57,7 @@ export type EnsureWorkspaceForCreate = (
 
 export interface CreateAgentFromSessionInput {
   kind: "session";
+  idempotencyKey?: string;
   config: AgentSessionConfig;
   workspaceId: string;
   worktreeName?: string;
@@ -78,6 +81,7 @@ export interface CreateAgentFromSessionInput {
 
 export interface CreateAgentFromMcpInput {
   kind: "mcp";
+  idempotencyKey?: string;
   provider: string;
   title: string;
   initialPrompt?: string;
@@ -174,6 +178,46 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
+  const dedupeRegistry = dependencies.createAgentDedupeRegistry;
+  const key = input.idempotencyKey?.trim();
+
+  if (dedupeRegistry && key) {
+    const outcome = await dedupeRegistry.execute({
+      idempotencyKey: key,
+      execute: async () => {
+        const result = await createAgentCommandInternal(dependencies, input);
+        return {
+          agentId: result.snapshot.id,
+          result,
+        };
+      },
+      onSuccessReturnExisting: async (agentId: string) => {
+        const live = dependencies.agentManager.getAgent(agentId);
+        if (live) {
+          return {
+            snapshot: live,
+            liveSnapshot: live,
+            background: input.kind === "mcp" ? input.background : true,
+            initialPromptStarted: true,
+            initialPromptError: null,
+          };
+        }
+        return null;
+      },
+      cleanupFailedAgent: async (agentId: string) => {
+        await dependencies.agentManager.deleteAgentState(agentId).catch(() => undefined);
+      },
+    });
+    return outcome.result;
+  }
+
+  return createAgentCommandInternal(dependencies, input);
+}
+
+async function createAgentCommandInternal(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+): Promise<CreateAgentCommandResult> {
   const resolved =
     input.kind === "session"
       ? await resolveSessionCreateAgent(dependencies, input)
@@ -196,10 +240,17 @@ export async function createAgentCommand(
     input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
   }
   if (resolved.prompt !== undefined) {
-    const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
-    initialPromptStarted = sendResult.started;
-    liveSnapshot = sendResult.liveSnapshot;
-    initialPromptError = sendResult.error ?? null;
+    try {
+      const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
+      initialPromptStarted = sendResult.started;
+      liveSnapshot = sendResult.liveSnapshot;
+      initialPromptError = sendResult.error ?? null;
+    } catch (error) {
+      if (resolved.promptFailure === "throw") {
+        await archiveCreatedAgentBestEffort(dependencies, snapshot.id);
+      }
+      throw error;
+    }
   }
 
   if (input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId && initialPromptStarted) {
@@ -472,6 +523,25 @@ async function sendInitialPrompt(
     }
     dependencies.logger.error({ err: error, agentId: snapshot.id }, "Failed to run initial prompt");
     return { started: false, liveSnapshot: snapshot };
+  }
+}
+
+async function archiveCreatedAgentBestEffort(
+  dependencies: CreateAgentCommandDependencies,
+  agentId: string,
+): Promise<void> {
+  const liveAgent = dependencies.agentManager.getAgent(agentId);
+  if (!liveAgent) {
+    return;
+  }
+
+  try {
+    await dependencies.agentManager.archiveAgent(agentId);
+  } catch (archiveError) {
+    dependencies.logger.error(
+      { err: archiveError, agentId },
+      "Failed to archive agent after initial prompt startup failure",
+    );
   }
 }
 
