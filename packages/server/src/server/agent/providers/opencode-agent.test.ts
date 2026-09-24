@@ -6549,3 +6549,33 @@ describe("OpenCode snapshot summary false-idle regression", () => {
     await session.close();
   });
 });
+
+describe("OpenCode session close idempotency and terminal error teardown", () => {
+  test("close is idempotent, shares in-flight promise, and releases server exactly once", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.sessionCreateResponse = { data: { id: "ses_close_idempotent" } };
+    runtime.enqueueClient(openCodeClient);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession(
+      { provider: "opencode", cwd: "/workspace/repo" },
+      { env: { PASEO_AGENT_ID: "close-agent" } },
+    );
+
+    // Call close concurrently multiple times
+    const p1 = session.close();
+    const p2 = session.close();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toBeUndefined();
+    expect(r2).toBeUndefined();
+
+    // Call close again after settling
+    await expect(session.close()).resolves.toBeUndefined();
+
+    // Server should only have been released once (acquired once, released once)
+    expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
+  });
+});

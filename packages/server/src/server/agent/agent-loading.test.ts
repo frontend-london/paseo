@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
@@ -75,6 +75,48 @@ test("loads archived records for history and active records with the interactive
       manager.closeAgent(archivedId).catch(() => undefined),
       manager.closeAgent(activeId).catch(() => undefined),
     ]);
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("closes agent runtime when hydration fails during ensureAgentLoaded", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-failure-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(path.join(root, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) {
+    throw new Error("expected Codex test client");
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: baseClient },
+    registry: storage,
+    logger,
+  });
+
+  const agentId = "00000000-0000-4000-8000-000000000303";
+  const agent = await manager.createAgent({ provider: "codex", cwd: root }, agentId, {
+    workspaceId: "workspace-hydration-fail",
+  });
+  await manager.closeAgent(agent.id);
+
+  // Mock hydrateTimelineFromProvider to fail on resume
+  const hydrateSpy = vi
+    .spyOn(manager, "hydrateTimelineFromProvider")
+    .mockRejectedValueOnce(new Error("timeline hydration exploded"));
+
+  try {
+    await expect(
+      ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger }),
+    ).rejects.toThrow("timeline hydration exploded");
+
+    // Agent runtime must be closed and not leaked into active agents
+    expect(manager.getAgent(agent.id)).toBeNull();
+  } finally {
+    hydrateSpy.mockRestore();
+    await manager.closeAgent(agentId).catch(() => undefined);
     await manager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
     await rm(root, { recursive: true, force: true });

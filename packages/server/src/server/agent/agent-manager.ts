@@ -1482,23 +1482,46 @@ export class AgentManager {
   // tracked background task: the caller is mid-way through finalizing a turn
   // and must not block on (or fail because of) process teardown.
   private closeAgentAfterTerminalError(agentId: string): void {
+    if (!this.agents.has(agentId) && !this.inFlightAgentCloses.has(agentId)) {
+      return;
+    }
+    if (this.terminalErrorCloses.has(agentId) || this.inFlightAgentCloses.has(agentId)) {
+      return;
+    }
+    this.terminalErrorCloses.add(agentId);
+
     // Defer past the in-flight session-event queue task and any foreground-run
     // finally handlers. closeAgentRuntime drains that queue first; invoking it
     // while turn_failed is still on the stack deadlocks on the current tail.
-    setImmediate(() => {
-      this.terminalErrorCloses.add(agentId);
-      const task = this.closeAgent(agentId)
-        .catch((error: unknown) => {
+    const closePromise = new Promise<void>((resolvePromise) => {
+      setImmediate(async () => {
+        try {
+          if (this.agents.has(agentId)) {
+            await this.closeAgentRuntime(agentId);
+          }
+        } catch (error: unknown) {
           this.logger.warn(
             { err: error, agentId },
             "Failed to close agent runtime after terminal error",
           );
-        })
-        .finally(() => {
+        } finally {
           this.terminalErrorCloses.delete(agentId);
-        });
-      this.trackBackgroundTask(task);
+          resolvePromise();
+        }
+      });
     });
+
+    if (!this.inFlightAgentCloses.has(agentId)) {
+      this.inFlightAgentCloses.set(agentId, closePromise);
+      const clearInFlight = () => {
+        if (this.inFlightAgentCloses.get(agentId) === closePromise) {
+          this.inFlightAgentCloses.delete(agentId);
+        }
+      };
+      void closePromise.then(clearInFlight, clearInFlight);
+    }
+
+    this.trackBackgroundTask(closePromise);
   }
 
   closeAgent(agentId: string): Promise<void> {
@@ -1536,10 +1559,12 @@ export class AgentManager {
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
-    try {
-      await agent.session.close();
-    } catch (error) {
-      closeError = error;
+    if (agent.session) {
+      try {
+        await agent.session.close();
+      } catch (error) {
+        closeError = error;
+      }
     }
 
     let persistError: unknown;
@@ -2193,12 +2218,26 @@ export class AgentManager {
       }
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-      await this.handleStreamEvent(agent, {
-        type: "turn_failed",
-        provider: agent.provider,
-        error: errorMsg,
-      });
-      this.finalizeForegroundTurn(agent);
+      try {
+        await this.handleStreamEvent(agent, {
+          type: "turn_failed",
+          provider: agent.provider,
+          error: errorMsg,
+        });
+      } catch (streamError) {
+        this.logger.warn(
+          { err: streamError, agentId },
+          "Failed to handle turn_failed event for startTurn failure",
+        );
+      }
+      try {
+        this.finalizeForegroundTurn(agent);
+      } catch (finalizeError) {
+        this.logger.warn(
+          { err: finalizeError, agentId },
+          "Failed to finalize foreground turn after startTurn failure",
+        );
+      }
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       throw error;
     }
@@ -2331,7 +2370,7 @@ export class AgentManager {
           this.runs.deleteWaiter(agent, turnStream.waiter);
         }
         this.runs.settleForegroundRun(agentId, pendingRun.token);
-        if (!agent.activeForegroundTurnId) {
+        if (!agent.activeForegroundTurnId && !agent.lastError && this.agents.has(agentId)) {
           await this.refreshRuntimeInfo(agent);
         }
       }
@@ -2342,6 +2381,9 @@ export class AgentManager {
 
   private finalizeForegroundTurn(agent: ActiveManagedAgent, turnId?: string): void {
     const mutableAgent = agent;
+    if (this.agents.get(mutableAgent.id) !== mutableAgent) {
+      return;
+    }
     if (turnId) {
       this.runs.rememberFinalizedTurn(mutableAgent, turnId);
     }
@@ -3174,9 +3216,10 @@ export class AgentManager {
     },
   ): Promise<ManagedAgent> {
     let registered = false;
+    let resolvedAgentId: string | null = null;
     try {
       this.assertAcceptingAgentRegistrations();
-      const resolvedAgentId = validateAgentId(agentId, "registerSession");
+      resolvedAgentId = validateAgentId(agentId, "registerSession");
       if (this.agents.has(resolvedAgentId)) {
         throw new Error(`Agent with id ${resolvedAgentId} already exists`);
       }
@@ -3227,8 +3270,18 @@ export class AgentManager {
       this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
-      if (!registered) {
+      if (!registered || !resolvedAgentId) {
         await this.closeUnregisteredSession(session);
+      } else {
+        const cleanupId = resolvedAgentId;
+        await this.closeAgent(cleanupId).catch(async (closeErr) => {
+          this.logger.warn(
+            { err: closeErr, agentId: cleanupId },
+            "Failed to close agent after registration failure",
+          );
+          await this.closeUnregisteredSession(session);
+          this.agents.delete(cleanupId);
+        });
       }
       throw error;
     }
@@ -4164,6 +4217,9 @@ export class AgentManager {
       "handleStreamEvent: turn_failed",
     );
     if (terminalDisposition === "stale") return;
+    if (this.agents.get(agent.id) !== agent) {
+      return;
+    }
     agent.lastError = event.error;
     await this.appendSystemErrorTimelineMessage(
       agent,

@@ -6,6 +6,8 @@ import { expect, test } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "../agent-manager.js";
+import { AgentStorage } from "../agent-storage.js";
+import { ensureAgentLoaded } from "../agent-loading.js";
 import type {
   AgentClient,
   AgentLaunchContext,
@@ -52,6 +54,20 @@ class ProcessExitCodexClient extends CodexAppServerAgentClient implements AgentC
     );
     await session.connect();
     return session;
+  }
+
+  override async resumeSession(
+    _handle: unknown,
+    overrides?: Partial<AgentSessionConfig>,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    return this.createSession(
+      {
+        provider: "codex",
+        cwd: overrides?.cwd ?? process.cwd(),
+      },
+      launchContext,
+    );
   }
 }
 
@@ -311,9 +327,11 @@ test("failed reconnect preserves manager events for a later successful run", asy
 
 test("unexpected exit fails an autonomous Codex turn", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "codex-process-autonomous-exit-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
   const appServer = createFakeCodexAppServer();
   const manager = new AgentManager({
     clients: { codex: new ProcessExitCodexClient([appServer]) },
+    registry: storage,
     logger,
   });
   const events: AgentManagerEvent[] = [];
@@ -333,8 +351,10 @@ test("unexpected exit fails an autonomous Codex turn", async () => {
     appServer.child.stderr.write("autonomous provider crashed");
     appServer.child.emit("exit", 23, null);
 
-    await expect.poll(() => manager.getAgent(agent.id)?.lifecycle).toBe("error");
-    expect(manager.getAgent(agent.id)?.lastError).toBe(
+    await expect.poll(async () => (await storage.get(agent.id))?.lastStatus).toBe("closed");
+    const persisted = await storage.get(agent.id);
+    expect(persisted?.attentionReason).toBe("error");
+    expect(persisted?.lastError).toBe(
       "Codex app-server exited with code 23 and signal null\nautonomous provider crashed",
     );
     expect(
@@ -351,12 +371,14 @@ test("unexpected exit fails an autonomous Codex turn", async () => {
 
 test("provider permissions do not survive an unexpected exit and reconnect", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "codex-process-permission-exit-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
   const exitedAppServer = createFakeCodexAppServer();
   const replacementAppServer = createFakeCodexAppServer();
   const manager = new AgentManager({
     clients: {
       codex: new ProcessExitCodexClient([exitedAppServer, replacementAppServer]),
     },
+    registry: storage,
     logger,
   });
   let agentId: string | null = null;
@@ -388,6 +410,9 @@ test("provider permissions do not survive an unexpected exit and reconnect", asy
     exitedAppServer.child.emit("exit", 17, null);
 
     await expect(failedRun).rejects.toThrow("Codex app-server exited with code 17");
+    await expect.poll(async () => (await storage.get(agent.id))?.lastStatus).toBe("closed");
+
+    await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
     expect(manager.getPendingPermissions(agent.id)).toEqual([]);
 
     const recoveredRun = manager.runAgent(agent.id, "continue after reconnect");
