@@ -10361,3 +10361,191 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
 });
+
+test("terminal error cleanup is idempotent and deduplicates concurrent/duplicate close requests without errors", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-error-idempotent-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class FailingConcurrentSession extends TestAgentSession {
+    closeCalls = 0;
+    closed = false;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = "turn-1";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_failed",
+          provider: this.provider,
+          error: "critical turn failure",
+          turnId,
+        });
+      }, 0);
+      return { turnId };
+    }
+
+    override async close(): Promise<void> {
+      this.closeCalls += 1;
+      this.closed = true;
+      await super.close();
+    }
+  }
+
+  const session = new FailingConcurrentSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+
+  const warnSpy = vi.spyOn(logger, "warn");
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    await expect(manager.runAgent(agent.id, "trigger failure")).rejects.toThrow(
+      "critical turn failure",
+    );
+
+    // Concurrently invoke close while terminal error close is in flight
+    const inFlightClose1 = manager.closeAgent(agent.id);
+    const inFlightClose2 = manager.closeAgent(agent.id);
+
+    // Both concurrent closes should join the in-flight close and resolve cleanly
+    await expect(inFlightClose1).resolves.toBeUndefined();
+    await expect(inFlightClose2).resolves.toBeUndefined();
+    await manager.flush();
+
+    // After cleanup has completed, subsequent closeAgent calls fail with Unknown agent
+    await expect(manager.closeAgent(agent.id)).rejects.toThrow(/Unknown agent/);
+
+    // Session should be closed exactly once
+    expect(session.closeCalls).toBe(1);
+    expect(manager.getAgent(agent.id)).toBeNull();
+
+    // Persisted record should reflect closed state with terminal error details
+    const persisted = await storage.get(agent.id);
+    expect(persisted?.lastStatus).toBe("closed");
+    expect(persisted?.lastError).toBe("critical turn failure");
+    expect(persisted?.attentionReason).toBe("error");
+
+    // No warning should be logged for unknown agent during terminal error cleanup
+    const unknownAgentWarnings = warnSpy.mock.calls.filter(
+      ([arg]) =>
+        typeof arg === "object" &&
+        arg !== null &&
+        "agentId" in arg &&
+        "err" in arg &&
+        String((arg as { err?: unknown }).err).includes("Unknown agent"),
+    );
+    expect(unknownAgentWarnings).toHaveLength(0);
+  } finally {
+    warnSpy.mockRestore();
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("cleanup failure on terminal error does not mask the original turn error", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-error-mask-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class FailingCleanupSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = "turn-mask";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_failed",
+          provider: this.provider,
+          error: "original turn failure",
+          turnId,
+        });
+      }, 0);
+      return { turnId };
+    }
+
+    override async close(): Promise<void> {
+      throw new Error("provider teardown boom");
+    }
+  }
+
+  const session = new FailingCleanupSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    await expect(manager.runAgent(agent.id, "run")).rejects.toThrow("original turn failure");
+    await manager.flush();
+
+    expect(manager.getAgent(agent.id)).toBeNull();
+    const persisted = await storage.get(agent.id);
+    expect(persisted?.lastStatus).toBe("closed");
+    expect(persisted?.lastError).toBe("original turn failure");
+    expect(persisted?.attentionReason).toBe("error");
+  } finally {
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("registration failure after assigning agent ID closes session without leaking runtime", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reg-fail-"));
+  const testAgentId = randomUUID();
+  let closeCalled = false;
+
+  class FailingRegSession extends TestAgentSession {
+    override async close(): Promise<void> {
+      closeCalled = true;
+      await super.close();
+    }
+  }
+
+  const session = new FailingRegSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+
+  // Use a storage mock that fails on applySnapshot
+  const failingStorage = {
+    get: vi.fn().mockResolvedValue(null),
+    applySnapshot: vi.fn().mockRejectedValue(new Error("disk write failure")),
+    list: vi.fn().mockResolvedValue([]),
+    flush: vi.fn().mockResolvedValue(undefined),
+  } as unknown as AgentStorage;
+
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: failingStorage,
+    logger,
+  });
+
+  try {
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: workdir }, testAgentId, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow("disk write failure");
+
+    // Session must have been closed
+    expect(closeCalled).toBe(true);
+    // Agent must not remain in active agents map
+    expect(manager.getAgent(testAgentId)).toBeNull();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

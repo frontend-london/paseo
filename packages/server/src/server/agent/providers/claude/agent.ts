@@ -2659,7 +2659,17 @@ class ClaudeAgentSession implements AgentSession {
     return this.persistence;
   }
 
+  private closePromise: Promise<void> | null = null;
+
   async close(): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+    this.closePromise = this.closeInternal();
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     this.logger.trace(
       {
         agentId: this.agentId,
