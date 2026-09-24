@@ -203,6 +203,154 @@ describe("OpenCodeServerManager generations", () => {
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 
+  test("shutdown terminates in-flight startPromise during port allocation before spawn", async () => {
+    let resolvePort!: (port: number) => void;
+    const portPromise = new Promise<number>((resolve) => {
+      resolvePort = resolve;
+    });
+    const runtime = new FakeOpenCodeServerRuntime([4480], { autoAnnounce: false });
+    const manager = new OpenCodeServerManager({
+      logger: createTestLogger(),
+      managedProcesses: runtime.managedProcesses,
+      portAllocator: () => portPromise,
+      resolveCommandPrefix: runtime.resolveCommandPrefix,
+      spawnServerProcess: runtime.spawnServerProcess,
+      terminateProcess: runtime.terminateProcess,
+    });
+
+    const acquisition = manager.acquireCurrent();
+    await runtime.settle();
+
+    const shutdown = manager.shutdown();
+    resolvePort(4480);
+
+    await expect(acquisition).rejects.toThrow("OpenCode server manager is shut down");
+    await shutdown;
+
+    expect(runtime.launchedPorts).toEqual([]);
+    expect(runtime.terminatedPorts).toEqual([]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("shutdown terminates in-flight newServerPromise and kills starting helper server", async () => {
+    const { manager, runtime } = createTestManager([4481, 4482], { autoAnnounce: false });
+
+    // Acquire current server first so newServerPromise has a generation to rotate
+    const currentStart = manager.acquireCurrent();
+    await runtime.settle();
+    runtime.processForPort(4481).announceListening();
+    const currentAcquisition = await currentStart;
+
+    // Start acquireNew which sets newServerPromise and starts port 4482 without announcing listening
+    const newAcquisition = manager.acquireNew();
+    await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([4481, 4482]));
+
+    // Shutdown while acquireNew is in flight
+    const shutdownPromise = manager.shutdown();
+    await runtime.settle();
+
+    await expect(newAcquisition).rejects.toThrow("OpenCode server exited with code null");
+    await shutdownPromise;
+
+    expect(runtime.terminatedPorts).toHaveLength(2);
+    expect(runtime.terminatedPorts).toContain(4481);
+    expect(runtime.terminatedPorts).toContain(4482);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+
+    await currentAcquisition.release().catch(() => undefined);
+  });
+
+  test("shutdown terminates in-flight newServerPromise during port allocation before spawn", async () => {
+    let resolveSecondPort!: (port: number) => void;
+    const secondPortPromise = new Promise<number>((resolve) => {
+      resolveSecondPort = resolve;
+    });
+    let callCount = 0;
+    const runtime = new FakeOpenCodeServerRuntime([4485], { autoAnnounce: true });
+    const manager = new OpenCodeServerManager({
+      logger: createTestLogger(),
+      managedProcesses: runtime.managedProcesses,
+      portAllocator: () => {
+        callCount += 1;
+        if (callCount === 1) return Promise.resolve(4485);
+        return secondPortPromise;
+      },
+      resolveCommandPrefix: runtime.resolveCommandPrefix,
+      spawnServerProcess: runtime.spawnServerProcess,
+      terminateProcess: runtime.terminateProcess,
+    });
+
+    const first = await manager.acquireCurrent();
+    expect(first.server.url).toBe("http://127.0.0.1:4485");
+
+    const newAcquisition = manager.acquireNew();
+    await runtime.settle();
+
+    const shutdown = manager.shutdown();
+    resolveSecondPort(4486);
+
+    await expect(newAcquisition).rejects.toThrow("OpenCode server manager is shut down");
+    await shutdown;
+
+    expect(runtime.launchedPorts).toEqual([4485]);
+    expect(runtime.terminatedPorts).toEqual([4485]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("shutdown terminates in-flight startServer after process spawn but before ready", async () => {
+    const { manager, runtime } = createTestManager([4487], { autoAnnounce: false });
+
+    // Initiate acquireCurrent which spawns the process on port 4487
+    const currentStart = manager.acquireCurrent();
+    await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([4487]));
+
+    // Shutdown while startPromise is in flight and server.ready is not yet resolved
+    const shutdownPromise = manager.shutdown();
+
+    await expect(currentStart).rejects.toThrow("OpenCode server exited with code null");
+    await shutdownPromise;
+
+    expect(runtime.terminatedPorts).toEqual([4487]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("shutdown terminates in-flight dedicated server starting promises", async () => {
+    const { manager, runtime } = createTestManager([4483], { autoAnnounce: false });
+
+    const dedicatedStart = manager.acquireDedicated({ DEDICATED: "1" });
+    await runtime.settle();
+
+    expect(runtime.launchedPorts).toEqual([4483]);
+
+    const shutdownPromise = manager.shutdown();
+    await runtime.settle();
+
+    await expect(dedicatedStart).rejects.toThrow("OpenCode server exited with code null");
+    await shutdownPromise;
+
+    expect(runtime.terminatedPorts).toEqual([4483]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("shutdown is idempotent and rejects subsequent acquisitions immediately", async () => {
+    const { manager, runtime } = createTestManager([4484]);
+
+    const acquisition = await manager.acquireCurrent();
+    expect(acquisition.server.url).toBe("http://127.0.0.1:4484");
+
+    await manager.shutdown();
+    await manager.shutdown();
+
+    expect(runtime.terminatedPorts).toEqual([4484]);
+
+    await expect(manager.acquireCurrent()).rejects.toThrow("OpenCode server manager is shut down");
+    await expect(manager.acquireNew()).rejects.toThrow("OpenCode server manager is shut down");
+    await expect(manager.acquireDedicated({ TEST: "1" })).rejects.toThrow(
+      "OpenCode server manager is shut down",
+    );
+    expect(manager.acquireExisting(acquisition.server.url)).toBe(null);
+  });
+
   test("dedicated server startup is protected from retired cleanup", async () => {
     const { manager, runtime } = createTestManager([4473, 4474], { autoAnnounce: false });
 
