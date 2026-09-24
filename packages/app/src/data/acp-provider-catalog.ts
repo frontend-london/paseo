@@ -167,7 +167,7 @@ const CATALOG_DATA = [
       DROID_DISABLE_AUTO_UPDATE: "true",
       FACTORY_DROID_AUTO_UPDATE_ENABLED: "false",
     },
-    params: { supportsMcpServers: false },
+    params: { supportsMcpServers: false, unattendedModeIds: ["auto-high"] },
   },
   {
     id: "fast-agent",

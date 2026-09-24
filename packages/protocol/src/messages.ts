@@ -979,6 +979,11 @@ export const WorkspacePinSetRequestSchema = z.object({
 });
 
 export const WorkspaceLabelColorSchema = z.enum(WORKSPACE_LABEL_COLORS);
+export const WorkspaceRemoveRequestSchema = z.object({
+  type: z.literal("workspace.remove.request"),
+  workspaceId: z.string(),
+  requestId: z.string(),
+});
 export const WorkspaceLabelDefinitionSchema = z.object({
   name: z.string(),
   color: WorkspaceLabelColorSchema,
@@ -2043,6 +2048,16 @@ export const ProjectRemoveResponsePayloadSchema = z.object({
 export const ProjectRemoveResponseSchema = z.object({
   type: z.literal("project.remove.response"),
   payload: ProjectRemoveResponsePayloadSchema,
+});
+
+export const WorkspaceRemoveResponseSchema = z.object({
+  type: z.literal("workspace.remove.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
 });
 
 export const WorkspaceTitleSetResponsePayloadSchema = z.object({
@@ -3295,6 +3310,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   OpenProjectRequestSchema,
   ProjectAddRequestSchema,
   ProjectCreateDirectoryRequestSchema,
+  WorkspaceRemoveRequestSchema,
   WorkspaceGithubSearchRepositoriesRequestSchema,
   ProjectGithubCloneRequestSchema,
   ArchiveWorkspaceRequestSchema,
@@ -6790,6 +6806,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   FetchWorkspacesResponseMessageSchema,
   ProjectAddResponseSchema,
   ProjectCreateDirectoryResponseSchema,
+  WorkspaceRemoveResponseSchema,
   OpenProjectResponseMessageSchema,
   WorkspaceGithubSearchRepositoriesResponseSchema,
   ProjectGithubCloneResponseSchema,

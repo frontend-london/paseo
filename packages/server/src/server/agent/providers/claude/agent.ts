@@ -2058,6 +2058,8 @@ class ClaudeAgentSession implements AgentSession {
   private claudeSessionId: string | null;
   private persistence: AgentPersistenceHandle | null;
   private currentMode: PermissionMode;
+  /** Mode explicitly used to launch the active query; authoritative over stale resume init data. */
+  private launchedMode: PermissionMode | null = null;
   private planResumeMode: PermissionMode | null = null;
   private availableModes: AgentMode[] = DEFAULT_MODES;
   private toolUseCache = new Map<string, ToolUseCacheEntry>();
@@ -3134,6 +3136,9 @@ class ClaudeAgentSession implements AgentSession {
 
     const input = createAsyncMessageInput<SDKUserMessage>();
     const options = await this.buildOptions();
+    this.launchedMode = isPermissionMode(options.permissionMode)
+      ? options.permissionMode
+      : this.currentMode;
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
     this.query = claudeQuery(
@@ -4567,10 +4572,7 @@ class ClaudeAgentSession implements AgentSession {
       notice = this.createClaudeSessionChangedNotice(existingSessionId, newSessionId);
     }
     this.availableModes = DEFAULT_MODES;
-    this.currentMode = message.permissionMode;
-    if (this.currentMode !== "plan") {
-      this.planResumeMode = this.currentMode;
-    }
+    this.adoptInitPermissionMode(message.permissionMode);
     this.persistence = null;
     if (message.model) {
       const normalizedRuntimeModel = normalizeClaudeRuntimeModelId(message.model);
@@ -4587,6 +4589,32 @@ class ClaudeAgentSession implements AgentSession {
       this.cachedRuntimeInfo = null;
     }
     return { threadStartedSessionId, notice };
+  }
+
+  private adoptInitPermissionMode(reportedMode: PermissionMode): void {
+    const launchedMode = this.launchedMode;
+    if (launchedMode !== null && launchedMode !== "plan" && reportedMode !== launchedMode) {
+      this.logger.warn(
+        { launchedMode, reportedMode },
+        "Claude init reported a stale permission mode; keeping and re-asserting the launched mode",
+      );
+      this.currentMode = launchedMode;
+      this.planResumeMode = launchedMode;
+      if (this.query) {
+        void this.query.setPermissionMode(launchedMode).catch((error) => {
+          this.logger.warn(
+            { err: error, launchedMode },
+            "Failed to re-assert launched permission mode after Claude init",
+          );
+        });
+      }
+      return;
+    }
+
+    this.currentMode = reportedMode;
+    if (reportedMode !== "plan") {
+      this.planResumeMode = reportedMode;
+    }
   }
 
   private readMissingResumedConversationError(message: SDKMessage): string | null {

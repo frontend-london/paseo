@@ -183,6 +183,7 @@ export interface PaseoWorkspaceHandle {
   refresh(options?: { requestId?: string }): Promise<PaseoWorkspace | null>;
   setTitle(title: string | null, requestId?: string): Promise<{ title: string | null }>;
   archive(requestId?: string): Promise<PaseoWorkspaceArchiveResult>;
+  remove(requestId?: string): Promise<void>;
   /**
    * Subscribes to already-emitted daemon workspace_update events for this id.
    * This returns a local unsubscribe function; it does not own app cache state or
@@ -215,6 +216,7 @@ export interface PaseoWorkspaceActions {
     workspace: string | PaseoWorkspaceHandle,
     requestId?: string,
   ): Promise<PaseoWorkspaceArchiveResult>;
+  remove(workspace: string | PaseoWorkspaceHandle, requestId?: string): Promise<void>;
   /**
    * Local event subscription over the low-level driver's workspace_update stream.
    * The returned function only removes this SDK listener.
@@ -724,6 +726,8 @@ export function createPaseoApi(
       },
       archive: (workspace, requestId) =>
         daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), requestId),
+      remove: (workspace, requestId) =>
+        daemonClient.removeWorkspace(resolveWorkspaceId(workspace), requestId),
       subscribe: listenWorkspaces,
     },
     agents: {
@@ -840,6 +844,10 @@ function createWorkspaceHandleFactory(
           current = { ...current, archivingAt: result.archivedAt };
         }
         return result;
+      },
+      remove: async (requestId) => {
+        await daemonClient.removeWorkspace(id, requestId);
+        current = null;
       },
       subscribe: (handler) =>
         listen((update) => {

@@ -2644,6 +2644,16 @@ export class DaemonClient {
     });
   }
 
+  async removeWorkspace(workspaceId: string, requestId?: string): Promise<void> {
+    const payload = await this.sendNamespacedCorrelatedSessionRequest<"workspace.remove.response">({
+      requestId,
+      message: { type: "workspace.remove.request", workspaceId },
+    });
+    if (!payload.accepted) {
+      throw new Error(payload.error ?? "removeWorkspace rejected");
+    }
+  }
+
   async fetchWorkspaceSetupStatus(
     workspaceId: string,
     requestId?: string,

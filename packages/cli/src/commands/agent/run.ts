@@ -42,6 +42,12 @@ export function addRunOptions(cmd: Command): Command {
       )
       .option("--thinking <id>", "Thinking option ID to use for this run")
       .option("--mode <mode>", "Provider-specific mode (e.g., plan, default, bypass)")
+      .option(
+        "--feature <key=value>",
+        "Set provider feature value(s) (can be used multiple times)",
+        collectMultiple,
+        [],
+      )
       .option("--new-workspace <local|worktree>", "Create a separate local or worktree workspace")
       .addOption(new Option("--worktree <name>", "Legacy workspace isolation alias").hideHelp())
       .option(
@@ -118,6 +124,7 @@ export interface AgentRunOptions extends CommandOptions {
   model?: string;
   thinking?: string;
   mode?: string;
+  feature?: string[];
   newWorkspace?: string;
   worktree?: string;
   worktreeMode?: string;
@@ -138,6 +145,28 @@ export interface AgentRunOptions extends CommandOptions {
 
 function resolveNewWorkspaceKind(options: AgentRunOptions): string | undefined {
   return options.newWorkspace ?? (options.worktree ? "worktree" : undefined);
+}
+
+export function parseRunFeatures(
+  featureFlags: string[] | undefined,
+): Record<string, unknown> | undefined {
+  if (!featureFlags || featureFlags.length === 0) return undefined;
+
+  const featureValues: Record<string, unknown> = {};
+  for (const featureFlag of featureFlags) {
+    const eqIndex = featureFlag.indexOf("=");
+    if (eqIndex <= 0) {
+      throw {
+        code: "INVALID_FEATURE",
+        message: `Invalid feature format: ${featureFlag}`,
+        details: "Features must be in key=value format with a non-empty key",
+      } satisfies CommandError;
+    }
+    const key = featureFlag.slice(0, eqIndex);
+    const rawValue = featureFlag.slice(eqIndex + 1);
+    featureValues[key] = rawValue === "true" ? true : rawValue === "false" ? false : rawValue;
+  }
+  return featureValues;
 }
 
 function buildRunWorkspaceSource(options: AgentRunOptions, cwd: string) {
@@ -607,6 +636,7 @@ export async function runRunCommand(
 
     const labels = parseRunLabels(options.label);
     const env = parseRunEnv(options.env);
+    const featureValues = parseRunFeatures(options.feature);
     const requestEnv = Object.keys(env).length > 0 ? env : undefined;
 
     const workspace = await resolveRunWorkspace(client, options, cwd);
@@ -628,6 +658,7 @@ export async function runRunCommand(
             modeId: options.mode,
             model: resolvedProviderModel.model,
             thinkingOptionId,
+            featureValues,
             initialPrompt: structuredPrompt,
             outputSchema,
             images,
@@ -699,6 +730,7 @@ export async function runRunCommand(
       modeId: options.mode,
       model: resolvedProviderModel.model,
       thinkingOptionId,
+      featureValues,
       initialPrompt: prompt,
       images,
       env: requestEnv,
