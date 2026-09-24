@@ -732,6 +732,13 @@ export function resolveACPModelSelection({
   };
 }
 
+function mergeACPModeWithFallback(mode: AgentMode, fallbackModes: AgentMode[]): AgentMode {
+  const fallback = fallbackModes.find((candidate) => candidate.id === mode.id);
+  return fallback?.isUnattended === undefined
+    ? mode
+    : { ...mode, isUnattended: fallback.isUnattended };
+}
+
 export function deriveModesFromACP(
   fallbackModes: AgentMode[],
   modeState?: { availableModes?: SessionMode[] | null; currentModeId?: string | null } | null,
@@ -739,11 +746,16 @@ export function deriveModesFromACP(
 ): { modes: AgentMode[]; currentModeId: string | null } {
   if (modeState?.availableModes?.length) {
     return {
-      modes: modeState.availableModes.map((mode) => ({
-        id: mode.id,
-        label: mode.name,
-        description: mode.description ?? undefined,
-      })),
+      modes: modeState.availableModes.map((mode) =>
+        mergeACPModeWithFallback(
+          {
+            id: mode.id,
+            label: mode.name,
+            description: mode.description ?? undefined,
+          },
+          fallbackModes,
+        ),
+      ),
       currentModeId: modeState.currentModeId ?? null,
     };
   }
@@ -752,11 +764,16 @@ export function deriveModesFromACP(
   if (modeOption) {
     const flatOptions = flattenSelectOptions(modeOption.options);
     return {
-      modes: flatOptions.map((option) => ({
-        id: option.value,
-        label: option.name,
-        description: option.description ?? undefined,
-      })),
+      modes: flatOptions.map((option) =>
+        mergeACPModeWithFallback(
+          {
+            id: option.value,
+            label: option.name,
+            description: option.description ?? undefined,
+          },
+          fallbackModes,
+        ),
+      ),
       currentModeId: modeOption.currentValue,
     };
   }
@@ -844,7 +861,13 @@ function buildACPAutoAcceptFeature(config: AgentSessionConfig): AgentFeature {
 function resolveACPCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
-  const isUnattendedCreate = input.unattended || input.parent?.isUnattended === true;
+  const requestedModeIsUnattended =
+    input.requestedMode !== undefined &&
+    input.availableModes?.some(
+      (mode) => mode.id === input.requestedMode && mode.isUnattended === true,
+    ) === true;
+  const isUnattendedCreate =
+    input.unattended || input.parent?.isUnattended === true || requestedModeIsUnattended;
   const featureValues =
     isUnattendedCreate && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined
       ? { ...input.featureValues, [ACP_AUTO_ACCEPT_FEATURE_ID]: true }
