@@ -4907,8 +4907,17 @@ class OpenCodeAgentSession implements AgentSession {
       },
     };
   }
+  private closePromise: Promise<void> | null = null;
 
   async close(): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+    this.closePromise = this.closeInternal();
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     try {
       this.closed = true;
       this.abortController?.abort();
@@ -4917,19 +4926,43 @@ class OpenCodeAgentSession implements AgentSession {
       this.unsubscribeEvents = null;
       await this.ingress.catch(() => undefined);
       this.subscribers.clear();
-      await abortOpenCodeSession({
-        client: this.client,
-        sessionId: this.sessionId,
-        directory: this.config.cwd,
-        logger: this.logger,
-      });
-      await this.deleteProviderSessionIfEphemeral();
+      try {
+        await abortOpenCodeSession({
+          client: this.client,
+          sessionId: this.sessionId,
+          directory: this.config.cwd,
+          logger: this.logger,
+        });
+      } catch (abortErr) {
+        this.logger.debug(
+          { err: abortErr, sessionId: this.sessionId },
+          "Failed to abort OpenCode session during close",
+        );
+      }
+      try {
+        await this.deleteProviderSessionIfEphemeral();
+      } catch (deleteErr) {
+        this.logger.debug(
+          { err: deleteErr, sessionId: this.sessionId },
+          "Failed to delete OpenCode session during close",
+        );
+      }
       this.turnState = { status: "idle" };
     } finally {
       this.releaseBridge?.();
       this.releaseBridge = null;
-      await this.releaseServer?.();
+      const release = this.releaseServer;
       this.releaseServer = null;
+      if (release) {
+        try {
+          await release();
+        } catch (releaseErr) {
+          this.logger.warn(
+            { err: releaseErr, sessionId: this.sessionId },
+            "Failed to release OpenCode server during close",
+          );
+        }
+      }
     }
   }
 

@@ -51,6 +51,7 @@ describe("GenericACPAgentClient", () => {
           },
         },
         defaultCommand: ["hermes", "acp"],
+        defaultModes: [],
         capabilities: {
           supportsStreaming: true,
           supportsSessionPersistence: true,
@@ -64,6 +65,38 @@ describe("GenericACPAgentClient", () => {
         },
       },
     ]);
+  });
+
+  test("marks Factory auto-high as unattended for existing provider configs", () => {
+    const _client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["npx", "-y", "droid@0.179.0", "exec", "--output-format", "acp-daemon"],
+      providerId: "factory-droid",
+      providerParams: {
+        supportsMcpServers: false,
+      },
+    });
+    void _client;
+
+    expect(mockState.superConstructorOptions.at(-1)).toMatchObject({
+      defaultModes: [{ id: "auto-high", label: "auto-high", isUnattended: true }],
+    });
+  });
+
+  test("accepts provider-configured unattended mode ids", () => {
+    const _client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["custom-acp"],
+      providerId: "custom-acp",
+      providerParams: {
+        unattendedModeIds: ["yolo"],
+      },
+    });
+    void _client;
+
+    expect(mockState.superConstructorOptions.at(-1)).toMatchObject({
+      defaultModes: [{ id: "yolo", label: "yolo", isUnattended: true }],
+    });
   });
 
   test("uses provider params to report MCP support", () => {

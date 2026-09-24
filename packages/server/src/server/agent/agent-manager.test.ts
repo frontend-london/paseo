@@ -11244,3 +11244,52 @@ test("concurrent native restores run once before resuming the same agent", async
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test("registration failure after assigning agent ID closes session without leaking runtime", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reg-fail-"));
+  const testAgentId = randomUUID();
+  let closeCalled = false;
+
+  class FailingRegSession extends TestAgentSession {
+    override async close(): Promise<void> {
+      closeCalled = true;
+      await super.close();
+    }
+  }
+
+  const session = new FailingRegSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+
+  // Use a storage mock that fails on applySnapshot
+  const failingStorage = {
+    get: vi.fn().mockResolvedValue(null),
+    applySnapshot: vi.fn().mockRejectedValue(new Error("disk write failure")),
+    list: vi.fn().mockResolvedValue([]),
+    flush: vi.fn().mockResolvedValue(undefined),
+  } as unknown as AgentStorage;
+
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: failingStorage,
+    logger,
+  });
+
+  try {
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: workdir }, testAgentId, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow("disk write failure");
+
+    // Session must have been closed
+    expect(closeCalled).toBe(true);
+    // Agent must not remain in active agents map
+    expect(manager.getAgent(testAgentId)).toBeNull();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

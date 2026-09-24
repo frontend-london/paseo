@@ -89,7 +89,7 @@ function matchesFilter(item: AgentTimelineItem, filter?: string): boolean {
 export async function runLogsCommand(
   id: string,
   options: AgentLogsOptions,
-  _command: Command,
+  command: Command,
 ): Promise<AgentLogsResult> {
   if (!id) {
     console.error("Error: Agent ID required");
@@ -141,6 +141,17 @@ export async function runLogsCommand(
 
     // Use curateAgentActivity to format the transcript
     if (tailCount === 0) {
+      const globals = command.optsWithGlobals();
+      if (globals.json || globals.format === "json") {
+        console.log("[]");
+      }
+      return;
+    }
+
+    const globals = command.optsWithGlobals();
+    if (globals.json || globals.format === "json") {
+      const itemsToKeep = tailCount !== undefined ? timelineItems.slice(-tailCount) : timelineItems;
+      console.log(JSON.stringify(itemsToKeep, null, 2));
       return;
     }
 

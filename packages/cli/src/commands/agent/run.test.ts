@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  parseRunFeatures,
   resolveExistingRunWorkspace,
   resolveRunCallerAgentId,
   runRunCommand,
@@ -7,6 +8,25 @@ import {
 } from "./run";
 
 const daemonTarget = { kind: "endpoint" as const, host: "example.test:12345" };
+
+describe("run feature parsing", () => {
+  it("parses repeatable booleans and string values", () => {
+    expect(parseRunFeatures(["auto_accept=true", "fast_mode=false", "profile=careful"])).toEqual({
+      auto_accept: true,
+      fast_mode: false,
+      profile: "careful",
+    });
+  });
+
+  it("omits absent feature values", () => {
+    expect(parseRunFeatures(undefined)).toBeUndefined();
+    expect(parseRunFeatures([])).toBeUndefined();
+  });
+
+  it.each(["auto_accept", "=true"])("rejects malformed feature syntax: %s", (feature) => {
+    expect(() => parseRunFeatures([feature])).toThrow();
+  });
+});
 
 describe("managed agent caller context", () => {
   it("propagates a trimmed PASEO_AGENT_ID", () => {

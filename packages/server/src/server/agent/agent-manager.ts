@@ -1669,7 +1669,6 @@ export class AgentManager {
       }
     }
   }
-
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
@@ -1707,7 +1706,9 @@ export class AgentManager {
     await this.drainSessionEvents(agentId);
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
-    await agent.session.close();
+    if (agent.session) {
+      await agent.session.close();
+    }
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
 
@@ -2590,7 +2591,7 @@ export class AgentManager {
           this.runs.deleteWaiter(agent, turnStream.waiter);
         }
         this.runs.settleForegroundRun(agentId, pendingRun.token);
-        if (!agent.activeForegroundTurnId) {
+        if (!agent.activeForegroundTurnId && !agent.lastError && this.agents.has(agentId)) {
           await this.refreshRuntimeInfo(agent);
         }
       }
@@ -2601,6 +2602,9 @@ export class AgentManager {
 
   private finalizeForegroundTurn(agent: ActiveManagedAgent, turnId?: string): void {
     const mutableAgent = agent;
+    if (this.agents.get(mutableAgent.id) !== mutableAgent) {
+      return;
+    }
     if (turnId) {
       this.runs.rememberFinalizedTurn(mutableAgent, turnId);
     }
@@ -3460,9 +3464,10 @@ export class AgentManager {
     },
   ): Promise<ManagedAgent> {
     let registered = false;
+    let resolvedAgentId: string | null = null;
     try {
       this.assertAcceptingAgentRegistrations();
-      const resolvedAgentId = validateAgentId(agentId, "registerSession");
+      resolvedAgentId = validateAgentId(agentId, "registerSession");
       if (this.agents.has(resolvedAgentId)) {
         throw new Error(`Agent with id ${resolvedAgentId} already exists`);
       }
@@ -3518,8 +3523,18 @@ export class AgentManager {
       this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
-      if (!registered) {
+      if (!registered || !resolvedAgentId) {
         await this.closeUnregisteredSession(session);
+      } else {
+        const cleanupId = resolvedAgentId;
+        await this.closeAgent(cleanupId).catch(async (closeErr) => {
+          this.logger.warn(
+            { err: closeErr, agentId: cleanupId },
+            "Failed to close agent after registration failure",
+          );
+          await this.closeUnregisteredSession(session);
+          this.agents.delete(cleanupId);
+        });
       }
       throw error;
     }
@@ -4432,6 +4447,9 @@ export class AgentManager {
       "agent.manager.turn.completed",
     );
     if (terminalDisposition === "stale") return;
+    if (this.agents.get(agent.id) !== agent) {
+      return;
+    }
     if (event.usage) {
       agent.lastUsage = { ...agent.lastUsage, ...event.usage };
     }
@@ -4476,6 +4494,9 @@ export class AgentManager {
       "handleStreamEvent: turn_failed",
     );
     if (terminalDisposition === "stale") return;
+    if (this.agents.get(agent.id) !== agent) {
+      return;
+    }
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       agent.lifecycle = "error";
     }
@@ -4518,6 +4539,9 @@ export class AgentManager {
       "agent.manager.turn.canceled",
     );
     if (terminalDisposition === "stale") return;
+    if (this.agents.get(agent.id) !== agent) {
+      return;
+    }
     if (!isForegroundEvent && !agent.activeForegroundTurnId && !agent.pendingReplacement) {
       agent.lifecycle = "idle";
     }

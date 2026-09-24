@@ -1,7 +1,8 @@
 import type { Logger } from "pino";
 import { z } from "zod";
 
-import type { AgentCapabilityFlags } from "../agent-sdk-types.js";
+import type { AgentCapabilityFlags, AgentMode } from "../agent-sdk-types.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import { checkProviderLaunchAvailable, resolveProviderLaunch } from "../provider-launch-config.js";
 import {
   ACPAgentClient,
@@ -21,6 +22,7 @@ import {
 export const GenericACPProviderParamsSchema = z
   .object({
     supportsMcpServers: z.boolean().optional(),
+    unattendedModeIds: z.array(z.string().min(1)).optional(),
     clientCapabilities: z
       .object({
         fs: z
@@ -37,6 +39,19 @@ export const GenericACPProviderParamsSchema = z
 
 type GenericACPProviderParams = z.infer<typeof GenericACPProviderParamsSchema>;
 
+const BUILTIN_GENERIC_ACP_UNATTENDED_MODE_IDS: Readonly<Record<string, readonly string[]>> = {
+  "factory-droid": ["auto-high"],
+};
+
+function buildGenericACPDefaultModes(
+  providerId: string | undefined,
+  params: GenericACPProviderParams,
+): AgentMode[] {
+  const ids =
+    params.unattendedModeIds ?? BUILTIN_GENERIC_ACP_UNATTENDED_MODE_IDS[providerId ?? ""] ?? [];
+  return ids.map((id) => ({ id, label: id, isUnattended: true }));
+}
+
 interface GenericACPAgentClientOptions {
   logger: Logger;
   command: [string, ...string[]];
@@ -51,6 +66,7 @@ interface GenericACPAgentClientOptions {
   configFeatureOptions?: ACPConfigFeatureOption[];
   extensionCommandsParser?: ACPExtensionCommandsParser;
   catalogModelResolver?: ACPCatalogModelResolver;
+  managedProcesses?: ManagedProcessRegistry;
   now?: () => number;
 }
 
@@ -69,6 +85,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
         env: options.env,
       },
       defaultCommand: options.command,
+      defaultModes: buildGenericACPDefaultModes(options.providerId, providerParams),
       capabilities: buildGenericACPCapabilities(providerParams),
       waitForInitialCommands: options.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: options.initialCommandsWaitTimeoutMs,
@@ -77,6 +94,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       configFeatureOptions: options.configFeatureOptions,
       extensionCommandsParser: options.extensionCommandsParser,
       catalogModelResolver: options.catalogModelResolver,
+      managedProcesses: options.managedProcesses,
       now: options.now,
     });
 
