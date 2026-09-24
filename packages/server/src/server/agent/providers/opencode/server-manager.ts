@@ -82,8 +82,12 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private static exitHandlerRegistered = false;
   private currentServer: OpenCodeServerGeneration | null = null;
   private retiredServers = new Set<OpenCodeServerGeneration>();
+  private readonly startingServers = new Set<OpenCodeServerGeneration>();
+  private readonly inFlightStartPromises = new Set<Promise<OpenCodeServerGeneration>>();
   private startPromise: Promise<OpenCodeServerGeneration> | null = null;
   private newServerPromise: Promise<OpenCodeServerGeneration> | null = null;
+  private isShuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
   private readonly logger: Logger;
   private readonly baseEnv?: SpawnProcessOptions["baseEnv"];
   private readonly runtimeSettings?: ProviderRuntimeSettings;
@@ -155,26 +159,44 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   async acquireCurrent(signal?: AbortSignal): Promise<OpenCodeServerAcquisition> {
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     signal?.throwIfAborted();
     const server = await waitForServerAcquisition(this.getCurrentServer(), signal);
     signal?.throwIfAborted();
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     return this.acquireServer(server);
   }
 
   async acquireNew(signal?: AbortSignal): Promise<OpenCodeServerAcquisition> {
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     signal?.throwIfAborted();
     const server = await waitForServerAcquisition(this.getNewServer(), signal);
     signal?.throwIfAborted();
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     return this.acquireServer(server);
   }
 
   async acquireDedicated(env: Record<string, string>): Promise<OpenCodeServerAcquisition> {
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     const server = await this.startServer(env);
     server.retired = true;
     this.retiredServers.add(server);
     const acquisition = this.acquireServer(server);
     try {
       await server.ready;
+      if (this.isShuttingDown) {
+        throw new Error("OpenCode server manager is shut down");
+      }
       return acquisition;
     } catch (error) {
       await acquisition.release();
@@ -183,6 +205,9 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   acquireExisting(url: string): OpenCodeServerAcquisition | null {
+    if (this.isShuttingDown) {
+      return null;
+    }
     const server = this.findLiveServerByUrl(url);
     return server ? this.acquireServer(server) : null;
   }
@@ -238,6 +263,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   private async getNewServer(): Promise<OpenCodeServerGeneration> {
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
+
     if (this.newServerPromise) {
       return this.newServerPromise;
     }
@@ -245,8 +274,11 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     this.newServerPromise = Promise.resolve()
       .then(async () => {
         await this.rotateCurrentServer();
+        if (this.isShuttingDown) {
+          throw new Error("OpenCode server manager is shut down");
+        }
         const server = await this.startServer();
-        if (!server.retired) {
+        if (!server.retired && !this.isShuttingDown) {
           this.currentServer = server;
         }
         await server.ready;
@@ -259,6 +291,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   private async getCurrentServer(): Promise<OpenCodeServerGeneration> {
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
+
     if (this.newServerPromise) {
       return this.newServerPromise;
     }
@@ -275,7 +311,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     }
 
     this.startPromise = this.startServer().then((server) => {
-      if (!server.retired) {
+      if (!server.retired && !this.isShuttingDown) {
         this.currentServer = server;
       }
       return server;
@@ -299,18 +335,43 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       await this.cleanupRetiredServers();
     }
     if (this.startPromise) {
-      const pending = await this.startPromise;
-      pending.retired = true;
-      this.retiredServers.add(pending);
-      this.currentServer = null;
-      await this.cleanupRetiredServers();
+      try {
+        const pending = await this.startPromise;
+        pending.retired = true;
+        this.retiredServers.add(pending);
+        this.currentServer = null;
+        await this.cleanupRetiredServers();
+      } catch {
+        // Ignored if in-flight start failed or was terminated
+      }
     }
   }
 
   private async startServer(launchEnv?: Record<string, string>): Promise<OpenCodeServerGeneration> {
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
+    const startOp = this.doStartServer(launchEnv);
+    this.inFlightStartPromises.add(startOp);
+    try {
+      return await startOp;
+    } finally {
+      this.inFlightStartPromises.delete(startOp);
+    }
+  }
+
+  private async doStartServer(
+    launchEnv?: Record<string, string>,
+  ): Promise<OpenCodeServerGeneration> {
     const port = await this.portAllocator();
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     const url = `http://127.0.0.1:${port}`;
     const launchPrefix = await this.resolveCommandPrefix();
+    if (this.isShuttingDown) {
+      throw new Error("OpenCode server manager is shut down");
+    }
     const serverArgs = [...launchPrefix.args, "serve", "--port", String(port)];
     // Use a neutral OpenCode home as the server cwd. Launching from the user's
     // home directory causes OpenCode to treat it as the default workspace and
@@ -348,6 +409,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       events: this.createEventSource({ serverUrl: url, processExit }),
       managedProcessRecord,
     };
+    this.startingServers.add(server);
     void managedProcessRecord.then((record) => {
       if (record && server.managedProcessRecord === managedProcessRecord) {
         server.managedProcessId = record.id;
@@ -403,6 +465,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
           started = true;
           settled = true;
           clearTimeout(timeout);
+          this.startingServers.delete(server);
           resolve();
         }
       });
@@ -420,6 +483,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
       serverProcess.on("exit", (code) => {
         resolveProcessExit(new Error(`OpenCode server exited with code ${code}`));
+        this.startingServers.delete(server);
         this.removeManagedServerRecord(server);
         if (!started) {
           failStartup(
@@ -450,13 +514,46 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   async shutdown(): Promise<void> {
-    const servers = [
-      ...(this.currentServer ? [this.currentServer] : []),
-      ...Array.from(this.retiredServers),
-    ];
-    await Promise.all(servers.map((server) => this.killServer(server)));
-    this.currentServer = null;
-    this.retiredServers.clear();
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
+    }
+    this.isShuttingDown = true;
+
+    this.shutdownPromise = (async () => {
+      // Collect all in-flight start promises so we await their resolution or rejection
+      const inFlight = Array.from(this.inFlightStartPromises);
+      if (this.newServerPromise) {
+        inFlight.push(this.newServerPromise);
+      }
+      if (this.startPromise) {
+        inFlight.push(this.startPromise);
+      }
+
+      // Kill all currently known servers immediately (active, retired, and partially started)
+      const initialServers = new Set<OpenCodeServerGeneration>([
+        ...(this.currentServer ? [this.currentServer] : []),
+        ...Array.from(this.retiredServers),
+        ...Array.from(this.startingServers),
+      ]);
+      await Promise.all(Array.from(initialServers).map((server) => this.killServer(server)));
+
+      // Await all in-flight start promises to settle (catch errors as killed servers will reject)
+      await Promise.allSettled(inFlight);
+
+      // Kill any servers that completed starting or registered while awaiting in-flight starts
+      const remainingServers = new Set<OpenCodeServerGeneration>([
+        ...(this.currentServer ? [this.currentServer] : []),
+        ...Array.from(this.retiredServers),
+        ...Array.from(this.startingServers),
+      ]);
+      await Promise.all(Array.from(remainingServers).map((server) => this.killServer(server)));
+
+      this.currentServer = null;
+      this.retiredServers.clear();
+      this.startingServers.clear();
+    })();
+
+    return this.shutdownPromise;
   }
 
   private async cleanupRetiredServers(): Promise<void> {
@@ -471,6 +568,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   private async killServer(server: OpenCodeServerGeneration): Promise<void> {
+    this.startingServers.delete(server);
     await server.events.close();
     if (
       (server.process.exitCode !== null && server.process.exitCode !== undefined) ||
