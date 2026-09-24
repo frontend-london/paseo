@@ -249,6 +249,21 @@ test("launch environment participates in the Claude default mode", async () => {
   ).resolves.toBe("default");
 });
 
+test("keeps Auto mode available when hosted-transport flags are explicitly disabled", async () => {
+  const client = new ClaudeAgentClient({
+    logger: createTestLogger(),
+    runtimeSettings: {
+      env: { CLAUDE_CODE_USE_BEDROCK: "off", CLAUDE_CODE_USE_VERTEX: "0" },
+    },
+  });
+
+  await expect(
+    client.resolveDefaultModeId({
+      config: { provider: "claude", cwd: process.cwd() },
+    }),
+  ).resolves.toBe("auto");
+});
+
 test("allows launch env to disable inherited Bedrock transport for auto mode", async () => {
   const previousBedrock = process.env.CLAUDE_CODE_USE_BEDROCK;
   process.env.CLAUDE_CODE_USE_BEDROCK = "1";
@@ -1342,11 +1357,7 @@ test("assembles assistant timeline when message_delta arrives before message_sta
               type: "stream_event",
               event: {
                 type: "message_start",
-                message: {
-                  id: "message-1",
-                  role: "assistant",
-                  model: "opus",
-                },
+                message: { id: "message-1", role: "assistant", model: "opus" },
               },
             },
           };
@@ -1533,14 +1544,6 @@ test("does not use stream_event uuid as assistant message identity when message_
 
   await session.close();
 });
-
-// Regression: reproduces the false "user rejected tool use" that Paseo surfaced
-// to Claude while permission mode was Bypass and the user rejected nothing.
-//
-// Timeline of the real repro (agent:paseo/62c89ad):
-//   1. User selected Bypass; the query launched with permissionMode:bypassPermissions.
-//   2. A background command was stopped / the session was torn down, which
-//      recreated the query via --resume.
 //   3. Claude Code's resumed system/init echoed the *persisted* permissionMode
 //      ("default"), NOT the launched Bypass.
 //   4. Paseo blindly adopted the echo, downgrading currentMode to "default".

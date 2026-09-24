@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions } from "../../output/index.js";
 import {
   fetchProjectedTimelineItems,
@@ -7,8 +7,7 @@ import {
 } from "../../utils/timeline.js";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
-import type { AgentStreamMessage } from "@getpaseo/protocol/messages";
-import { curateAgentActivity } from "@getpaseo/server";
+import { curateAgentActivity } from "@getpaseo/server/agent-activity";
 
 export function addLogsOptions(cmd: Command): Command {
   return cmd
@@ -90,25 +89,15 @@ function matchesFilter(item: AgentTimelineItem, filter?: string): boolean {
 export async function runLogsCommand(
   id: string,
   options: AgentLogsOptions,
-  _command: Command,
+  command: Command,
 ): Promise<AgentLogsResult> {
-  const host = getDaemonHost({ host: options.host });
-
   if (!id) {
     console.error("Error: Agent ID required");
     console.error("Usage: paseo agent logs <id>");
     process.exit(1);
   }
 
-  let client: DaemonClient;
-  try {
-    client = await connectToDaemon({ host: options.host });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`Error: Cannot connect to daemon at ${host}: ${message}`);
-    console.error("Start the daemon with: paseo daemon start");
-    process.exit(1);
-  }
+  const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
     const fetchResult = await client.fetchAgent({ agentId: id });
@@ -152,11 +141,15 @@ export async function runLogsCommand(
 
     // Use curateAgentActivity to format the transcript
     if (tailCount === 0) {
+      const globals = command.optsWithGlobals();
+      if (globals.json || globals.format === "json") {
+        console.log("[]");
+      }
       return;
     }
 
-    const opts = _command.optsWithGlobals();
-    if (opts.json || opts.format === "json") {
+    const globals = command.optsWithGlobals();
+    if (globals.json || globals.format === "json") {
       const itemsToKeep = tailCount !== undefined ? timelineItems.slice(-tailCount) : timelineItems;
       console.log(JSON.stringify(itemsToKeep, null, 2));
       return;
@@ -165,6 +158,7 @@ export async function runLogsCommand(
     const transcript = formatAgentActivityTranscript(timelineItems, tailCount);
     console.log(transcript);
   } catch (err) {
+    if (err && typeof err === "object" && "code" in err) throw err;
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Error: Failed to get logs: ${message}`);
     await client.close().catch(() => {});
@@ -209,13 +203,21 @@ async function runFollowMode(
   // Subscribe to new events
   const tailLabel =
     tailCount === 0 ? "no history" : `last ${tailCount} entr${tailCount === 1 ? "y" : "ies"}`;
-  console.log(`\n--- Following logs (${tailLabel}; Ctrl+C to stop) ---\n`);
 
-  const unsubscribe = client.on("agent_stream", (msg: unknown) => {
-    const message = msg as AgentStreamMessage;
-    if (message.type !== "agent_stream") return;
-    if (message.payload.agentId !== agentId) return;
+  const unsubscribe = client.subscribeAgentTimeline(agentId, (message) => {
+    if (message.type === "agent.timeline.replacement") {
+      console.log("\n[Timeline replaced; earlier output is no longer current]");
+      return;
+    }
 
+    if (message.type === "agent.timeline.error") {
+      console.error(`Timeline observation stopped: ${message.payload.error}`);
+      return;
+    }
+    if (message.type === "agent.timeline.subscription_restored") {
+      console.log("\n[Reconnected; live output resumed. Events may have been missed.]");
+      return;
+    }
     if (message.payload.event.type === "timeline") {
       const item = message.payload.event.item;
       // Apply filter
@@ -229,6 +231,9 @@ async function runFollowMode(
       }
     }
   });
+
+  await unsubscribe.ready;
+  console.log(`\n--- Following logs (${tailLabel}; Ctrl+C to stop) ---\n`);
 
   // Wait for interrupt
   await new Promise<void>((resolve) => {

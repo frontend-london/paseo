@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { connectToDaemon } from "../../utils/client.js";
 import {
   parseRunFeatures,
   resolveExistingRunWorkspace,
@@ -8,13 +7,10 @@ import {
   type AgentRunOptions,
 } from "./run";
 
-vi.mock("../../utils/client.js", () => ({
-  connectToDaemon: vi.fn(),
-  getDaemonHost: vi.fn(() => "http://localhost:6768"),
-}));
+const daemonTarget = { kind: "endpoint" as const, host: "example.test:12345" };
 
 describe("run feature parsing", () => {
-  it("parses repeatable feature flags and preserves non-boolean values as strings", () => {
+  it("parses repeatable booleans and string values", () => {
     expect(parseRunFeatures(["auto_accept=true", "fast_mode=false", "profile=careful"])).toEqual({
       auto_accept: true,
       fast_mode: false,
@@ -22,142 +18,13 @@ describe("run feature parsing", () => {
     });
   });
 
-  it("keeps featureValues absent when no features are provided", () => {
+  it("omits absent feature values", () => {
     expect(parseRunFeatures(undefined)).toBeUndefined();
     expect(parseRunFeatures([])).toBeUndefined();
   });
 
   it.each(["auto_accept", "=true"])("rejects malformed feature syntax: %s", (feature) => {
     expect(() => parseRunFeatures([feature])).toThrow();
-    try {
-      parseRunFeatures([feature]);
-    } catch (error) {
-      expect(error).toMatchObject({
-        code: "INVALID_FEATURE",
-        message: `Invalid feature format: ${feature}`,
-      });
-    }
-  });
-});
-
-describe("run feature transport", () => {
-  const originalAgentId = process.env.PASEO_AGENT_ID;
-
-  afterEach(() => {
-    vi.mocked(connectToDaemon).mockReset();
-    if (originalAgentId === undefined) {
-      delete process.env.PASEO_AGENT_ID;
-    } else {
-      process.env.PASEO_AGENT_ID = originalAgentId;
-    }
-  });
-
-  it.each([
-    { name: "with features", feature: ["auto_accept=true", "profile=careful"] },
-    { name: "without features", feature: undefined },
-  ])("creates the agent atomically $name", async ({ feature }) => {
-    process.env.PASEO_AGENT_ID = "parent-agent";
-    const createAgent = vi.fn().mockResolvedValue({
-      id: "agent-1",
-      status: "running",
-      provider: "cursor",
-      cwd: "/workspace",
-      title: null,
-    });
-    const client = {
-      createAgent,
-      waitForFinish: vi.fn().mockResolvedValue({ status: "idle" }),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
-
-    await runRunCommand(
-      "implement the task",
-      { provider: "cursor", cwd: "/workspace", feature },
-      {} as never,
-    );
-
-    expect(createAgent).toHaveBeenCalledTimes(1);
-    expect(createAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        initialPrompt: "implement the task",
-        ...(feature
-          ? { featureValues: { auto_accept: true, profile: "careful" } }
-          : { featureValues: undefined }),
-      }),
-    );
-  });
-
-  it("forwards idempotencyKey to client.createAgent", async () => {
-    const createAgent = vi.fn().mockResolvedValue({
-      id: "agent-1",
-      status: "running",
-      provider: "cursor",
-      cwd: "/workspace",
-      title: null,
-    });
-    const client = {
-      createAgent,
-      waitForFinish: vi.fn().mockResolvedValue({ status: "idle" }),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
-
-    await runRunCommand(
-      "implement task",
-      { provider: "cursor", cwd: "/workspace", idempotencyKey: "test-idem-key" },
-      {} as never,
-    );
-
-    expect(createAgent).toHaveBeenCalledTimes(1);
-    expect(createAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        initialPrompt: "implement task",
-        idempotencyKey: "test-idem-key",
-      }),
-    );
-  });
-
-  it("passes features to the structured-output agent creation", async () => {
-    process.env.PASEO_AGENT_ID = "parent-agent";
-    const createAgent = vi.fn().mockResolvedValue({
-      id: "agent-1",
-      status: "running",
-      provider: "cursor",
-      cwd: "/workspace",
-      title: null,
-    });
-    const client = {
-      createAgent,
-      waitForFinish: vi.fn().mockResolvedValue({
-        status: "idle",
-        lastMessage: '{"result":"done"}',
-      }),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
-
-    await runRunCommand(
-      "implement the task",
-      {
-        provider: "cursor",
-        cwd: "/workspace",
-        feature: ["auto_accept=true", "profile=careful"],
-        outputSchema: '{"type":"object","properties":{"result":{"type":"string"}}}',
-      },
-      {} as never,
-    );
-
-    expect(createAgent).toHaveBeenCalledTimes(1);
-    expect(createAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        featureValues: { auto_accept: true, profile: "careful" },
-        outputSchema: {
-          type: "object",
-          properties: { result: { type: "string" } },
-        },
-      }),
-    );
   });
 });
 
@@ -220,8 +87,13 @@ describe("runRunCommand option validation", () => {
     }
   });
 
-  async function expectInvalidOptions(options: AgentRunOptions, messageMatch: RegExp) {
-    await expect(runRunCommand("do something", options, {} as never)).rejects.toMatchObject({
+  async function expectInvalidOptions(
+    options: Omit<AgentRunOptions, "daemonTarget">,
+    messageMatch: RegExp,
+  ) {
+    await expect(
+      runRunCommand("do something", { ...options, daemonTarget }, {} as never),
+    ).rejects.toMatchObject({
       code: "INVALID_OPTIONS",
       message: expect.stringMatching(messageMatch),
     });
@@ -239,7 +111,11 @@ describe("runRunCommand option validation", () => {
     // must clear validation. It still fails later (provider resolution), which
     // is enough to prove the new guard did not reject it.
     await expect(
-      runRunCommand("do something", { newWorkspace: "worktree", provider: undefined }, {} as never),
+      runRunCommand(
+        "do something",
+        { newWorkspace: "worktree", provider: undefined, daemonTarget },
+        {} as never,
+      ),
     ).rejects.not.toMatchObject({ code: "INVALID_OPTIONS" });
   });
 

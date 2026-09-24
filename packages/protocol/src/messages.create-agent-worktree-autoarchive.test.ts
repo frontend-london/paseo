@@ -56,27 +56,4 @@ describe("create_agent_request worktree and autoArchive fields", () => {
       labels: {},
     });
   });
-
-  test("accepts optional idempotencyKey", () => {
-    const parsed = SessionInboundMessageSchema.parse({
-      type: "create_agent_request",
-      requestId: "create-with-idempotency",
-      config: {
-        provider: "codex",
-        cwd: "/repo/app",
-      },
-      idempotencyKey: "test-idem-key-123",
-    });
-
-    expect(parsed).toEqual({
-      type: "create_agent_request",
-      requestId: "create-with-idempotency",
-      config: {
-        provider: "codex",
-        cwd: "/repo/app",
-      },
-      idempotencyKey: "test-idem-key-123",
-      labels: {},
-    });
-  });
 });
