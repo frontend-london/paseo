@@ -712,6 +712,7 @@ export class AgentManager {
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+  private readonly terminalErrorCloses = new Set<string>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
@@ -1641,6 +1642,37 @@ export class AgentManager {
     }
   }
 
+  private closeAgentAfterTerminalError(agentId: string): void {
+    if (!this.agents.has(agentId) && !this.inFlightAgentCloses.has(agentId)) return;
+    if (this.terminalErrorCloses.has(agentId) || this.inFlightAgentCloses.has(agentId)) return;
+    this.terminalErrorCloses.add(agentId);
+
+    const closePromise = new Promise<void>((resolvePromise) => {
+      setImmediate(async () => {
+        try {
+          if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
+        } catch (error: unknown) {
+          this.logger.warn(
+            { err: error, agentId },
+            "Failed to close agent runtime after terminal error",
+          );
+        } finally {
+          this.terminalErrorCloses.delete(agentId);
+          resolvePromise();
+        }
+      });
+    });
+
+    this.inFlightAgentCloses.set(agentId, closePromise);
+    const clearInFlight = () => {
+      if (this.inFlightAgentCloses.get(agentId) === closePromise) {
+        this.inFlightAgentCloses.delete(agentId);
+      }
+    };
+    void closePromise.then(clearInFlight, clearInFlight);
+    this.trackBackgroundTask(closePromise);
+  }
+
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
@@ -2424,12 +2456,26 @@ export class AgentManager {
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
       pendingRun.start = { status: "failed", error: errorMsg };
-      await this.handleStreamEvent(agent, {
-        type: "turn_failed",
-        provider: agent.provider,
-        error: errorMsg,
-      });
-      this.finalizeForegroundTurn(agent);
+      try {
+        await this.handleStreamEvent(agent, {
+          type: "turn_failed",
+          provider: agent.provider,
+          error: errorMsg,
+        });
+      } catch (streamError) {
+        this.logger.warn(
+          { err: streamError, agentId },
+          "Failed to handle turn_failed event for startTurn failure",
+        );
+      }
+      try {
+        this.finalizeForegroundTurn(agent);
+      } catch (finalizeError) {
+        this.logger.warn(
+          { err: finalizeError, agentId },
+          "Failed to finalize foreground turn after startTurn failure",
+        );
+      }
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       throw error;
     }
@@ -2561,7 +2607,7 @@ export class AgentManager {
           this.runs.deleteWaiter(agent, turnStream.waiter);
         }
         this.runs.settleForegroundRun(agentId, pendingRun.token);
-        if (!agent.activeForegroundTurnId) {
+        if (!agent.activeForegroundTurnId && !agent.lastError && this.agents.has(agentId)) {
           await this.refreshRuntimeInfo(agent);
         }
       }
@@ -2572,6 +2618,7 @@ export class AgentManager {
 
   private finalizeForegroundTurn(agent: ActiveManagedAgent, turnId?: string): void {
     const mutableAgent = agent;
+    if (this.agents.get(mutableAgent.id) !== mutableAgent) return;
     if (turnId) {
       this.runs.rememberFinalizedTurn(mutableAgent, turnId);
     }
@@ -4431,6 +4478,7 @@ export class AgentManager {
       "handleStreamEvent: turn_failed",
     );
     if (terminalDisposition === "stale") return;
+    if (this.agents.get(agent.id) !== agent) return;
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       agent.lifecycle = "error";
     }
@@ -4445,6 +4493,7 @@ export class AgentManager {
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
     }
+    this.closeAgentAfterTerminalError(agent.id);
   }
 
   private onStreamTurnCanceled(params: {

@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import type { AgentModelDefinition } from "../agent-sdk-types.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import {
   deriveSelectorOptions,
   type ACPCatalogModelResolverContext,
@@ -17,6 +18,7 @@ interface CursorACPAgentClientOptions {
   providerId?: string;
   label?: string;
   providerParams?: unknown;
+  managedProcesses?: ManagedProcessRegistry;
 }
 
 const CURSOR_INITIAL_COMMANDS_WAIT_TIMEOUT_MS = 10_000;
@@ -100,6 +102,7 @@ export class CursorACPAgentClient extends GenericACPAgentClient {
       clientCapabilityMeta: CURSOR_CLIENT_CAPABILITY_META,
       configFeatureOptions: [CURSOR_FAST_FEATURE_OPTION],
       catalogModelResolver: resolveCursorCatalogModels,
+      managedProcesses: options.managedProcesses,
     });
   }
 }

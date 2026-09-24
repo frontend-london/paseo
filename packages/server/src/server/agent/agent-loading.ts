@@ -27,7 +27,7 @@ export type AgentLoaderManager = Pick<
   | "hydrateTimelineFromProvider"
   | "resumeAgentFromPersistence"
 > &
-  Partial<Pick<AgentManager, "waitForAgentClose">>;
+  Partial<Pick<AgentManager, "waitForAgentClose" | "closeAgent">>;
 
 export interface EnsureAgentLoadedDeps {
   agentManager: AgentLoaderManager;
@@ -132,10 +132,20 @@ export async function ensureAgentLoaded(
       deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
     }
 
-    await deps.agentManager.hydrateTimelineFromProvider(agentId, {
-      broadcast: () => pendingOptions.broadcastTimeline,
-    });
-    return deps.agentManager.getAgent(agentId) ?? snapshot;
+    try {
+      await deps.agentManager.hydrateTimelineFromProvider(agentId, {
+        broadcast: () => pendingOptions.broadcastTimeline,
+      });
+      return deps.agentManager.getAgent(agentId) ?? snapshot;
+    } catch (loadError) {
+      await deps.agentManager.closeAgent?.(agentId)?.catch((closeErr: unknown) => {
+        deps.logger.warn(
+          { err: closeErr, agentId },
+          "Failed to close agent after timeline hydration failure",
+        );
+      });
+      throw loadError;
+    }
   })();
 
   const pending: PendingAgentInitialization = { promise: initPromise, options: pendingOptions };

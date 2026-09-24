@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import type { AgentModelDefinition } from "../agent-sdk-types.js";
 import {
   type ACPCatalogModelResolverContext,
@@ -16,6 +17,7 @@ interface KimiACPAgentClientOptions {
   providerId?: string;
   label?: string;
   providerParams?: unknown;
+  managedProcesses?: ManagedProcessRegistry;
 }
 
 // Kimi exposes thinking options only for the selected model. Keep its model-switching
@@ -90,6 +92,7 @@ export class KimiACPAgentClient extends GenericACPAgentClient {
       label: options.label,
       providerParams: options.providerParams,
       catalogModelResolver: resolveKimiCatalogModels,
+      managedProcesses: options.managedProcesses,
     });
   }
 }
