@@ -2645,6 +2645,11 @@ export class DaemonClient {
   }
 
   async removeWorkspace(workspaceId: string, requestId?: string): Promise<void> {
+    if (!this.lastServerInfoMessage) throw new DaemonConnectionError("Transport not connected");
+    // COMPAT(workspaceRemove): added in v0.9.2, remove after 2027-03-25 once daemon floor >= v0.9.2.
+    if (this.lastServerInfoMessage.features?.workspaceRemove !== true) {
+      throw new Error("Update Paseo on the host to remove workspaces.");
+    }
     const payload = await this.sendNamespacedCorrelatedSessionRequest<"workspace.remove.response">({
       requestId,
       message: { type: "workspace.remove.request", workspaceId },

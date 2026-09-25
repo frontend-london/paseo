@@ -3538,7 +3538,7 @@ test("sends project.remove.request", async () => {
   await expect(removePromise).resolves.toEqual({ removedWorkspaceIds: ["ws-main"] });
 });
 
-test("sends workspace.remove.request", async () => {
+test("does not send workspace.remove.request when the daemon lacks workspaceRemove", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
 
@@ -3552,7 +3552,30 @@ test("sends workspace.remove.request", async () => {
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: {} });
+  await connectPromise;
+
+  await expect(client.removeWorkspace("ws-orphan", "req-remove-workspace")).rejects.toThrow(
+    "Update Paseo on the host to remove workspaces.",
+  );
+  expect(mock.sent).toHaveLength(0);
+});
+
+test("sends workspace.remove.request when the daemon advertises workspaceRemove", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: { workspaceRemove: true } });
   await connectPromise;
 
   const removePromise = client.removeWorkspace("ws-orphan", "req-remove-workspace");
@@ -3592,7 +3615,7 @@ test("sends workspace.remove.request and throws on rejection", async () => {
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: { workspaceRemove: true } });
   await connectPromise;
 
   const removePromise = client.removeWorkspace("ws-active", "req-remove-workspace-reject");
