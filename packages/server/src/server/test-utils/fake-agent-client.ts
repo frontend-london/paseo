@@ -62,6 +62,7 @@ interface FakeAgentSessionOptions {
 }
 
 export interface TestAgentClientOptions {
+  beforeCreateSession?: () => Promise<void>;
   closeSession?: () => Promise<void>;
   onStartTurn?: (prompt: AgentPromptInput) => void;
   supportsMcpServers?: boolean;
@@ -737,6 +738,16 @@ class FakeAgentSession implements AgentSession {
       await this.appendHistoryEvent(turnStarted);
       this.notifySubscribers(turnStarted);
 
+      if (textPrompt === "Emit a provider child") {
+        const child: AgentStreamEvent = {
+          type: "provider_subagent",
+          provider: this.providerName,
+          event: { type: "upsert", id: "fixture-child", title: "Fixture child", status: "running" },
+        };
+        await this.appendHistoryEvent(child);
+        this.notifySubscribers(child);
+      }
+
       if (textPrompt.toLowerCase().includes("emit a turn failure")) {
         const failed: AgentStreamEvent = {
           type: "turn_failed",
@@ -1202,6 +1213,7 @@ class FakeAgentClient implements AgentClient {
     config: AgentSessionConfig,
     _launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    await this.options.beforeCreateSession?.();
     return new FakeAgentSession({
       providerName: this.provider,
       config: { ...config },
@@ -1215,7 +1227,9 @@ class FakeAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     _launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    options?.signal?.throwIfAborted();
     const cfg: AgentSessionConfig = {
       provider: this.provider,
       cwd: overrides?.cwd ?? process.cwd(),
@@ -1225,7 +1239,7 @@ class FakeAgentClient implements AgentClient {
       (handle.metadata as Record<string, unknown> | undefined)?.marker ??
       (handle.metadata as Record<string, unknown> | undefined)?.conversationId ??
       null;
-    return new FakeAgentSession({
+    const session = new FakeAgentSession({
       providerName: this.provider,
       config: cfg,
       supportsMcpServers: this.options.supportsMcpServers,
@@ -1234,6 +1248,11 @@ class FakeAgentClient implements AgentClient {
       closeSession: this.options.closeSession,
       onStartTurn: this.options.onStartTurn,
     });
+    if (options?.signal?.aborted) {
+      await session.close().catch(() => undefined);
+      throw options.signal.reason;
+    }
+    return session;
   }
 
   async fetchCatalog(
@@ -1280,4 +1299,11 @@ export function createTestAgentClients(
     codex: new FakeAgentClient("codex", options),
     opencode: new FakeAgentClient("opencode", options),
   };
+}
+
+export function createTestAgentClient(
+  provider: string,
+  options: TestAgentClientOptions = {},
+): AgentClient {
+  return new FakeAgentClient(provider, options);
 }

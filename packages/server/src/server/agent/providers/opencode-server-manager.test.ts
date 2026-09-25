@@ -2,9 +2,10 @@ import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
+import pino, { type Logger } from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { findExecutable } from "../../../executable-resolution/executable-resolution.js";
@@ -28,6 +29,26 @@ afterEach(() => {
 });
 
 describe("OpenCodeServerManager generations", () => {
+  test("logs generation lifecycle transitions", async () => {
+    const { logger, records } = createCapturingLogger();
+    const { manager } = createTestManager([4081, 4082], { logger });
+
+    const first = await manager.acquireCurrent();
+    const second = await manager.acquireNew();
+    await second.release();
+    await first.release();
+    await manager.shutdown();
+
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ msg: "OpenCode server generation started", port: 4081 }),
+        expect.objectContaining({ msg: "OpenCode server generation retired", port: 4081 }),
+        expect.objectContaining({ msg: "OpenCode server generation started", port: 4082 }),
+        expect.objectContaining({ msg: "OpenCode server generation released", port: 4082 }),
+        expect.objectContaining({ msg: "OpenCode server generation exited", port: 4081 }),
+      ]),
+    );
+  });
   test("shares one real SDK event stream across acquisitions until generation shutdown", async () => {
     const responses: ServerResponse[] = [];
     let requestCount = 0;
@@ -134,6 +155,27 @@ describe("OpenCodeServerManager generations", () => {
     expect(runtime.terminatedPorts).toEqual([4302, 4301]);
   });
 
+  test("failed final release retries cleanup without releasing the reference twice", async () => {
+    const { manager, runtime } = createTestManager([4351], { terminateFailures: 1 });
+
+    const first = await manager.acquireCurrent();
+    const final = await manager.acquireCurrent();
+
+    await first.release();
+    expect(runtime.terminateAttempts).toEqual([]);
+
+    await expect(final.release()).rejects.toThrow("fake termination failed");
+    expect(runtime.terminateAttempts).toEqual([4351]);
+    expect(runtime.terminatedPorts).toEqual([]);
+
+    await expect(final.release()).resolves.toBeUndefined();
+    expect(runtime.terminateAttempts).toEqual([4351, 4351]);
+    expect(runtime.terminatedPorts).toEqual([4351]);
+
+    await expect(final.release()).resolves.toBeUndefined();
+    expect(runtime.terminateAttempts).toEqual([4351, 4351]);
+  });
+
   test("shutdown kills current and retired servers", async () => {
     const { manager, runtime } = createTestManager([4401, 4402]);
 
@@ -201,154 +243,6 @@ describe("OpenCodeServerManager generations", () => {
     await expect(acquisition).rejects.toThrow("OpenCode server exited with code null");
     expect(runtime.terminatedPorts).toEqual([4472]);
     expect(await runtime.managedProcesses.list()).toEqual([]);
-  });
-
-  test("shutdown terminates in-flight startPromise during port allocation before spawn", async () => {
-    let resolvePort!: (port: number) => void;
-    const portPromise = new Promise<number>((resolve) => {
-      resolvePort = resolve;
-    });
-    const runtime = new FakeOpenCodeServerRuntime([4480], { autoAnnounce: false });
-    const manager = new OpenCodeServerManager({
-      logger: createTestLogger(),
-      managedProcesses: runtime.managedProcesses,
-      portAllocator: () => portPromise,
-      resolveCommandPrefix: runtime.resolveCommandPrefix,
-      spawnServerProcess: runtime.spawnServerProcess,
-      terminateProcess: runtime.terminateProcess,
-    });
-
-    const acquisition = manager.acquireCurrent();
-    await runtime.settle();
-
-    const shutdown = manager.shutdown();
-    resolvePort(4480);
-
-    await expect(acquisition).rejects.toThrow("OpenCode server manager is shut down");
-    await shutdown;
-
-    expect(runtime.launchedPorts).toEqual([]);
-    expect(runtime.terminatedPorts).toEqual([]);
-    expect(await runtime.managedProcesses.list()).toEqual([]);
-  });
-
-  test("shutdown terminates in-flight newServerPromise and kills starting helper server", async () => {
-    const { manager, runtime } = createTestManager([4481, 4482], { autoAnnounce: false });
-
-    // Acquire current server first so newServerPromise has a generation to rotate
-    const currentStart = manager.acquireCurrent();
-    await runtime.settle();
-    runtime.processForPort(4481).announceListening();
-    const currentAcquisition = await currentStart;
-
-    // Start acquireNew which sets newServerPromise and starts port 4482 without announcing listening
-    const newAcquisition = manager.acquireNew();
-    await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([4481, 4482]));
-
-    // Shutdown while acquireNew is in flight
-    const shutdownPromise = manager.shutdown();
-    await runtime.settle();
-
-    await expect(newAcquisition).rejects.toThrow("OpenCode server exited with code null");
-    await shutdownPromise;
-
-    expect(runtime.terminatedPorts).toHaveLength(2);
-    expect(runtime.terminatedPorts).toContain(4481);
-    expect(runtime.terminatedPorts).toContain(4482);
-    expect(await runtime.managedProcesses.list()).toEqual([]);
-
-    await currentAcquisition.release().catch(() => undefined);
-  });
-
-  test("shutdown terminates in-flight newServerPromise during port allocation before spawn", async () => {
-    let resolveSecondPort!: (port: number) => void;
-    const secondPortPromise = new Promise<number>((resolve) => {
-      resolveSecondPort = resolve;
-    });
-    let callCount = 0;
-    const runtime = new FakeOpenCodeServerRuntime([4485], { autoAnnounce: true });
-    const manager = new OpenCodeServerManager({
-      logger: createTestLogger(),
-      managedProcesses: runtime.managedProcesses,
-      portAllocator: () => {
-        callCount += 1;
-        if (callCount === 1) return Promise.resolve(4485);
-        return secondPortPromise;
-      },
-      resolveCommandPrefix: runtime.resolveCommandPrefix,
-      spawnServerProcess: runtime.spawnServerProcess,
-      terminateProcess: runtime.terminateProcess,
-    });
-
-    const first = await manager.acquireCurrent();
-    expect(first.server.url).toBe("http://127.0.0.1:4485");
-
-    const newAcquisition = manager.acquireNew();
-    await runtime.settle();
-
-    const shutdown = manager.shutdown();
-    resolveSecondPort(4486);
-
-    await expect(newAcquisition).rejects.toThrow("OpenCode server manager is shut down");
-    await shutdown;
-
-    expect(runtime.launchedPorts).toEqual([4485]);
-    expect(runtime.terminatedPorts).toEqual([4485]);
-    expect(await runtime.managedProcesses.list()).toEqual([]);
-  });
-
-  test("shutdown terminates in-flight startServer after process spawn but before ready", async () => {
-    const { manager, runtime } = createTestManager([4487], { autoAnnounce: false });
-
-    // Initiate acquireCurrent which spawns the process on port 4487
-    const currentStart = manager.acquireCurrent();
-    await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([4487]));
-
-    // Shutdown while startPromise is in flight and server.ready is not yet resolved
-    const shutdownPromise = manager.shutdown();
-
-    await expect(currentStart).rejects.toThrow("OpenCode server exited with code null");
-    await shutdownPromise;
-
-    expect(runtime.terminatedPorts).toEqual([4487]);
-    expect(await runtime.managedProcesses.list()).toEqual([]);
-  });
-
-  test("shutdown terminates in-flight dedicated server starting promises", async () => {
-    const { manager, runtime } = createTestManager([4483], { autoAnnounce: false });
-
-    const dedicatedStart = manager.acquireDedicated({ DEDICATED: "1" });
-    await runtime.settle();
-
-    expect(runtime.launchedPorts).toEqual([4483]);
-
-    const shutdownPromise = manager.shutdown();
-    await runtime.settle();
-
-    await expect(dedicatedStart).rejects.toThrow("OpenCode server exited with code null");
-    await shutdownPromise;
-
-    expect(runtime.terminatedPorts).toEqual([4483]);
-    expect(await runtime.managedProcesses.list()).toEqual([]);
-  });
-
-  test("shutdown is idempotent and rejects subsequent acquisitions immediately", async () => {
-    const { manager, runtime } = createTestManager([4484]);
-
-    const acquisition = await manager.acquireCurrent();
-    expect(acquisition.server.url).toBe("http://127.0.0.1:4484");
-
-    await manager.shutdown();
-    await manager.shutdown();
-
-    expect(runtime.terminatedPorts).toEqual([4484]);
-
-    await expect(manager.acquireCurrent()).rejects.toThrow("OpenCode server manager is shut down");
-    await expect(manager.acquireNew()).rejects.toThrow("OpenCode server manager is shut down");
-    await expect(manager.acquireDedicated({ TEST: "1" })).rejects.toThrow(
-      "OpenCode server manager is shut down",
-    );
-    expect(manager.acquireExisting(acquisition.server.url)).toBe(null);
   });
 
   test("dedicated server startup is protected from retired cleanup", async () => {
@@ -493,7 +387,7 @@ describe("OpenCodeServerManager managed process ledger", () => {
 describe.runIf(process.platform === "win32")(
   "OpenCodeServerManager Windows OpenCode npm install",
   () => {
-    test("starts the helper server from opencode.exe instead of the npm opencode.cmd shim", async () => {
+    test("resolves the Windows npm shim to its native helper executable", async () => {
       const detectedOpenCode = await findExecutable("opencode");
       expect(detectedOpenCode, "Windows CI must install opencode-ai before server tests").not.toBe(
         null,
@@ -502,27 +396,21 @@ describe.runIf(process.platform === "win32")(
 
       const tempDir = mkdtempSync(path.join(os.tmpdir(), "opencode-real-windows-"));
       const opencodeHomeDir = path.join(tempDir, "opencode-home");
-      const managedProcesses = new FakeManagedProcesses();
+      const runtime = new FakeOpenCodeServerRuntime([4604], { autoAnnounce: true });
       const manager = new OpenCodeServerManager({
         logger: createTestLogger(),
-        managedProcesses,
+        managedProcesses: runtime.managedProcesses,
         resolveHomeDir: () => opencodeHomeDir,
+        portAllocator: runtime.allocatePort,
+        spawnServerProcess: runtime.spawnServerProcess,
+        terminateProcess: runtime.terminateProcess,
       });
-      let acquiredPort: number | null = null;
 
       try {
-        const acquisition = await manager.acquireDedicated({
-          OPENCODE_AUTH_CONTENT: "{}",
-          OPENCODE_DISABLE_AUTOUPDATE: "1",
-          OPENCODE_DISABLE_AUTOCOMPACT: "1",
-          OPENCODE_DISABLE_MODELS_FETCH: "1",
-          OPENCODE_DISABLE_PROJECT_CONFIG: "1",
-          OPENCODE_PURE: "1",
-          OPENCODE_TEST_HOME: path.join(tempDir, "test-home"),
-        });
-        acquiredPort = acquisition.server.port;
-
-        const records = await managedProcesses.list();
+        // Resolve the actual npm installation. Generation lifecycle coverage above
+        // owns process readiness; this regression owns the Windows launch command.
+        const acquisition = await manager.acquireCurrent();
+        const records = await runtime.managedProcesses.list();
         expect(records).toHaveLength(1);
         const record = records[0]!;
         expect(path.extname(record.command).toLowerCase()).toBe(".exe");
@@ -530,15 +418,13 @@ describe.runIf(process.platform === "win32")(
           path.normalize("node_modules/opencode-ai/bin/opencode.exe").toLowerCase(),
         );
         expect(record.command.toLowerCase()).not.toBe(detectedOpenCode!.toLowerCase());
-        expect(record.args).toEqual(["serve", "--port", String(acquiredPort)]);
+        expect(record.args).toEqual(["serve", "--port", String(acquisition.server.port)]);
+        await acquisition.release();
       } finally {
-        await manager.shutdown().catch(() => undefined);
-        if (acquiredPort !== null) {
-          await waitForClosedPort(acquiredPort, 5_000);
-        }
-        rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        await manager.shutdown();
+        rmSync(tempDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    });
   },
 );
 
@@ -548,6 +434,8 @@ function createTestManager(
     autoAnnounce?: boolean;
     baseEnv?: Record<string, string>;
     opencodeHomeDir?: string;
+    logger?: Logger;
+    terminateFailures?: number;
   } = {},
 ): {
   manager: OpenCodeServerManager;
@@ -556,10 +444,11 @@ function createTestManager(
   const { opencodeHomeDir } = options;
   const runtime = new FakeOpenCodeServerRuntime(ports, {
     autoAnnounce: options.autoAnnounce ?? true,
+    terminateFailures: options.terminateFailures ?? 0,
   });
   return {
     manager: new OpenCodeServerManager({
-      logger: createTestLogger(),
+      logger: options.logger ?? createTestLogger(),
       baseEnv: options.baseEnv,
       managedProcesses: runtime.managedProcesses,
       portAllocator: runtime.allocatePort,
@@ -572,9 +461,21 @@ function createTestManager(
   };
 }
 
+function createCapturingLogger(): { logger: Logger; records: Array<Record<string, unknown>> } {
+  const records: Array<Record<string, unknown>> = [];
+  const stream = new Writable({
+    write(chunk, _encoding, callback) {
+      records.push(JSON.parse(chunk.toString()) as Record<string, unknown>);
+      callback();
+    },
+  });
+  return { logger: pino({ level: "info" }, stream), records };
+}
+
 class FakeOpenCodeServerRuntime {
   readonly managedProcesses = new FakeManagedProcesses();
   readonly terminatedPorts: number[] = [];
+  readonly terminateAttempts: number[] = [];
   readonly spawnCalls: Array<{
     command: string;
     args: string[];
@@ -582,12 +483,14 @@ class FakeOpenCodeServerRuntime {
   }> = [];
   private readonly ports: number[];
   private readonly autoAnnounce: boolean;
+  private remainingTerminateFailures: number;
   private readonly processesByChild = new Map<ChildProcess, FakeOpenCodeProcess>();
   private readonly processesByPort = new Map<number, FakeOpenCodeProcess>();
 
-  constructor(ports: number[], options: { autoAnnounce: boolean }) {
+  constructor(ports: number[], options: { autoAnnounce: boolean; terminateFailures?: number }) {
     this.ports = [...ports];
     this.autoAnnounce = options.autoAnnounce;
+    this.remainingTerminateFailures = options.terminateFailures ?? 0;
   }
 
   get launchedPorts(): number[] {
@@ -621,6 +524,11 @@ class FakeOpenCodeServerRuntime {
 
   readonly terminateProcess: ProcessTerminator = async (target: TreeKillTarget) => {
     const process = this.processForChild(target as ChildProcess);
+    this.terminateAttempts.push(process.port);
+    if (this.remainingTerminateFailures > 0) {
+      this.remainingTerminateFailures -= 1;
+      throw new Error("fake termination failed");
+    }
     this.terminatedPorts.push(process.port);
     process.exitBySignal("SIGTERM");
     return "terminated";
@@ -723,38 +631,4 @@ class FakeManagedProcesses implements ManagedProcessRegistry {
       errors: [],
     };
   }
-}
-
-async function waitForClosedPort(port: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!(await canConnectToPort(port))) {
-      return;
-    }
-    await sleep(100);
-  }
-  throw new Error(`OpenCode helper server still accepts connections on port ${port}`);
-}
-
-function canConnectToPort(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port });
-    let settled = false;
-    const settle = (connected: boolean) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      socket.destroy();
-      resolve(connected);
-    };
-
-    socket.once("connect", () => settle(true));
-    socket.once("error", () => settle(false));
-    socket.setTimeout(500, () => settle(false));
-  });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

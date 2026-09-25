@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
-import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema, CommandError } from "../../output/index.js";
 
 export function addInspectOptions(cmd: Command): Command {
@@ -46,6 +46,8 @@ interface AgentInspect {
   }>;
   Worktree: string | null;
   ParentAgentId: string | null;
+  WorkspaceId: string | null;
+  Labels: Record<string, string>;
 }
 
 /** Key-value row for table display */
@@ -151,6 +153,8 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     })),
     Worktree: snapshot.labels?.["paseo.worktree"] ?? null,
     ParentAgentId: snapshot.labels?.[PARENT_AGENT_ID_LABEL] ?? null,
+    WorkspaceId: snapshot.workspaceId ?? null,
+    Labels: snapshot.labels ?? {},
   };
 }
 
@@ -202,6 +206,7 @@ function toInspectRows(agent: AgentInspect): InspectRow[] {
 
   rows.push({ key: "Worktree", value: agent.Worktree ?? "null" });
   rows.push({ key: "ParentAgentId", value: agent.ParentAgentId ?? "null" });
+  rows.push({ key: "WorkspaceId", value: agent.WorkspaceId ?? "null" });
 
   return rows;
 }
@@ -217,8 +222,6 @@ export async function runInspectCommand(
   options: AgentInspectOptions,
   _command: Command,
 ): Promise<AgentInspectResult> {
-  const host = getDaemonHost({ host: options.host });
-
   // Validate arguments
   if (!agentIdArg || agentIdArg.trim().length === 0) {
     const error: CommandError = {
@@ -229,18 +232,7 @@ export async function runInspectCommand(
     throw error;
   }
 
-  let client;
-  try {
-    client = await connectToDaemon({ host: options.host });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const error: CommandError = {
-      code: "DAEMON_NOT_RUNNING",
-      message: `Cannot connect to daemon at ${host}: ${message}`,
-      details: "Start the daemon with: paseo daemon start",
-    };
-    throw error;
-  }
+  const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
     const fetchResult = await client.fetchAgent({ agentId: agentIdArg });

@@ -30,6 +30,7 @@ import type {
 // guard: deriving the boundary from OPENCODE_SERVER_STARTUP_TIMEOUT_MS would keep the
 // readiness tests green if that constant were shortened below the required budget.
 const EXPECTED_STARTUP_BUDGET_MS = 30_000;
+const EXPECTED_EVENT_READINESS_BUDGET_MS = 45_000;
 
 function tmpCwd(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "opencode-agent-test-"));
@@ -78,11 +79,21 @@ const TEST_MODEL = "opencode/big-pickle";
 function createDirectEventSource(client: OpencodeClient): OpenCodeEventSource {
   const listeners = new Set<(input: never) => void>();
   const abort = new AbortController();
+  let connected = false;
   void client.global
     .event({ signal: abort.signal, sseMaxRetryAttempts: 0 })
     .then(async ({ stream }) => {
       for await (const event of stream) {
-        for (const listener of listeners) listener(event as never);
+        const payload = "payload" in event ? event.payload : event;
+        if (!connected && payload.type === "server.connected") {
+          connected = true;
+          continue;
+        }
+        for (const listener of listeners) {
+          listener(
+            ("payload" in event ? event : { directory: "/tmp/test", payload: event }) as never,
+          );
+        }
       }
       return undefined;
     });
@@ -343,6 +354,43 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     rmSync(cwd, { recursive: true, force: true });
   }, 60_000);
 
+  test("retries server release after a failed close without losing ownership", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    runtime.enqueueClient(openCode);
+    let releaseAttempts = 0;
+    const release = vi.fn(async () => {
+      releaseAttempts += 1;
+      if (releaseAttempts === 1) {
+        throw new Error("release failed");
+      }
+    });
+    vi.spyOn(runtime, "acquireCurrent").mockResolvedValue({
+      server: runtime.server,
+      events: runtime.events,
+      release,
+    });
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession(buildConfig(cwd));
+
+    try {
+      await expect(session.close()).rejects.toThrow("release failed");
+      expect(release).toHaveBeenCalledTimes(1);
+
+      await expect(session.close()).resolves.toBeUndefined();
+      expect(release).toHaveBeenCalledTimes(2);
+
+      await expect(session.close()).resolves.toBeUndefined();
+      expect(release).toHaveBeenCalledTimes(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("creates a session when session.create needs more than ten seconds", async () => {
     vi.useFakeTimers();
     const cwd = tmpCwd();
@@ -449,7 +497,7 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
       {
         sessionID: "session-1",
         directory: cwd,
-        time: { archived: null },
+        time: { archived: 0 },
       },
     ]);
     expect(runtime.acquisitions.every((acquisition) => acquisition.releaseCount === 1)).toBe(true);
@@ -600,6 +648,115 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     await session.close();
     rmSync(cwd, { recursive: true, force: true });
   }, 120_000);
+
+  test.each([
+    { name: "absent", variants: {} },
+    { name: "empty", variants: { default: {} } },
+    { name: "configured", variants: { default: { reasoningEffort: "low" } } },
+  ])("catalog exposes one Default when upstream default is $name", async ({ variants }) => {
+    const runtime = new TestOpenCodeHarness();
+    const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.providerListResponse = {
+      data: {
+        connected: ["catalog-provider"],
+        all: [
+          {
+            id: "catalog-provider",
+            name: "Catalog provider",
+            source: "api",
+            models: {
+              model: {
+                name: "Variant model",
+                variants: { ...variants, high: {}, "variant:default": {} },
+              },
+            },
+          },
+        ],
+      },
+    };
+    runtime.enqueueClient(openCodeClient);
+    const cwd = tmpCwd();
+    try {
+      const client = new OpenCodeAgentClient(logger, undefined, {
+        serverManager: runtime,
+        createClient: runtime.createClient,
+        resolveHomeDir: () => cwd,
+      });
+      const catalog = await client.fetchCatalog({ scope: "global", force: false });
+      const options = catalog.models[0].thinkingOptions ?? [];
+      expect(options).toEqual([
+        { id: "default", label: "Default", isDefault: true },
+        { id: "high", label: "high" },
+        { id: "variant:default", label: "variant:default" },
+      ]);
+      expect(catalog.models[0].defaultThinkingOptionId).toBe("default");
+      const execution = new TestOpenCodeClient();
+      execution.sessionCreateResponse = { data: { id: "ses_catalog_variants" } };
+      execution.sessionPromptAsyncEvents = [
+        { type: "session.idle", properties: { sessionID: "ses_catalog_variants" } },
+      ];
+      runtime.enqueueClient(execution);
+      const session = await client.createSession({
+        provider: "opencode",
+        cwd,
+        model: "catalog-provider/model",
+        thinkingOptionId: "default",
+      });
+      try {
+        await collectTurnEvents(streamSession(session, "Use OpenCode's default"));
+        await session.setThinkingOption!("high");
+        await collectTurnEvents(streamSession(session, "Use high"));
+        await session.setThinkingOption!("variant:default");
+        await collectTurnEvents(streamSession(session, "Use the literal variant name"));
+        await session.setThinkingOption!("default");
+        await collectTurnEvents(streamSession(session, "Return to OpenCode's default"));
+        expect(execution.calls.sessionPromptAsync).toEqual([
+          expect.not.objectContaining({ variant: expect.anything() }),
+          expect.objectContaining({ variant: "high" }),
+          expect.objectContaining({ variant: "variant:default" }),
+          expect.not.objectContaining({ variant: expect.anything() }),
+        ]);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    { saved: "default", variant: undefined },
+    { saved: "high", variant: "high" },
+    { saved: "variant:default", variant: "variant:default" },
+  ])("resume preserves saved thinking choice $saved", async ({ saved, variant }) => {
+    const runtime = new TestOpenCodeHarness();
+    const execution = new TestOpenCodeClient();
+    execution.sessionPromptAsyncEvents = [
+      { type: "session.idle", properties: { sessionID: "ses_saved_variant" } },
+    ];
+    runtime.enqueueClient(execution);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const cwd = tmpCwd();
+    try {
+      const session = await client.resumeSession(
+        { provider: "opencode", sessionId: "ses_saved_variant", metadata: { cwd } },
+        { thinkingOptionId: saved },
+      );
+      try {
+        await collectTurnEvents(streamSession(session, "Keep my saved choice"));
+        expect(execution.calls.sessionPromptAsync.map((request) => request.variant)).toEqual([
+          variant,
+        ]);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
   test("fetchCatalog returns models with required fields", async () => {
     const runtime = new TestOpenCodeHarness();
@@ -2265,49 +2422,41 @@ describe("OpenCode adapter startTurn error handling", () => {
   });
 
   test("sends exact Hub MCP permission grants without approving unrelated tools", async () => {
-    const promptAsync = vi.fn(async () => ({ data: {}, error: undefined }));
-    const fakeClient = {
-      global: {
-        event: vi.fn().mockImplementation(async ({ signal }: { signal: AbortSignal }) => ({
-          stream: {
-            async *[Symbol.asyncIterator](): AsyncGenerator<OpenCodeEvent> {
-              yield { type: "server.connected", properties: {} } as OpenCodeEvent;
-              await waitForAbort(signal);
-            },
-          },
-        })),
-      },
-      session: { promptAsync },
-    } as never;
-    const session = new __openCodeInternals.OpenCodeAgentSession(
-      {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    try {
+      const session = await client.createSession({
         provider: "opencode",
-        cwd: "/tmp/test",
-        providerOptions: { permission: { bash: "ask", hub_reply: "deny" } },
+        cwd,
+        providerOptions: { permission: { bash: "ask", question: "deny" } },
         toolPolicy: {
           preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }],
         },
-      },
-      fakeClient,
-      "ses_unit_test",
-      createTestLogger(),
-    );
-
-    await session.startTurn("finish");
-
-    expect(promptAsync).toHaveBeenCalledWith(
-      expect.objectContaining({
-        permission: [
+      });
+      try {
+        const created = openCode.calls.sessionCreate[0] as {
+          permission?: Array<{ permission: string; pattern: string; action: string }>;
+        };
+        expect(created.permission).toEqual([
           { permission: "hub_finish_execution", pattern: "*", action: "allow" },
           { permission: "bash", pattern: "*", action: "ask" },
-          { permission: "hub_reply", pattern: "*", action: "deny" },
-        ],
-      }),
-    );
-    expect(promptAsync.mock.calls[0]?.[0].permission).not.toContainEqual(
-      expect.objectContaining({ permission: "bash", action: "allow" }),
-    );
-    await session.close();
+          { permission: "question", pattern: "*", action: "deny" },
+        ]);
+        expect(created.permission).not.toContainEqual(
+          expect.objectContaining({ permission: "bash", action: "allow" }),
+        );
+      } finally {
+        await session.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test("waits for the stop abort and provider idle before starting the next prompt", async () => {
@@ -2963,7 +3112,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("/summarize");
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(countEvents(events, "turn_completed")).toBe(1));
 
       expect(openCode.calls.sessionMessages).toHaveLength(0);
@@ -3035,7 +3184,7 @@ describe("OpenCode adapter startTurn error handling", () => {
           return recoveredMessages;
         };
 
-        openCode.emitEvent({ type: "reconnected" });
+        openCode.emitEvent({ type: "server.connected", properties: {} });
         await vi.waitFor(() =>
           expect(failedRequest === "status" ? statusAttempts : messageAttempts).toBe(1),
         );
@@ -3072,7 +3221,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("missing dispatch");
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(countEvents(events, "turn_failed")).toBe(1));
       await vi.advanceTimersByTimeAsync(5_000);
 
@@ -3096,7 +3245,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("keep live ingress moving");
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(openCode.calls.sessionStatus).toHaveLength(1));
       openCode.emitEvent({ type: "session.idle", properties: { sessionID: session.id } });
       await vi.waitFor(() => expect(countEvents(events, "turn_completed")).toBe(1));
@@ -3134,7 +3283,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("first turn");
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await firstStatus.promise;
       openCode.emitEvent({ type: "session.idle", properties: { sessionID: session.id } });
       await firstCompletion.promise;
@@ -3176,7 +3325,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("first turn");
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(statusAttempts).toBe(1));
       await vi.advanceTimersByTimeAsync(100);
       await retryStarted.promise;
@@ -3215,12 +3364,12 @@ describe("OpenCode adapter startTurn error handling", () => {
     await vi.waitFor(() => expect(session.getPendingPermissions()).toHaveLength(1));
 
     openCode.permissionListResponse = { error: new Error("snapshot failed") };
-    openCode.emitEvent({ type: "reconnected" });
+    openCode.emitEvent({ type: "server.connected", properties: {} });
     await vi.waitFor(() => expect(openCode.calls.permissionList).toHaveLength(1));
     expect(session.getPendingPermissions()).toHaveLength(1);
 
     openCode.permissionListResponse = { data: [] };
-    openCode.emitEvent({ type: "reconnected" });
+    openCode.emitEvent({ type: "server.connected", properties: {} });
     await vi.waitFor(() => expect(session.getPendingPermissions()).toHaveLength(0));
     expect(events).toContainEqual(
       expect.objectContaining({ type: "permission_resolved", requestId: "permission-1" }),
@@ -3315,7 +3464,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         ],
       };
 
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() =>
         expect(countChildStatuses(events, recoveryCase.status, childId)).toBeGreaterThanOrEqual(1),
       );
@@ -3337,7 +3486,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
       openCode.permissionListResponse = { error: new Error("permission snapshot failed") };
       openCode.questionListResponse = { error: new Error("question snapshot failed") };
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(openCode.calls.permissionList.length).toBeGreaterThan(1));
       expect(parent.getPendingPermissions()).toEqual([]);
 
@@ -3360,13 +3509,13 @@ describe("OpenCode adapter startTurn error handling", () => {
         },
       });
       await vi.waitFor(() => expect(parent.getPendingPermissions()).toHaveLength(2));
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(openCode.calls.permissionList.length).toBeGreaterThan(2));
       expect(parent.getPendingPermissions()).toHaveLength(2);
 
       openCode.permissionListResponse = { data: [] };
       openCode.questionListResponse = { data: [] };
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await vi.waitFor(() => expect(parent.getPendingPermissions()).toHaveLength(0));
       await parent.close();
     }
@@ -3410,7 +3559,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       ],
     };
 
-    openCode.emitEvent({ type: "reconnected" });
+    openCode.emitEvent({ type: "server.connected", properties: {} });
     await vi.waitFor(() => expect(countChildStatuses(events, "failed", childId)).toBe(1));
     const recoveredStatuses = events.flatMap((event) =>
       event.type === "provider_subagent" &&
@@ -3469,7 +3618,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       throw new Error("child messages unavailable");
     };
 
-    openCode.emitEvent({ type: "reconnected" });
+    openCode.emitEvent({ type: "server.connected", properties: {} });
     await vi.waitFor(() => expect(openCode.calls.sessionMessages).toHaveLength(1));
     const recoveredStatuses = events.flatMap((event) =>
       event.type === "provider_subagent" &&
@@ -3540,7 +3689,7 @@ describe("OpenCode adapter startTurn error handling", () => {
     await session.close();
   });
 
-  test("bounds dispatch readiness at the server startup budget without sending a prompt", async () => {
+  test("bounds dispatch readiness without sending a prompt", async () => {
     vi.useFakeTimers();
     const openCode = new TestOpenCodeClient();
     const session = new __openCodeInternals.OpenCodeAgentSession(
@@ -3552,20 +3701,32 @@ describe("OpenCode adapter startTurn error handling", () => {
       {
         ready: () => new Promise<void>(() => undefined),
         subscribe: () => () => undefined,
+        diagnostics: () => ({
+          attempt: 2,
+          phase: "first-record",
+          elapsedMs: EXPECTED_EVENT_READINESS_BUDGET_MS,
+          lastOutcome: "watchdog",
+        }),
       },
     );
     try {
       const dispatch = session.startTurn("wait for transport");
-      const rejection = expect(dispatch).rejects.toThrow("OpenCode event stream first record");
+      const rejection = expect(dispatch).rejects.toThrow(
+        "OpenCode server.connected event; your message was not sent. opencode-stream attempt=2 phase=first-record elapsedMs=45000 lastOutcome=watchdog",
+      );
       let settled = false;
-      const markSettled = () => {
-        settled = true;
-      };
-      void dispatch.then(markSettled, markSettled);
+      void dispatch.then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        () => {
+          settled = true;
+          return undefined;
+        },
+      );
 
-      await vi.advanceTimersByTimeAsync(EXPECTED_STARTUP_BUDGET_MS - 1);
-      // Still waiting one tick before the budget: a shorter readiness timeout would have
-      // already failed the dispatch here.
+      await vi.advanceTimersByTimeAsync(EXPECTED_EVENT_READINESS_BUDGET_MS - 1);
       expect(settled).toBe(false);
       expect(openCode.calls.sessionPromptAsync).toHaveLength(0);
 
@@ -3597,11 +3758,39 @@ describe("OpenCode adapter startTurn error handling", () => {
     );
     try {
       const dispatch = session.startTurn("wait for a slow transport");
-      // OpenCode installs with plugins have been observed taking well past ten seconds
-      // to emit their first SSE record.
       await vi.advanceTimersByTimeAsync(20_000);
       expect(openCode.calls.sessionPromptAsync).toHaveLength(0);
 
+      streamReady.resolve();
+      await dispatch;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(openCode.calls.sessionPromptAsync).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      streamReady.resolve();
+      await session.close();
+    }
+  });
+
+  test("allows the shared stream to recover once after its thirty-second watchdog", async () => {
+    vi.useFakeTimers();
+    const openCode = new TestOpenCodeClient();
+    openCode.sessionPromptAsyncEvents = [];
+    const streamReady = createTestDeferred<void>();
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/workspace/repo" },
+      openCode.asSdkClient(),
+      "ses_readiness_retry",
+      createTestLogger(),
+      new Map(),
+      {
+        ready: () => streamReady.promise,
+        subscribe: () => () => undefined,
+      },
+    );
+    try {
+      const dispatch = session.startTurn("wait for the producer retry");
+      await vi.advanceTimersByTimeAsync(35_000);
       streamReady.resolve();
       await dispatch;
       await vi.advanceTimersByTimeAsync(0);
@@ -3668,7 +3857,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         await session.startTurn("keep running");
       }
 
-      openCode.emitEvent({ type: "reconnected" });
+      openCode.emitEvent({ type: "server.connected", properties: {} });
       await Promise.race([
         blocked.promise,
         new Promise((_, reject) =>
@@ -4363,6 +4552,7 @@ describe("OpenCode provider subagent contract", () => {
       event: {
         type: "upsert",
         id: "ses_child_registry",
+        parentSubagentId: null,
         description: "Live child",
         status: "running",
       },
@@ -5287,6 +5477,7 @@ describe("OpenCode provider subagent contract", () => {
       event: {
         type: "upsert",
         id: "ses_child_background",
+        parentSubagentId: null,
         description: "Plugin child",
         status: "running",
       },
@@ -5335,6 +5526,7 @@ describe("OpenCode provider subagent contract", () => {
         event: {
           type: "upsert",
           id: "ses_child_plugin",
+          parentSubagentId: null,
           description: "Background plugin child",
           status: "running",
         },
@@ -5578,6 +5770,7 @@ describe("OpenCode provider subagent contract", () => {
         event: {
           type: "upsert",
           id: "ses_child_rich",
+          parentSubagentId: null,
           title: "explore",
           description: "Investigate flaky test",
           status: "running",
@@ -5604,7 +5797,12 @@ describe("OpenCode provider subagent contract", () => {
       {
         type: "provider_subagent",
         provider: "opencode",
-        event: { type: "upsert", id: "ses_child_bare", status: "running" },
+        event: {
+          type: "upsert",
+          id: "ses_child_bare",
+          parentSubagentId: null,
+          status: "running",
+        },
       },
     ]);
   });
@@ -5929,12 +6127,24 @@ describe("OpenCode provider subagent contract", () => {
       {
         type: "provider_subagent",
         provider: "opencode",
-        event: { type: "upsert", id: "ses_child_a", description: "Child A", status: "completed" },
+        event: {
+          type: "upsert",
+          id: "ses_child_a",
+          parentSubagentId: null,
+          description: "Child A",
+          status: "completed",
+        },
       },
       {
         type: "provider_subagent",
         provider: "opencode",
-        event: { type: "upsert", id: "ses_child_b", description: "Child B", status: "completed" },
+        event: {
+          type: "upsert",
+          id: "ses_child_b",
+          parentSubagentId: null,
+          description: "Child B",
+          status: "completed",
+        },
       },
       {
         type: "provider_subagent",
@@ -5942,6 +6152,7 @@ describe("OpenCode provider subagent contract", () => {
         event: {
           type: "upsert",
           id: "ses_grandchild_a",
+          parentSubagentId: "ses_child_a",
           description: "Grandchild A",
           status: "completed",
         },
@@ -6004,6 +6215,7 @@ describe("OpenCode provider subagent contract", () => {
       event: {
         type: "upsert",
         id: "ses_child_with_history",
+        parentSubagentId: null,
         description: "Historical child",
         status: "completed",
         cwd: "/workspace/child",
@@ -6091,6 +6303,7 @@ describe("OpenCode provider subagent contract", () => {
       event: {
         type: "upsert",
         id: "ses_child_hydrated_facts",
+        parentSubagentId: null,
         description: "Chase the regression",
         status: "completed",
         subtitle: "claude-sonnet-5 · Max",
@@ -6310,7 +6523,7 @@ describe("OpenCode provider subagent contract", () => {
           messageID: "msg_child_prompt",
           type: "text",
           text: "Inspect the auth flow.",
-          time: { start: 1, end: 2 },
+          time: { start: 1 },
         },
       },
     });
@@ -6550,32 +6763,123 @@ describe("OpenCode snapshot summary false-idle regression", () => {
   });
 });
 
-describe("OpenCode session close idempotency and terminal error teardown", () => {
-  test("close is idempotent, shares in-flight promise, and releases server exactly once", async () => {
+describe("OpenCode session permission rules", () => {
+  const logger = createTestLogger();
+  function permissionConfig(cwd: string): AgentSessionConfig {
+    return {
+      provider: "opencode",
+      cwd,
+      providerOptions: { permission: { bash: "ask", external_directory: "allow" } },
+      toolPolicy: { preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }] },
+    };
+  }
+  // OpenCode stores permission rules on the session (POST /session, PATCH /session/{id}) and
+  // drops an unknown `permission` field on prompt_async, so rules sent with a prompt never
+  // reach the server.
+  const expectedRules = [
+    { permission: "hub_finish_execution", pattern: "*", action: "allow" },
+    { permission: "bash", pattern: "*", action: "ask" },
+    { permission: "external_directory", pattern: "*", action: "allow" },
+  ];
+
+  test("creates the session with the agent's permission rules", async () => {
+    const cwd = tmpCwd();
     const runtime = new TestOpenCodeHarness();
-    const openCodeClient = new TestOpenCodeClient();
-    openCodeClient.sessionCreateResponse = { data: { id: "ses_close_idempotent" } };
-    runtime.enqueueClient(openCodeClient);
-    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    const openCode = new TestOpenCodeClient();
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
       serverManager: runtime,
       createClient: runtime.createClient,
     });
-    const session = await client.createSession(
-      { provider: "opencode", cwd: "/workspace/repo" },
-      { env: { PASEO_AGENT_ID: "close-agent" } },
-    );
+    try {
+      const session = await client.createSession(permissionConfig(cwd));
+      try {
+        expect(openCode.calls.sessionCreate[0]).toEqual(
+          expect.objectContaining({ permission: expectedRules }),
+        );
+      } finally {
+        await session.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
-    // Call close concurrently multiple times
-    const p1 = session.close();
-    const p2 = session.close();
-    const [r1, r2] = await Promise.all([p1, p2]);
-    expect(r1).toBeUndefined();
-    expect(r2).toBeUndefined();
+  test("applies the agent's permission rules to a resumed session", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    try {
+      const session = await client.resumeSession(
+        { provider: "opencode", sessionId: "ses_resumed_rules", metadata: { cwd } },
+        permissionConfig(cwd),
+      );
+      try {
+        expect(openCode.calls.sessionUpdate[0]).toEqual(
+          expect.objectContaining({
+            sessionID: "ses_resumed_rules",
+            permission: expectedRules,
+          }),
+        );
+      } finally {
+        await session.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
-    // Call close again after settling
-    await expect(session.close()).resolves.toBeUndefined();
+  test("fails the resume when the rules cannot be applied", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    openCode.sessionUpdateResponse = { error: { data: { message: "session is archived" } } };
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    try {
+      // Resuming without the rules would run the agent under a more permissive policy than
+      // the one it was configured with, which is the failure this guards.
+      await expect(
+        client.resumeSession(
+          { provider: "opencode", sessionId: "ses_archived", metadata: { cwd } },
+          permissionConfig(cwd),
+        ),
+      ).rejects.toThrow("Failed to apply OpenCode session permission rules");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
-    // Server should only have been released once (acquired once, released once)
-    expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
+  test("leaves a session without rules untouched", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    try {
+      const session = await client.resumeSession({
+        provider: "opencode",
+        sessionId: "ses_resumed_no_rules",
+        metadata: { cwd },
+      });
+      try {
+        expect(openCode.calls.sessionUpdate).toEqual([]);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });

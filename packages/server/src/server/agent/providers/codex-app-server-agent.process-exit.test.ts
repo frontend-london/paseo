@@ -6,13 +6,12 @@ import { expect, test } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "../agent-manager.js";
-import { AgentStorage } from "../agent-storage.js";
-import { ensureAgentLoaded } from "../agent-loading.js";
 import type {
   AgentClient,
   AgentLaunchContext,
   AgentSession,
   AgentSessionConfig,
+  AgentStreamEvent,
 } from "../agent-sdk-types.js";
 import { CodexAppServerAgentClient, CodexAppServerAgentSession } from "./codex-app-server-agent.js";
 import {
@@ -21,6 +20,87 @@ import {
 } from "./codex/test-utils/fake-app-server.js";
 
 const logger = createTestLogger();
+
+interface PendingPlanLifecycle {
+  close(): Promise<void>;
+  crashDuringActiveTurn(): Promise<void>;
+  expectCanceledPlan(): void;
+}
+
+async function withPendingPlan(
+  runScenario: (plan: PendingPlanLifecycle) => Promise<void>,
+): Promise<void> {
+  const workdir = mkdtempSync(join(tmpdir(), "codex-plan-cancel-"));
+  const appServer = createFakeCodexAppServer();
+  const client = new ProcessExitCodexClient([appServer]);
+  const session = await client.createSession({
+    provider: "codex",
+    cwd: workdir,
+    modeId: "auto",
+    model: "gpt-5.4",
+    featureValues: { plan_mode: true },
+  });
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  try {
+    const run = session.run("make a plan");
+    await appServer.waitForTurnStart();
+    appServer.startsTurn({ threadId: "thread-1", turnId: "plan-turn" });
+    appServer.updatesPlan({ threadId: "thread-1", steps: ["Inspect README"] });
+    appServer.completeTurn();
+    await run;
+    const proposal = events.find(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.name === "plan_approval",
+    );
+    expect(proposal).toBeDefined();
+    const [request] = session.getPendingPermissions?.() ?? [];
+    expect(request).toBeDefined();
+    await runScenario({
+      close: () => session.close(),
+      async crashDuringActiveTurn() {
+        appServer.startsTurn({ threadId: "thread-1", turnId: "autonomous-turn" });
+        await expect
+          .poll(() => events.filter((event) => event.type === "turn_started").length)
+          .toBe(2);
+        appServer.child.emit("exit", 17, null);
+        await expect.poll(() => events.some((event) => event.type === "turn_failed")).toBe(true);
+      },
+      expectCanceledPlan() {
+        expect(session.getPendingPermissions?.()).toEqual([]);
+        expect(events).toContainEqual({
+          ...proposal,
+          item: expect.objectContaining({
+            type: "tool_call",
+            name: "plan_approval",
+            callId: request?.id,
+            status: "canceled",
+            detail: { type: "plan", text: "- Inspect README" },
+          }),
+        });
+      },
+    });
+  } finally {
+    await session.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+}
+
+test("closing a session retains a canceled pending plan", async () => {
+  await withPendingPlan(async (plan) => {
+    await plan.close();
+    plan.expectCanceledPlan();
+  });
+});
+
+test("an active provider crash retains a canceled pending plan", async () => {
+  await withPendingPlan(async (plan) => {
+    await plan.crashDuringActiveTurn();
+    plan.expectCanceledPlan();
+  });
+});
 
 class ProcessExitCodexClient extends CodexAppServerAgentClient implements AgentClient {
   constructor(private readonly appServers: FakeCodexAppServer[]) {
@@ -54,20 +134,6 @@ class ProcessExitCodexClient extends CodexAppServerAgentClient implements AgentC
     );
     await session.connect();
     return session;
-  }
-
-  override async resumeSession(
-    _handle: unknown,
-    overrides?: Partial<AgentSessionConfig>,
-    launchContext?: AgentLaunchContext,
-  ): Promise<AgentSession> {
-    return this.createSession(
-      {
-        provider: "codex",
-        cwd: overrides?.cwd ?? process.cwd(),
-      },
-      launchContext,
-    );
   }
 }
 
@@ -327,11 +393,9 @@ test("failed reconnect preserves manager events for a later successful run", asy
 
 test("unexpected exit fails an autonomous Codex turn", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "codex-process-autonomous-exit-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
   const appServer = createFakeCodexAppServer();
   const manager = new AgentManager({
     clients: { codex: new ProcessExitCodexClient([appServer]) },
-    registry: storage,
     logger,
   });
   const events: AgentManagerEvent[] = [];
@@ -351,10 +415,8 @@ test("unexpected exit fails an autonomous Codex turn", async () => {
     appServer.child.stderr.write("autonomous provider crashed");
     appServer.child.emit("exit", 23, null);
 
-    await expect.poll(async () => (await storage.get(agent.id))?.lastStatus).toBe("closed");
-    const persisted = await storage.get(agent.id);
-    expect(persisted?.attentionReason).toBe("error");
-    expect(persisted?.lastError).toBe(
+    await expect.poll(() => manager.getAgent(agent.id)?.lifecycle).toBe("error");
+    expect(manager.getAgent(agent.id)?.lastError).toBe(
       "Codex app-server exited with code 23 and signal null\nautonomous provider crashed",
     );
     expect(
@@ -371,14 +433,12 @@ test("unexpected exit fails an autonomous Codex turn", async () => {
 
 test("provider permissions do not survive an unexpected exit and reconnect", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "codex-process-permission-exit-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
   const exitedAppServer = createFakeCodexAppServer();
   const replacementAppServer = createFakeCodexAppServer();
   const manager = new AgentManager({
     clients: {
       codex: new ProcessExitCodexClient([exitedAppServer, replacementAppServer]),
     },
-    registry: storage,
     logger,
   });
   let agentId: string | null = null;
@@ -410,9 +470,6 @@ test("provider permissions do not survive an unexpected exit and reconnect", asy
     exitedAppServer.child.emit("exit", 17, null);
 
     await expect(failedRun).rejects.toThrow("Codex app-server exited with code 17");
-    await expect.poll(async () => (await storage.get(agent.id))?.lastStatus).toBe("closed");
-
-    await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
     expect(manager.getPendingPermissions(agent.id)).toEqual([]);
 
     const recoveredRun = manager.runAgent(agent.id, "continue after reconnect");

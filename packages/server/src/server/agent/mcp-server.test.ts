@@ -12,7 +12,6 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createAgentMcpServer } from "./mcp-server.js";
 import { AgentManager, type ManagedAgent } from "./agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
-import { CreateAgentDedupeRegistry } from "./create-agent/create-agent-dedupe.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type { AgentMode, AgentProvider, ProviderSnapshotEntry } from "./agent-sdk-types.js";
 import type { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
@@ -738,6 +737,7 @@ function createPaseoWorktreeForMcpTest(options: {
     projectRegistry,
     workspaceRegistry,
     workspaceGitService,
+    isDirectory: async () => true,
     logger: createTestLogger(),
   });
   const workspaceAutoName = new WorkspaceAutoName({
@@ -972,8 +972,85 @@ describe("browser MCP tools", () => {
       logger,
     });
 
+    const client = await connectInMemoryMcpClient(server);
+    try {
+      const listedTools = await client.listTools();
+      const toolNames = listedTools.tools.map((tool) => tool.name);
+
+      expect(toolNames).not.toContain("browser_list_tabs");
+      expect(toolNames).not.toContain("browser_snapshot");
+      expect(toolNames).toEqual(expect.arrayContaining(["create_agent", "list_agents"]));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("applies provider policy after the browser-tools host gate", async () => {
+    const agentManager = new BoundaryAgentManagerFake();
+    const agentStorage = new BoundaryAgentStorageFake();
+    const broker = new FakeBrowserToolsBroker({
+      requestId: "req-browser-policy",
+      ok: true,
+      result: { command: "list_tabs", tabs: [] },
+    });
+    const server = await createAgentMcpServer({
+      agentManager: agentManager as AgentManager,
+      agentStorage: agentStorage as AgentStorage,
+      providerSnapshotManager:
+        new BoundaryProviderSnapshotManagerFake() as unknown as ProviderSnapshotManager,
+      browserToolsEnabled: true,
+      browserToolsBroker: broker as BrowserToolsBroker,
+      callerAgentId: "agent-1",
+      paseoToolPolicy: { disabledTools: ["browser_list_tabs"] },
+      logger,
+    });
+
     expect(lookupTool(server, "browser_list_tabs")).toBeUndefined();
-    expect(lookupTool(server, "browser_snapshot")).toBeUndefined();
+    expect(lookupTool(server, "browser_snapshot")).toBeDefined();
+  });
+
+  it("filters policy-disabled tools from MCP listing and calls", async () => {
+    const agentManager = new BoundaryAgentManagerFake();
+    const agentStorage = new BoundaryAgentStorageFake();
+    const broker = new FakeBrowserToolsBroker({
+      requestId: "req-browser-policy-call",
+      ok: true,
+      result: { command: "list_tabs", tabs: [] },
+    });
+    const server = await createAgentMcpServer({
+      agentManager: agentManager as AgentManager,
+      agentStorage: agentStorage as AgentStorage,
+      providerSnapshotManager:
+        new BoundaryProviderSnapshotManagerFake() as unknown as ProviderSnapshotManager,
+      browserToolsEnabled: true,
+      browserToolsBroker: broker as BrowserToolsBroker,
+      callerAgentId: "agent-1",
+      paseoToolPolicy: { disabledTools: ["list_agents", "browser_list_tabs"] },
+      logger,
+    });
+    const client = await connectInMemoryMcpClient(server);
+
+    try {
+      const listedTools = await client.listTools();
+      const toolNames = listedTools.tools.map((tool) => tool.name);
+
+      expect(toolNames).not.toContain("list_agents");
+      expect(toolNames).not.toContain("browser_list_tabs");
+      expect(toolNames).toEqual(expect.arrayContaining(["create_agent", "browser_snapshot"]));
+      await expect(client.callTool({ name: "list_agents", arguments: {} })).resolves.toEqual({
+        content: [{ type: "text", text: "MCP error -32602: Tool list_agents not found" }],
+        isError: true,
+      });
+      await expect(client.callTool({ name: "browser_list_tabs", arguments: {} })).resolves.toEqual({
+        content: [{ type: "text", text: "MCP error -32602: Tool browser_list_tabs not found" }],
+        isError: true,
+      });
+      expect(broker.calls).toEqual([]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 
   it("wires browser tools through the browser tools broker", async () => {
@@ -1177,7 +1254,6 @@ describe("create_agent MCP tool", () => {
       provider: "codex/gpt-5.4",
       title: "Short title",
       initialPrompt: "test",
-      idempotencyKey: "test-idem-key-1",
     });
     expect(ok.success).toBe(true);
   });
@@ -1358,69 +1434,8 @@ describe("create_agent MCP tool", () => {
         cwd: existingCwd,
       }),
       undefined,
-      expect.objectContaining({
-        workspaceId: "wks_existing",
-      }),
+      { workspaceId: "wks_existing" },
     );
-  });
-
-  it("deduplicates create_agent MCP calls with the same idempotencyKey", async () => {
-    const { agentManager, agentStorage, spies } = createTestDeps();
-    const liveAgent = {
-      id: "agent-mcp-idem",
-      cwd: existingCwd,
-      workspaceId: "wks_existing",
-      lifecycle: "idle",
-      currentModeId: null,
-      availableModes: [],
-      config: { title: "Idempotent MCP agent" },
-    } as ManagedAgent;
-
-    spies.agentManager.createAgent.mockResolvedValue(liveAgent);
-    spies.agentManager.getAgent.mockReturnValue(liveAgent);
-
-    const dedupeRegistry = new CreateAgentDedupeRegistry({
-      agentManager,
-      agentStorage,
-      logger,
-    });
-
-    const server = await createAgentMcpServer({
-      agentManager,
-      agentStorage,
-      createAgentDedupeRegistry: dedupeRegistry,
-      providerSnapshotManager: createOpenCodeManager().manager,
-      listActiveWorkspaces: async () => [
-        { workspaceId: "wks_existing", cwd: existingCwd, kind: "worktree" },
-      ],
-      logger,
-    });
-    const tool = registeredTool(server, "create_agent");
-
-    const response1 = await tool.handler({
-      ...detachedExistingWorkspace("wks_existing"),
-      title: "Idempotent MCP agent",
-      provider: "codex/gpt-5.4",
-      initialPrompt: "Do idempotent work",
-      idempotencyKey: "mcp-idem-1",
-      background: true,
-    });
-
-    const response2 = await tool.handler({
-      ...detachedExistingWorkspace("wks_existing"),
-      title: "Idempotent MCP agent",
-      provider: "codex/gpt-5.4",
-      initialPrompt: "Do idempotent work",
-      idempotencyKey: "mcp-idem-1",
-      background: true,
-    });
-
-    // createAgent was called only once
-    expect(spies.agentManager.createAgent).toHaveBeenCalledTimes(1);
-    const body1 = response1.structuredContent as Record<string, unknown>;
-    const body2 = response2.structuredContent as Record<string, unknown>;
-    expect(body1.agentId).toBe("agent-mcp-idem");
-    expect(body2.agentId).toBe("agent-mcp-idem");
   });
 
   it("accepts provider features and passes them through createAgent", async () => {

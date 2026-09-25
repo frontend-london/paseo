@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
-import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema, CommandError } from "../../output/index.js";
 import { collectMultiple } from "../../utils/command-options.js";
 import { isSameOrDescendantPath } from "../../utils/paths.js";
@@ -33,6 +33,8 @@ export interface AgentListItem {
   status: string;
   cwd: string;
   created: string;
+  workspaceId: string | null;
+  labels: Record<string, string>;
 }
 
 /** Helper to get relative time string */
@@ -99,6 +101,8 @@ function toListItem(agent: AgentSnapshotPayload): AgentListItem {
     status: agent.status,
     cwd: shortenPath(agent.cwd),
     created: relativeTime(agent.createdAt),
+    workspaceId: agent.workspaceId ?? null,
+    labels: agent.labels ?? {},
   };
 }
 
@@ -170,21 +174,7 @@ export async function runLsCommand(
   options: AgentLsOptions,
   _command: Command,
 ): Promise<AgentLsResult> {
-  const host = getDaemonHost({ host: options.host });
-
-  let client;
-  try {
-    client = await connectToDaemon({ host: options.host });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const error: CommandError = {
-      code: "DAEMON_NOT_RUNNING",
-      message: `Cannot connect to daemon at ${host}: ${message}`,
-      details:
-        "Start the daemon with: paseo daemon start\nFor a remote daemon, pass --host <host:port> or set PASEO_HOST.",
-    };
-    throw error;
-  }
+  const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
     const normalizedThinkingOptionId = options.thinking?.trim();

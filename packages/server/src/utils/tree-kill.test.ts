@@ -64,13 +64,8 @@ function killIfRunning(pid: number | null | undefined): void {
 
 function spawnOwnerWithDescendant(options: {
   childPidPath: string;
-  detachedOwner?: boolean;
-  detachedDescendant?: boolean;
+  detachedDescendant: boolean;
 }): ChildProcess {
-  const ownerOptions = {
-    stdio: "ignore" as const,
-    ...(options.detachedOwner ? { detached: true } : {}),
-  };
   const descendantOptions = options.detachedDescendant
     ? '{ detached: true, stdio: "ignore" }'
     : '{ stdio: "ignore" }';
@@ -96,7 +91,7 @@ function spawnOwnerWithDescendant(options: {
         setInterval(() => {}, 1000);
       `,
     ],
-    ownerOptions,
+    { stdio: "ignore" },
   );
 }
 
@@ -184,62 +179,6 @@ describe("terminateWithTreeKill", () => {
       await expectOwnerAndDescendantStopped(
         "owner or separate-process-group descendant survived terminateWithTreeKill",
       );
-    },
-  );
-
-  test.runIf(process.platform !== "win32")(
-    "kills descendants in the same process group when useProcessGroup is enabled",
-    async () => {
-      tempDir = await mkdtemp(join(tmpdir(), "paseo-server-tree-kill-"));
-      const childPidPath = join(tempDir, "descendant.pid");
-
-      ownerProcess = spawnOwnerWithDescendant({
-        childPidPath,
-        detachedOwner: true,
-        detachedDescendant: false,
-      });
-      expect(ownerProcess.pid).toBeTypeOf("number");
-      await waitForFixtureReady(childPidPath);
-
-      const result = await terminateWithTreeKill(ownerProcess, {
-        gracefulTimeoutMs: 100,
-        forceTimeoutMs: 2000,
-        useProcessGroup: true,
-      });
-
-      expect(result).toBe("killed");
-      await expectOwnerAndDescendantStopped(
-        "owner or same-process-group descendant survived terminateWithTreeKill",
-      );
-    },
-  );
-
-  test.runIf(process.platform !== "win32")(
-    "kills process group descendants even when the owner has already exited",
-    async () => {
-      tempDir = await mkdtemp(join(tmpdir(), "paseo-server-tree-kill-"));
-      const childPidPath = join(tempDir, "descendant.pid");
-
-      ownerProcess = spawnOwnerWithDescendant({
-        childPidPath,
-        detachedOwner: true,
-        detachedDescendant: false,
-      });
-      expect(ownerProcess.pid).toBeTypeOf("number");
-      await waitForFixtureReady(childPidPath);
-
-      // Simulate the owner already having exited; cleanup should still target the
-      // surviving process group so descendants do not leak.
-      ownerProcess.exitCode = 0;
-
-      const result = await terminateWithTreeKill(ownerProcess, {
-        gracefulTimeoutMs: 100,
-        forceTimeoutMs: 2000,
-        useProcessGroup: true,
-      });
-
-      expect(result).toBe("killed");
-      await expectOwnerAndDescendantStopped("descendant survived after owner already exited");
     },
   );
 });

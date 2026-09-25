@@ -19,6 +19,7 @@ import {
   type AgentPersistenceHandle,
   type AgentPromptInput,
   type AgentProvider,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
@@ -69,7 +70,7 @@ export { formatOmpVersionSupport, resolveOmpDiagnosticPaths } from "./provider-c
 import { OmpSubagentCardTracker, type OmpSubagentCardScheduler } from "./subagent-card-tracker.js";
 import { shouldDisplayOmpCustomMessage } from "./custom-message.js";
 import { getUserMessageText } from "./message-history.js";
-import { mapOmpSystemNoticeToToolCall } from "./system-notice.js";
+import { mapOmpSystemNoticeToNotification } from "./system-notice.js";
 import { materializeProviderImage } from "../provider-image-output.js";
 import { OmpCliRuntime } from "./cli-runtime.js";
 import { listOmpImportableSessions, readOmpImportSessionConfig } from "./session-descriptor.js";
@@ -433,6 +434,7 @@ function buildResumeStartInput(input: {
   sessionFile: string;
   launchContext: AgentLaunchContext | undefined;
   launchMode: { modeId: string | null; extraArgs?: string[] };
+  signal?: AbortSignal;
 }): OmpStartSessionInput {
   return {
     cwd: input.resumeConfig.cwd,
@@ -447,6 +449,7 @@ function buildResumeStartInput(input: {
       input.resumeConfig.config.systemPrompt,
       input.resumeConfig.config.daemonAppendSystemPrompt,
     ),
+    signal: input.signal,
   };
 }
 
@@ -524,6 +527,11 @@ function latestOmpErrorMessage(messages: OmpAgentMessage[]): string | null {
     return null;
   }
   return formatOmpErrorMessage(latestAssistant);
+}
+
+function isOmpAbortedTerminalResponse(messages: OmpAgentMessage[]): boolean {
+  const latestAssistant = messages.findLast((message) => message.role === "assistant");
+  return latestAssistant?.stopReason?.toLowerCase() === "aborted";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -828,12 +836,15 @@ function buildExtensionUiResponse(
 function createRuntime(
   logger: Logger,
   runtimeSettings: ProviderRuntimeSettings | undefined,
+  providerParams: OmpRuntimeProviderParams,
 ): OmpRuntime {
   return new OmpCliRuntime({
     logger,
     runtimeSettings,
     command: ["omp"],
     commandsRpcName: "get_available_commands",
+    readyTimeoutMs: providerParams.readyTimeoutMs,
+    requestTimeoutMs: providerParams.rpcTimeoutMs,
   });
 }
 
@@ -2016,7 +2027,7 @@ export class OmpAgentSession implements AgentSession {
         if (text) {
           const item =
             mapOmpAdvisorMessageToToolCall(event.message, text) ??
-            mapOmpSystemNoticeToToolCall(text);
+            mapOmpSystemNoticeToNotification(text);
           this.emit({
             type: "timeline",
             provider: this.provider,
@@ -2024,9 +2035,6 @@ export class OmpAgentSession implements AgentSession {
             item: item ?? { type: "assistant_message", text },
           });
         }
-      }
-      if (!this.activeTurnHasUserMessage) {
-        this.completeTurn(turnId, []);
       }
       return;
     }
@@ -2130,6 +2138,19 @@ export class OmpAgentSession implements AgentSession {
     this.activeTurnStarted = false;
     this.activeTurnHasUserMessage = false;
     this.clearNoTurnBuffers();
+    // OMP reports a stopped turn as a terminal response carrying its interrupt
+    // text as an error. That is the user's own Stop, not a failed turn.
+    if (isOmpAbortedTerminalResponse(messages)) {
+      this.usagePoller.stopTurn();
+      this.terminalizeActiveWork();
+      this.emit({
+        type: "turn_canceled",
+        provider: this.provider,
+        turnId,
+        reason: "interrupted",
+      });
+      return;
+    }
     const errorMessage = latestOmpErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
       this.usagePoller.stopTurn();
@@ -2158,6 +2179,10 @@ export class OmpAgentSession implements AgentSession {
       try {
         const state = await this.runtimeSession.getState();
         this.state = state;
+        if (this.closed || !this.activeTurnStarted || this.currentTurnIdForEvent() !== turnId) {
+          // An interrupt settled this turn while the state check was in flight.
+          return;
+        }
         if (!state.isStreaming && !state.isCompacting) {
           this.completeTurn(turnId, messages);
           return;
@@ -2176,6 +2201,17 @@ export class OmpAgentSession implements AgentSession {
   private async refreshAfterTurn(finalUsage: Promise<void>): Promise<void> {
     await Promise.all([this.refreshState().catch(() => undefined), finalUsage]);
   }
+}
+
+function throwIfAborted(options?: AgentResumeSessionOptions): void {
+  options?.signal?.throwIfAborted();
+}
+
+function rethrowIfAborted(signal: AbortSignal | undefined, error: unknown): never {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
+  throw error;
 }
 
 export class OmpAgentClient implements AgentClient {
@@ -2213,7 +2249,8 @@ export class OmpAgentClient implements AgentClient {
     this.providerIdleScheduler = options.providerIdleScheduler;
     this.noTurnScheduler = options.noTurnScheduler;
     this.usagePollScheduler = options.usagePollScheduler;
-    this.runtime = options.runtime ?? createRuntime(options.logger, runtimeSettings);
+    this.runtime =
+      options.runtime ?? createRuntime(options.logger, runtimeSettings, this.providerParams);
   }
 
   private async configureNativePaseoTools(
@@ -2266,7 +2303,9 @@ export class OmpAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    throwIfAborted(options);
     const sessionFile = handle.nativeHandle;
     if (!sessionFile) {
       throw new Error("OMP resume requires a native session file handle");
@@ -2276,20 +2315,31 @@ export class OmpAgentClient implements AgentClient {
     const resumeConfig = buildResumeConfig(persistenceMetadata, overrides, this.provider);
 
     const launchMode = this.resolveLaunchMode(resumeConfig.modeId);
-    const runtimeSession = await this.runtime.startSession(
-      buildResumeStartInput({
-        resumeConfig,
-        sessionFile,
-        launchContext,
-        launchMode,
-      }),
-    );
+    let runtimeSession: OmpRuntimeSession;
     try {
+      throwIfAborted(options);
+      runtimeSession = await this.runtime.startSession(
+        buildResumeStartInput({
+          resumeConfig,
+          sessionFile,
+          launchContext,
+          launchMode,
+          signal: options?.signal,
+        }),
+      );
+    } catch (error) {
+      rethrowIfAborted(options?.signal, error);
+    }
+    try {
+      throwIfAborted(options);
       await this.configureNativePaseoTools(runtimeSession, launchContext?.paseoTools);
+      throwIfAborted(options);
+      const initialState = await runtimeSession.getState();
+      throwIfAborted(options);
       return new OmpAgentSession({
         runtimeSession,
         config: resumeConfig.config,
-        initialState: await runtimeSession.getState(),
+        initialState,
         currentModeId: launchMode.modeId,
         logger: this.logger,
         subagentCardScheduler: this.subagentCardScheduler,
@@ -2301,7 +2351,7 @@ export class OmpAgentClient implements AgentClient {
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
-      throw error;
+      rethrowIfAborted(options?.signal, error);
     }
   }
 

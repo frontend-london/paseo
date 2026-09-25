@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import type { AgentCapabilityFlags, AgentMode } from "../agent-sdk-types.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import { checkProviderLaunchAvailable, resolveProviderLaunch } from "../provider-launch-config.js";
 import {
   ACPAgentClient,
@@ -46,13 +47,9 @@ function buildGenericACPDefaultModes(
   providerId: string | undefined,
   params: GenericACPProviderParams,
 ): AgentMode[] {
-  const modeIds =
+  const ids =
     params.unattendedModeIds ?? BUILTIN_GENERIC_ACP_UNATTENDED_MODE_IDS[providerId ?? ""] ?? [];
-  return modeIds.map((id) => ({
-    id,
-    label: id,
-    isUnattended: true,
-  }));
+  return ids.map((id) => ({ id, label: id, isUnattended: true }));
 }
 
 interface GenericACPAgentClientOptions {
@@ -69,6 +66,8 @@ interface GenericACPAgentClientOptions {
   configFeatureOptions?: ACPConfigFeatureOption[];
   extensionCommandsParser?: ACPExtensionCommandsParser;
   catalogModelResolver?: ACPCatalogModelResolver;
+  managedProcesses?: ManagedProcessRegistry;
+  now?: () => number;
 }
 
 export class GenericACPAgentClient extends ACPAgentClient {
@@ -95,6 +94,8 @@ export class GenericACPAgentClient extends ACPAgentClient {
       configFeatureOptions: options.configFeatureOptions,
       extensionCommandsParser: options.extensionCommandsParser,
       catalogModelResolver: options.catalogModelResolver,
+      managedProcesses: options.managedProcesses,
+      now: options.now,
     });
 
     this.command = options.command;

@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
@@ -32,7 +33,6 @@ import {
   type ArchiveDependencies,
 } from "../../workspace-archive-service.js";
 import { createAgentCommand, type CreateAgentFromMcpInput } from "../create-agent/create.js";
-import type { CreateAgentDedupeRegistry } from "../create-agent/create-agent-dedupe.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "../../voice-types.js";
 import type { FirstAgentContext } from "../../messages.js";
 import { everyMsToFiveFieldCron } from "@getpaseo/protocol/schedule/cadence";
@@ -93,11 +93,12 @@ import type {
   PaseoToolExecutionContext,
   PaseoToolResult,
 } from "./types.js";
+import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 
 export interface PaseoToolHostDependencies {
   agentManager: AgentManager;
   agentStorage: AgentStorage;
-  createAgentDedupeRegistry?: CreateAgentDedupeRegistry;
   terminalManager?: TerminalManager | null;
   getDaemonTcpPort?: () => number | null;
   scheduleService?: ScheduleService | null;
@@ -130,6 +131,7 @@ export interface PaseoToolHostDependencies {
   ) => Promise<string>;
   browserToolsEnabled?: boolean;
   browserToolsBroker?: BrowserToolsBroker | null;
+  paseoToolPolicy?: ProviderPaseoToolsPolicy;
   paseoHome?: string;
   worktreesRoot?: string;
   /**
@@ -220,6 +222,20 @@ function assertOptionsAbsent(
   if (options.some(([, value]) => value !== undefined)) {
     throw new Error(message);
   }
+}
+
+async function isExistingDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch (error) {
+    if (isMissingPathError(error)) return false;
+    throw error;
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "ENOENT" || error.code === "ENOTDIR";
 }
 
 function resolveWorkspaceWorktreeTarget(input: WorkspaceWorktreeOptions): WorkspaceWorktreeTarget {
@@ -578,6 +594,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Tool handlers are schema-validated at registration boundaries.
     handler: (input: any, context: PaseoToolExecutionContext) => Promise<PaseoToolResult>,
   ) => {
+    if (!isPaseoToolEnabled(options.paseoToolPolicy, name)) {
+      return;
+    }
     tools.set(name, {
       name,
       title: config.title,
@@ -993,11 +1012,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       .trim()
       .min(1, "initialPrompt is required")
       .describe("Required first task to run immediately after creation."),
-    idempotencyKey: z
-      .string()
-      .min(1)
-      .optional()
-      .describe("Optional idempotency key to prevent duplicate agents/workspaces on retry."),
   };
   const legacyCreateAgentPlacementFields = {
     relationship: AgentRelationshipInputSchema.describe(
@@ -1226,7 +1240,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         path: z
           .string()
           .optional()
-          .describe("Local directory or source checkout. Defaults to your current workspace."),
+          .describe(
+            "Local directory or source checkout. Defaults to your current workspace. Local isolation adopts an existing directory and never creates one.",
+          ),
         projectId: z.string().optional().describe("Existing project id to own the workspace."),
         title: z.string().trim().min(1).optional(),
         mode: z
@@ -1278,6 +1294,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       let workspace: PersistedWorkspaceRecord;
       if (isolation === "local") {
         const cwd = resolveScopedCwd(path, { required: true });
+        if (!(await isExistingDirectory(cwd))) {
+          throw new Error(`Directory not found: ${cwd}`);
+        }
         assertOptionsAbsent(
           [
             ["mode", mode],
@@ -1452,7 +1471,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           terminalManager,
           providerSnapshotManager,
           createPaseoWorktree: options.createPaseoWorktree,
-          createAgentDedupeRegistry: options.createAgentDedupeRegistry,
+          ...(options.workspaceRegistry ? { workspaceRegistry: options.workspaceRegistry } : {}),
           ...(options.ensureWorkspaceForCreate
             ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
             : {}),
@@ -1475,7 +1494,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           callerAgentId,
           callerContext,
           worktree,
-          idempotencyKey: parsedArgs.idempotencyKey?.trim() || undefined,
         },
       );
 
@@ -1554,16 +1572,11 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       };
 
   async function resolveCreateAgentToolArgs(args: unknown): Promise<ResolvedCreateAgentToolArgs> {
-    const normalizedArgs =
-      args && typeof args === "object" && "idempotency_key" in args && !("idempotencyKey" in args)
-        ? { ...args, idempotencyKey: (args as { idempotency_key: unknown }).idempotency_key }
-        : args;
-
     if (callerAgentId) {
-      if (hasLegacyCreateAgentPlacement(normalizedArgs)) {
+      if (hasLegacyCreateAgentPlacement(args)) {
         // COMPAT(nestedCreateAgentPlacement): accept the old relationship/workspace shape without
         // advertising it to models. Added in v0.2.0; remove after 2027-01-17.
-        const parsed = legacyAgentToAgentCreateAgentArgsSchema.parse(normalizedArgs);
+        const parsed = legacyAgentToAgentCreateAgentArgsSchema.parse(args);
         const { cwd, workspaceId, worktree } = await resolveCreateAgentWorkspace(parsed.workspace, {
           prompt: parsed.initialPrompt,
         });
@@ -1576,7 +1589,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           worktree,
         };
       }
-      const parsed = agentToAgentCreateAgentArgsSchema.parse(normalizedArgs);
+      const parsed = agentToAgentCreateAgentArgsSchema.parse(args);
       const { cwd, workspaceId } = await resolveCanonicalCreateAgentWorkspace(parsed.workspaceId, {
         prompt: parsed.initialPrompt,
       });
@@ -1589,10 +1602,10 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         worktree: undefined,
       };
     }
-    if (hasLegacyCreateAgentPlacement(normalizedArgs)) {
+    if (hasLegacyCreateAgentPlacement(args)) {
       // COMPAT(nestedCreateAgentPlacement): see the agent-scoped branch above.
       const parsedArgs = normalizeTopLevelCreateAgentArgs(
-        legacyTopLevelCreateAgentArgsSchema.parse(normalizedArgs),
+        legacyTopLevelCreateAgentArgsSchema.parse(args),
       );
       if (parsedArgs.relationship?.kind === "subagent") {
         throw new Error("relationship subagent requires an agent-scoped tool session");
@@ -1613,7 +1626,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         worktree,
       };
     }
-    const parsedArgs = canonicalTopLevelCreateAgentArgsSchema.parse(normalizedArgs);
+    const parsedArgs = canonicalTopLevelCreateAgentArgsSchema.parse(args);
     const { cwd, workspaceId } = await resolveCanonicalCreateAgentWorkspace(
       parsedArgs.workspaceId,
       { prompt: parsedArgs.initialPrompt },
