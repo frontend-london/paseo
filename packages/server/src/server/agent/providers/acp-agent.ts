@@ -2749,7 +2749,6 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       rejectExit(spawnError);
     });
     child.once("exit", (code, signal) => {
-      void this.removeManagedProcessRecord();
       const exit = { exitCode: code, signal };
       entry.exit = exit;
       resolveExit(exit);

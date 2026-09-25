@@ -55,6 +55,7 @@ import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { buildStringCommandShellInvocation } from "../../../utils/string-command-shell.js";
 import { asInternals } from "../../test-utils/class-mocks.js";
 import * as spawnUtils from "../../../utils/spawn.js";
+import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 
 describe("buildACPClientCapabilities", () => {
   test("enables terminal execution on the host while keeping filesystem operations with the agent by default", () => {
@@ -3479,6 +3480,14 @@ interface ACPCloseInternals {
   sessionId: string | null;
 }
 
+interface ACPLedgerInternals extends ACPCloseInternals {
+  recordManagedProcess(
+    child: ChildProcessWithoutNullStreams,
+    command: string,
+    args: string[],
+  ): Promise<string | null>;
+}
+
 async function startTerminal(
   session: ACPAgentSession,
   child: ChildProcess,
@@ -3523,6 +3532,81 @@ describe("ACPAgentSession close() tree-kill", () => {
         item: { type: "user_message", text: "[image]" },
       },
     ]);
+  });
+
+  test("terminal exit keeps the main ACP managed-process record until session close", async () => {
+    const terminator = new FakeTerminator();
+    const ledger = new Set<string>();
+    const remove = vi.fn(async (id: string) => {
+      ledger.delete(id);
+    });
+    const managedProcesses: ManagedProcessRegistry = {
+      async record(input) {
+        const id = "main-acp-record";
+        ledger.add(id);
+        return {
+          id,
+          ...input,
+          metadata: input.metadata ?? {},
+          identity: { commandLine: null, startedAt: null },
+          createdAt: "2026-01-01T00:00:00.000Z",
+        };
+      },
+      remove,
+      async list() {
+        return [];
+      },
+      async reapStale() {
+        return {
+          checked: 0,
+          dead: 0,
+          mismatched: 0,
+          removed: 0,
+          terminated: 0,
+          errors: [],
+        };
+      },
+    };
+    const session = new ACPAgentSession(
+      { provider: "claude-acp", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "claude-acp",
+        logger: createTestLogger(),
+        defaultCommand: ["claude", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+        },
+        terminateProcess: terminator.terminate,
+        managedProcesses,
+      },
+    );
+    const internals = asInternals<ACPLedgerInternals>(session);
+    const mainChild = createTerminalChildStub() as ChildProcessWithoutNullStreams;
+    Object.defineProperty(mainChild, "pid", { value: 4242, configurable: true });
+    internals.child = mainChild;
+    internals.connection = null;
+    internals.sessionId = null;
+
+    await internals.recordManagedProcess(mainChild, "claude", ["--acp"]);
+    expect(ledger.has("main-acp-record")).toBe(true);
+
+    const terminalChild = createTerminalChildStub();
+    const terminalId = await startTerminal(session, terminalChild);
+    terminalChild.emit("exit", 0, null);
+    await expect(
+      session.waitForTerminalExit({ sessionId: "session-1", terminalId }),
+    ).resolves.toEqual({ exitCode: 0, signal: null });
+
+    expect(ledger.has("main-acp-record")).toBe(true);
+    expect(remove).not.toHaveBeenCalled();
+
+    await session.close();
+
+    expect(ledger.has("main-acp-record")).toBe(false);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith("main-acp-record");
   });
 
   test("close() terminates the main child process via the process tree", async () => {
