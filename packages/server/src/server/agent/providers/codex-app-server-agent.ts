@@ -7006,6 +7006,31 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 }
 
+async function connectCodexResumedSession(
+  session: CodexAppServerAgentSession,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!signal) {
+    await session.connect();
+    return;
+  }
+  signal.throwIfAborted();
+  const handleAbort = () => {
+    void session.close().catch(() => undefined);
+  };
+  signal.addEventListener("abort", handleAbort, { once: true });
+  try {
+    signal.throwIfAborted();
+    await session.connect();
+    signal.throwIfAborted();
+  } catch (error) {
+    await session.close().catch(() => undefined);
+    throw signal.aborted ? signal.reason : error;
+  } finally {
+    signal.removeEventListener("abort", handleAbort);
+  }
+}
+
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -7147,6 +7172,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
     options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    options?.signal?.throwIfAborted();
     const storedConfig = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const merged: AgentSessionConfig = {
       ...storedConfig,
@@ -7169,7 +7195,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       options?.purpose ?? "interactive",
     );
-    await session.connect();
+    await connectCodexResumedSession(session, options?.signal);
     return session;
   }
 

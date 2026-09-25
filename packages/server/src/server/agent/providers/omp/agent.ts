@@ -19,6 +19,7 @@ import {
   type AgentPersistenceHandle,
   type AgentPromptInput,
   type AgentProvider,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
@@ -433,6 +434,7 @@ function buildResumeStartInput(input: {
   sessionFile: string;
   launchContext: AgentLaunchContext | undefined;
   launchMode: { modeId: string | null; extraArgs?: string[] };
+  signal?: AbortSignal;
 }): OmpStartSessionInput {
   return {
     cwd: input.resumeConfig.cwd,
@@ -447,6 +449,7 @@ function buildResumeStartInput(input: {
       input.resumeConfig.config.systemPrompt,
       input.resumeConfig.config.daemonAppendSystemPrompt,
     ),
+    signal: input.signal,
   };
 }
 
@@ -2200,6 +2203,17 @@ export class OmpAgentSession implements AgentSession {
   }
 }
 
+function throwIfAborted(options?: AgentResumeSessionOptions): void {
+  options?.signal?.throwIfAborted();
+}
+
+function rethrowIfAborted(signal: AbortSignal | undefined, error: unknown): never {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
+  throw error;
+}
+
 export class OmpAgentClient implements AgentClient {
   readonly provider: AgentProvider = OMP_PROVIDER;
   readonly capabilities: AgentCapabilityFlags = withOmpCapabilities();
@@ -2289,7 +2303,9 @@ export class OmpAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    throwIfAborted(options);
     const sessionFile = handle.nativeHandle;
     if (!sessionFile) {
       throw new Error("OMP resume requires a native session file handle");
@@ -2299,20 +2315,31 @@ export class OmpAgentClient implements AgentClient {
     const resumeConfig = buildResumeConfig(persistenceMetadata, overrides, this.provider);
 
     const launchMode = this.resolveLaunchMode(resumeConfig.modeId);
-    const runtimeSession = await this.runtime.startSession(
-      buildResumeStartInput({
-        resumeConfig,
-        sessionFile,
-        launchContext,
-        launchMode,
-      }),
-    );
+    let runtimeSession: OmpRuntimeSession;
     try {
+      throwIfAborted(options);
+      runtimeSession = await this.runtime.startSession(
+        buildResumeStartInput({
+          resumeConfig,
+          sessionFile,
+          launchContext,
+          launchMode,
+          signal: options?.signal,
+        }),
+      );
+    } catch (error) {
+      rethrowIfAborted(options?.signal, error);
+    }
+    try {
+      throwIfAborted(options);
       await this.configureNativePaseoTools(runtimeSession, launchContext?.paseoTools);
+      throwIfAborted(options);
+      const initialState = await runtimeSession.getState();
+      throwIfAborted(options);
       return new OmpAgentSession({
         runtimeSession,
         config: resumeConfig.config,
-        initialState: await runtimeSession.getState(),
+        initialState,
         currentModeId: launchMode.modeId,
         logger: this.logger,
         subagentCardScheduler: this.subagentCardScheduler,
@@ -2324,7 +2351,7 @@ export class OmpAgentClient implements AgentClient {
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
-      throw error;
+      rethrowIfAborted(options?.signal, error);
     }
   }
 

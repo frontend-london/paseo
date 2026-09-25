@@ -650,6 +650,8 @@ export type AgentResumePurpose = "interactive" | "history";
 export interface AgentResumeSessionOptions {
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
   purpose?: AgentResumePurpose;
+  /** Optional cancellation signal. When aborted, resume must abort in-flight work, finish cleanup, and reject. */
+  signal?: AbortSignal;
 }
 
 /**

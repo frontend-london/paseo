@@ -1227,7 +1227,9 @@ class FakeAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     _launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    options?.signal?.throwIfAborted();
     const cfg: AgentSessionConfig = {
       provider: this.provider,
       cwd: overrides?.cwd ?? process.cwd(),
@@ -1237,7 +1239,7 @@ class FakeAgentClient implements AgentClient {
       (handle.metadata as Record<string, unknown> | undefined)?.marker ??
       (handle.metadata as Record<string, unknown> | undefined)?.conversationId ??
       null;
-    return new FakeAgentSession({
+    const session = new FakeAgentSession({
       providerName: this.provider,
       config: cfg,
       supportsMcpServers: this.options.supportsMcpServers,
@@ -1246,6 +1248,11 @@ class FakeAgentClient implements AgentClient {
       closeSession: this.options.closeSession,
       onStartTurn: this.options.onStartTurn,
     });
+    if (options?.signal?.aborted) {
+      await session.close().catch(() => undefined);
+      throw options.signal.reason;
+    }
+    return session;
   }
 
   async fetchCatalog(

@@ -33,6 +33,7 @@ import {
   type AgentPermissionResponse,
   type AgentPersistenceHandle,
   type AgentPromptInput,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
@@ -1393,6 +1394,17 @@ function createSdkOpenCodeClient(options: { baseUrl: string; directory: string }
   return createOpencodeClient(options satisfies OpencodeClientConfig & { directory: string });
 }
 
+function throwIfAborted(options?: AgentResumeSessionOptions): void {
+  options?.signal?.throwIfAborted();
+}
+
+function rethrowIfAborted(signal: AbortSignal | undefined, error: unknown): never {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
+  throw error;
+}
+
 export class OpenCodeAgentClient implements AgentClient {
   readonly provider = "opencode" as const;
   readonly capabilities: AgentCapabilityFlags;
@@ -1510,7 +1522,9 @@ export class OpenCodeAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    throwIfAborted(options);
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const cwd = overrides?.cwd ?? metadata.cwd;
     if (!cwd) {
@@ -1536,9 +1550,17 @@ export class OpenCodeAgentClient implements AgentClient {
       directory: openCodeConfig.cwd,
     });
 
+    const handleAbort = () => {
+      void acquisition.release();
+    };
+    options?.signal?.addEventListener("abort", handleAbort, { once: true });
+
     try {
+      throwIfAborted(options);
       await this.applySessionPermissionRules(client, openCodeConfig, handle.sessionId);
+      throwIfAborted(options);
       await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
+      throwIfAborted(options);
       const unbindBridge = this.bindBridgeSession(handle.sessionId, launchContext);
 
       return new OpenCodeAgentSession(
@@ -1557,7 +1579,9 @@ export class OpenCodeAgentClient implements AgentClient {
       );
     } catch (error) {
       await acquisition.release();
-      throw error;
+      return rethrowIfAborted(options?.signal, error);
+    } finally {
+      options?.signal?.removeEventListener("abort", handleAbort);
     }
   }
 

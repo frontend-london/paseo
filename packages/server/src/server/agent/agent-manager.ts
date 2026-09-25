@@ -1426,7 +1426,10 @@ export class AgentManager {
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
@@ -1456,13 +1459,22 @@ export class AgentManager {
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+    currentResumeOptions?.signal?.throwIfAborted();
     const session = await client.resumeSession(
       handle,
       providerLaunchConfig,
       launchContext,
       currentResumeOptions,
     );
+    if (currentResumeOptions?.signal?.aborted) {
+      await this.closeUnregisteredSession(session);
+      throw currentResumeOptions.signal.reason;
+    }
     await this.requireExternalMcpSupport(session, storedConfig);
+    if (currentResumeOptions?.signal?.aborted) {
+      await this.closeUnregisteredSession(session);
+      throw currentResumeOptions.signal.reason;
+    }
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
       persistence: handle,

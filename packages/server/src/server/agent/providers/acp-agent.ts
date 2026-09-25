@@ -75,6 +75,7 @@ import {
   type AgentPersistenceHandle,
   type AgentPromptContentBlock,
   type AgentPromptInput,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
@@ -898,6 +899,13 @@ function isACPCreateConfigUnattended(input: AgentCreateConfigUnattendedInput): b
   );
 }
 
+function rethrowIfAborted(signal: AbortSignal | undefined, error: unknown): never {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
+  throw error;
+}
+
 export class ACPAgentClient implements AgentClient {
   readonly provider: string;
   readonly capabilities: AgentCapabilityFlags;
@@ -1014,7 +1022,9 @@ export class ACPAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    options?.signal?.throwIfAborted();
     if (handle.provider !== this.provider) {
       throw new Error(`Cannot resume ${handle.provider} handle with ${this.provider} provider`);
     }
@@ -1058,8 +1068,21 @@ export class ACPAgentClient implements AgentClient {
       managedProcesses: this.managedProcesses,
       initializeTimeoutMs: this.initializeTimeoutMs,
     });
-    await session.initializeResumedSession();
-    return session;
+    const handleAbort = () => {
+      void session.close().catch(() => undefined);
+    };
+    options?.signal?.addEventListener("abort", handleAbort, { once: true });
+    try {
+      options?.signal?.throwIfAborted();
+      await session.initializeResumedSession();
+      options?.signal?.throwIfAborted();
+      return session;
+    } catch (error) {
+      await session.close().catch(() => undefined);
+      return rethrowIfAborted(options?.signal, error);
+    } finally {
+      options?.signal?.removeEventListener("abort", handleAbort);
+    }
   }
 
   async fetchCatalog(

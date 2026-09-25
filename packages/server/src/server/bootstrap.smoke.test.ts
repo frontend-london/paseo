@@ -10,7 +10,6 @@ import { WebSocket } from "ws";
 import { createPaseoDaemon, parseListenString, type PaseoDaemonConfig } from "./bootstrap.js";
 import { loadConfig } from "./config.js";
 import { AgentManagerShuttingDownError } from "./agent/agent-manager.js";
-import type { ManagedAgent } from "./agent/agent-manager.js";
 import { writeAgentResumeLedger } from "./agent/agent-resume-ledger.js";
 import { hashDaemonPassword } from "./auth.js";
 import { generateLocalPairingOffer } from "./pairing-offer.js";
@@ -51,6 +50,37 @@ type WebSocketProbeResult =
   | { status: "connected" }
   | { status: "rejected"; statusCode: number | null };
 
+function createDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function handleDeferredAbort(
+  signal: AbortSignal | undefined,
+  abortDeferred: { resolve: () => void },
+  cleanupGatePromise: Promise<void>,
+  state: { abortObserved: boolean; cleanupGateCompleted: boolean },
+  reject: (reason?: unknown) => void,
+) {
+  const onAbort = async () => {
+    state.abortObserved = true;
+    abortDeferred.resolve();
+    await cleanupGatePromise;
+    state.cleanupGateCompleted = true;
+    reject(signal?.reason ?? new Error("Aborted"));
+  };
+  if (signal?.aborted) {
+    void onAbort();
+  } else {
+    signal?.addEventListener("abort", () => void onAbort(), { once: true });
+  }
+}
+
 describe("paseo daemon bootstrap", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -86,6 +116,7 @@ describe("paseo daemon bootstrap", () => {
     const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-rehydrate-timeout-"));
     const paseoHome = path.join(paseoHomeRoot, ".paseo");
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-rehydrate-cwd-"));
     await mkdir(paseoHome, { recursive: true });
     const logEntries: Array<Record<string, unknown>> = [];
     const logger = pino(
@@ -96,6 +127,33 @@ describe("paseo daemon bootstrap", () => {
         },
       },
     );
+    const stalledAgentId = "00000000-0000-0000-0000-000000000001";
+    const resumedAgentId = "00000000-0000-0000-0000-000000000002";
+    const daemonOwnedAgentId = "00000000-0000-0000-0000-000000000003";
+
+    const abortState = { abortObserved: false, cleanupGateCompleted: false };
+    const abortDeferred = createDeferred<void>();
+    const cleanupGate = createDeferred<void>();
+
+    const testClients = createTestAgentClients();
+    const originalCodexResumeSession = testClients.codex.resumeSession.bind(testClients.codex);
+    vi.spyOn(testClients.codex, "resumeSession").mockImplementation(
+      async (handle, overrides, launchContext, resumeOptions) => {
+        if (handle.sessionId === stalledAgentId) {
+          return await new Promise<never>((_resolve, reject) => {
+            handleDeferredAbort(
+              resumeOptions?.signal,
+              abortDeferred,
+              cleanupGate.promise,
+              abortState,
+              reject,
+            );
+          });
+        }
+        return await originalCodexResumeSession(handle, overrides, launchContext, resumeOptions);
+      },
+    );
+
     const config: PaseoDaemonConfig = {
       listen: "127.0.0.1:0",
       paseoHome,
@@ -104,22 +162,19 @@ describe("paseo daemon bootstrap", () => {
       mcpEnabled: false,
       staticDir,
       mcpDebug: false,
-      agentClients: createTestAgentClients(),
+      agentClients: testClients,
       agentStoragePath: path.join(paseoHome, "agents"),
       relayEnabled: false,
       agentRehydrationTimeoutMs: 25,
     };
     const daemon = await createPaseoDaemon(config, logger);
-    const stalledAgentId = "stalled-agent";
-    const resumedAgentId = "resumed-agent";
-    const daemonOwnedAgentId = "daemon-owned-agent";
     const now = new Date().toISOString();
 
     for (const agentId of [stalledAgentId, resumedAgentId]) {
       await daemon.agentStorage.upsert({
         id: agentId,
         provider: "codex",
-        cwd: "/tmp/project",
+        cwd: agentCwd,
         createdAt: now,
         updatedAt: now,
         labels: {},
@@ -130,7 +185,7 @@ describe("paseo daemon bootstrap", () => {
     await daemon.agentStorage.upsert({
       id: daemonOwnedAgentId,
       provider: "codex",
-      cwd: "/tmp/project",
+      cwd: agentCwd,
       createdAt: now,
       updatedAt: now,
       labels: {},
@@ -140,18 +195,28 @@ describe("paseo daemon bootstrap", () => {
     });
     await writeAgentResumeLedger(paseoHome, [stalledAgentId, resumedAgentId, daemonOwnedAgentId]);
 
-    const resumeAgentFromPersistence = vi
-      .spyOn(daemon.agentManager, "resumeAgentFromPersistence")
-      .mockImplementation(async (handle) => {
-        if (handle.sessionId === stalledAgentId) {
-          return await new Promise<ManagedAgent>(() => {});
-        }
-        return {} as ManagedAgent;
-      });
-
     let client: DaemonClient | null = null;
     try {
-      await daemon.start();
+      const startPromise = daemon.start();
+
+      // stalled resume -> timeout -> abort observed
+      await abortDeferred.promise;
+      expect(abortState.abortObserved).toBe(true);
+      expect(abortState.cleanupGateCompleted).toBe(false);
+
+      // cleanup gate must complete before startup settles
+      cleanupGate.resolve();
+      await startPromise;
+      expect(abortState.cleanupGateCompleted).toBe(true);
+
+      // second resume succeeds
+      expect(daemon.agentManager.getAgent(resumedAgentId)).not.toBeNull();
+
+      // stalled agent never registers
+      expect(daemon.agentManager.getAgent(stalledAgentId)).toBeNull();
+      expect(daemon.agentManager.listAgents().map((agent) => agent.id)).toEqual([resumedAgentId]);
+
+      // daemon accepts connection
       const target = daemon.getListenTarget();
       if (!target || target.type !== "tcp") throw new Error("Expected a TCP listener");
       client = new DaemonClient({
@@ -163,11 +228,6 @@ describe("paseo daemon bootstrap", () => {
       expect(await daemon.agentStorage.get(stalledAgentId)).not.toBeNull();
       expect(await daemon.agentStorage.get(resumedAgentId)).not.toBeNull();
       expect(await daemon.agentStorage.get(daemonOwnedAgentId)).not.toBeNull();
-      expect(
-        resumeAgentFromPersistence.mock.calls
-          .map(([handle]) => handle.sessionId)
-          .sort((left, right) => left.localeCompare(right)),
-      ).toEqual([resumedAgentId, stalledAgentId]);
       expect(logEntries).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -185,10 +245,11 @@ describe("paseo daemon bootstrap", () => {
       );
     } finally {
       client?.close();
-      await daemon.stop().catch(() => undefined);
+      await daemon.stop();
       await Promise.all([
         rm(paseoHomeRoot, { recursive: true, force: true }),
         rm(staticDir, { recursive: true, force: true }),
+        rm(agentCwd, { recursive: true, force: true }),
       ]);
     }
   });

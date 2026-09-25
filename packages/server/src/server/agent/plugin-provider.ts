@@ -26,6 +26,7 @@ import type {
   AgentCapabilityFlags,
   AgentClient,
   AgentCreateSessionOptions,
+  AgentResumeSessionOptions,
   AgentFeature,
   AgentLaunchContext,
   AgentMode,
@@ -881,17 +882,24 @@ class PluginAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    options?.signal?.throwIfAborted();
     if (!overrides?.cwd) {
       throw new Error(`Plugin provider '${this.provider}' requires cwd to resume a session`);
     }
-    return await this.openSession({
+    const session = await this.openSession({
       config: { ...overrides, provider: this.provider, cwd: overrides.cwd },
       launchContext,
       persistence: decodePersistence(handle),
       history: "replay",
       persist: true,
     });
+    if (options?.signal?.aborted) {
+      await session.close().catch(() => undefined);
+      throw options.signal.reason;
+    }
+    return session;
   }
 
   async fetchCatalog(

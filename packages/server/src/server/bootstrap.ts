@@ -584,8 +584,16 @@ async function rehydrateResumableAgents(
 
         const overrides = buildConfigOverrides(record);
         const timestamps = extractTimestamps(record);
-        await withTimeout({
-          promise: agentManager.resumeAgentFromPersistence(
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          controller.abort(
+            new Error(
+              `Timed out after ${timeoutMs}ms (resume agent ${agentId} after daemon restart)`,
+            ),
+          );
+        }, timeoutMs);
+        try {
+          await agentManager.resumeAgentFromPersistence(
             handle,
             overrides ?? undefined,
             agentId,
@@ -597,11 +605,12 @@ async function rehydrateResumableAgents(
               workspaceId: timestamps.workspaceId,
               owner: timestamps.owner,
             },
-          ),
-          timeoutMs,
-          label: `resume agent ${agentId} after daemon restart`,
-        });
-        logger.info({ agentId }, "Resumed agent after daemon restart");
+            { signal: controller.signal },
+          );
+          logger.info({ agentId }, "Resumed agent after daemon restart");
+        } finally {
+          clearTimeout(timer);
+        }
       } catch (error) {
         logger.error({ err: error, agentId }, "Failed to resume agent after daemon restart");
       }

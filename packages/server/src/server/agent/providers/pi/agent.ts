@@ -21,6 +21,7 @@ import {
   type AgentPersistenceHandle,
   type AgentPromptInput,
   type AgentProvider,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
@@ -501,6 +502,7 @@ function buildResumeStartInput(input: {
   launchContext: AgentLaunchContext | undefined;
   mcpConfig: PiMcpConfigFile | null;
   paseoExtension: PiTempFile | null;
+  signal?: AbortSignal;
 }): PiStartSessionInput {
   return {
     cwd: input.resumeConfig.cwd,
@@ -510,6 +512,7 @@ function buildResumeStartInput(input: {
     thinkingOptionId: normalizePiThinkingOption(input.resumeConfig.thinkingOptionId) ?? undefined,
     mcpConfigPath: input.mcpConfig?.path,
     extensionPaths: input.paseoExtension ? [input.paseoExtension.path] : undefined,
+    signal: input.signal,
   };
 }
 
@@ -2509,6 +2512,17 @@ export class PiRpcAgentSession implements AgentSession {
   }
 }
 
+function throwIfAborted(options?: AgentResumeSessionOptions): void {
+  options?.signal?.throwIfAborted();
+}
+
+function rethrowIfAborted(signal: AbortSignal | undefined, error: unknown): never {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
+  throw error;
+}
+
 export class PiRpcAgentClient implements AgentClient {
   readonly provider: AgentProvider;
   readonly capabilities: AgentCapabilityFlags;
@@ -2582,7 +2596,9 @@ export class PiRpcAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
+    throwIfAborted(options);
     const sessionFile = handle.nativeHandle;
     if (!sessionFile) {
       throw new Error("Pi resume requires a native session file handle");
@@ -2608,6 +2624,7 @@ export class PiRpcAgentClient implements AgentClient {
     );
     let runtimeSession: PiRuntimeSession;
     try {
+      throwIfAborted(options);
       runtimeSession = await this.runtime.startSession(
         buildResumeStartInput({
           resumeConfig,
@@ -2615,18 +2632,22 @@ export class PiRpcAgentClient implements AgentClient {
           launchContext,
           mcpConfig,
           paseoExtension,
+          signal: options?.signal,
         }),
       );
     } catch (error) {
       mcpConfig?.cleanup();
       paseoExtension?.cleanup();
-      throw error;
+      rethrowIfAborted(options?.signal, error);
     }
     try {
+      throwIfAborted(options);
+      const initialState = await runtimeSession.getState();
+      throwIfAborted(options);
       return new PiRpcAgentSession({
         runtimeSession,
         config: resumeConfig.config,
-        initialState: await runtimeSession.getState(),
+        initialState,
         capabilities: capabilitiesForSession(mcpConfig !== null),
         cleanup: combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]),
         extensionTimeoutMs: this.providerParams.extensionTimeoutMs,
@@ -2637,7 +2658,7 @@ export class PiRpcAgentClient implements AgentClient {
       await runtimeSession.close().catch(() => undefined);
       mcpConfig?.cleanup();
       paseoExtension?.cleanup();
-      throw error;
+      rethrowIfAborted(options?.signal, error);
     }
   }
 
