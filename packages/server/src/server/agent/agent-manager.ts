@@ -3591,13 +3591,11 @@ export class AgentManager {
         await this.closeUnregisteredSession(session);
       } else {
         const cleanupId = resolvedAgentId;
-        await this.closeAgent(cleanupId).catch(async (closeErr) => {
+        await this.closeAgent(cleanupId).catch((closeErr) => {
           this.logger.warn(
             { err: closeErr, agentId: cleanupId },
             "Failed to close agent after registration failure",
           );
-          await this.closeUnregisteredSession(session);
-          this.agents.delete(cleanupId);
         });
       }
       throw error;

@@ -1749,6 +1749,79 @@ test("does not persist an initializing session after shutdown closes it", async 
   }
 });
 
+test("registration cleanup retains ownership until a failed close can be retried", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reg-close-retry-"));
+  const agentId = randomUUID();
+  let allowClose = false;
+  let closeCalls = 0;
+  let replacementClosed = false;
+  let createCalls = 0;
+
+  class RetryableCloseSession extends TestAgentSession {
+    override async close(): Promise<void> {
+      closeCalls += 1;
+      if (!allowClose) throw new Error("provider cleanup failed");
+      await super.close();
+    }
+  }
+
+  const ownedSession = new RetryableCloseSession({ provider: "codex", cwd: workdir });
+  const replacementSession = new (class extends TestAgentSession {
+    override async close(): Promise<void> {
+      replacementClosed = true;
+    }
+  })({ provider: "codex", cwd: workdir });
+
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      createCalls += 1;
+      return createCalls === 1 ? ownedSession : replacementSession;
+    }
+  })();
+
+  const storage = {
+    get: vi.fn().mockResolvedValue(null),
+    applySnapshot: vi
+      .fn()
+      .mockRejectedValueOnce(new Error("disk write failure"))
+      .mockResolvedValue(undefined),
+    list: vi.fn().mockResolvedValue([]),
+    flush: vi.fn().mockResolvedValue(undefined),
+  } as unknown as AgentStorage;
+
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow("disk write failure");
+
+    expect(closeCalls).toBe(1);
+    expect(manager.getAgent(agentId)?.session).toBe(ownedSession);
+
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow(`Agent with id ${agentId} already exists`);
+
+    expect(replacementClosed).toBe(true);
+    expect(manager.getAgent(agentId)?.session).toBe(ownedSession);
+
+    allowClose = true;
+    await manager.closeAgent(agentId);
+
+    expect(closeCalls).toBe(2);
+    expect(manager.getAgent(agentId)).toBeNull();
+  } finally {
+    allowClose = true;
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("reload leaves a closed durable snapshot when shutdown starts during the swap", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-reload-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
