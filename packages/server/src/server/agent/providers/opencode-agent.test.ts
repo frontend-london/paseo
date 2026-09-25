@@ -354,6 +354,43 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     rmSync(cwd, { recursive: true, force: true });
   }, 60_000);
 
+  test("retries server release after a failed close without losing ownership", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    runtime.enqueueClient(openCode);
+    let releaseAttempts = 0;
+    const release = vi.fn(async () => {
+      releaseAttempts += 1;
+      if (releaseAttempts === 1) {
+        throw new Error("release failed");
+      }
+    });
+    vi.spyOn(runtime, "acquireCurrent").mockResolvedValue({
+      server: runtime.server,
+      events: runtime.events,
+      release,
+    });
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession(buildConfig(cwd));
+
+    try {
+      await expect(session.close()).rejects.toThrow("release failed");
+      expect(release).toHaveBeenCalledTimes(1);
+
+      await expect(session.close()).resolves.toBeUndefined();
+      expect(release).toHaveBeenCalledTimes(2);
+
+      await expect(session.close()).resolves.toBeUndefined();
+      expect(release).toHaveBeenCalledTimes(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("creates a session when session.create needs more than ten seconds", async () => {
     vi.useFakeTimers();
     const cwd = tmpCwd();

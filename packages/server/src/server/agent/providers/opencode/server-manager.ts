@@ -207,6 +207,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private acquireServer(server: OpenCodeServerGeneration): OpenCodeServerAcquisition {
     server.refCount += 1;
     let releasePromise: Promise<void> | null = null;
+    let referenceReleased = false;
     return {
       server: { port: server.port, url: server.url },
       events: server.events,
@@ -214,14 +215,20 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         if (releasePromise) {
           return releasePromise;
         }
-        releasePromise = this.releaseServer(server);
+        if (!referenceReleased) {
+          server.refCount = Math.max(0, server.refCount - 1);
+          referenceReleased = true;
+        }
+        releasePromise = this.releaseServer(server).catch((error) => {
+          releasePromise = null;
+          throw error;
+        });
         return releasePromise;
       },
     };
   }
 
   private async releaseServer(server: OpenCodeServerGeneration): Promise<void> {
-    server.refCount = Math.max(0, server.refCount - 1);
     if (server.refCount > 0) {
       return;
     }
@@ -229,14 +236,15 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     if (this.currentServer === server) {
       this.currentServer = null;
       server.retired = true;
+      this.retiredServers.add(server);
     }
     if (!server.retired) {
       return;
     }
 
+    await this.killServer(server);
     this.retiredServers.delete(server);
     this.logger.info(generationLogContext(server), "OpenCode server generation released");
-    await this.killServer(server);
   }
 
   private async getNewServer(): Promise<OpenCodeServerGeneration> {

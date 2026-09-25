@@ -155,6 +155,27 @@ describe("OpenCodeServerManager generations", () => {
     expect(runtime.terminatedPorts).toEqual([4302, 4301]);
   });
 
+  test("failed final release retries cleanup without releasing the reference twice", async () => {
+    const { manager, runtime } = createTestManager([4351], { terminateFailures: 1 });
+
+    const first = await manager.acquireCurrent();
+    const final = await manager.acquireCurrent();
+
+    await first.release();
+    expect(runtime.terminateAttempts).toEqual([]);
+
+    await expect(final.release()).rejects.toThrow("fake termination failed");
+    expect(runtime.terminateAttempts).toEqual([4351]);
+    expect(runtime.terminatedPorts).toEqual([]);
+
+    await expect(final.release()).resolves.toBeUndefined();
+    expect(runtime.terminateAttempts).toEqual([4351, 4351]);
+    expect(runtime.terminatedPorts).toEqual([4351]);
+
+    await expect(final.release()).resolves.toBeUndefined();
+    expect(runtime.terminateAttempts).toEqual([4351, 4351]);
+  });
+
   test("shutdown kills current and retired servers", async () => {
     const { manager, runtime } = createTestManager([4401, 4402]);
 
@@ -414,6 +435,7 @@ function createTestManager(
     baseEnv?: Record<string, string>;
     opencodeHomeDir?: string;
     logger?: Logger;
+    terminateFailures?: number;
   } = {},
 ): {
   manager: OpenCodeServerManager;
@@ -422,6 +444,7 @@ function createTestManager(
   const { opencodeHomeDir } = options;
   const runtime = new FakeOpenCodeServerRuntime(ports, {
     autoAnnounce: options.autoAnnounce ?? true,
+    terminateFailures: options.terminateFailures ?? 0,
   });
   return {
     manager: new OpenCodeServerManager({
@@ -452,6 +475,7 @@ function createCapturingLogger(): { logger: Logger; records: Array<Record<string
 class FakeOpenCodeServerRuntime {
   readonly managedProcesses = new FakeManagedProcesses();
   readonly terminatedPorts: number[] = [];
+  readonly terminateAttempts: number[] = [];
   readonly spawnCalls: Array<{
     command: string;
     args: string[];
@@ -459,12 +483,14 @@ class FakeOpenCodeServerRuntime {
   }> = [];
   private readonly ports: number[];
   private readonly autoAnnounce: boolean;
+  private remainingTerminateFailures: number;
   private readonly processesByChild = new Map<ChildProcess, FakeOpenCodeProcess>();
   private readonly processesByPort = new Map<number, FakeOpenCodeProcess>();
 
-  constructor(ports: number[], options: { autoAnnounce: boolean }) {
+  constructor(ports: number[], options: { autoAnnounce: boolean; terminateFailures?: number }) {
     this.ports = [...ports];
     this.autoAnnounce = options.autoAnnounce;
+    this.remainingTerminateFailures = options.terminateFailures ?? 0;
   }
 
   get launchedPorts(): number[] {
@@ -498,6 +524,11 @@ class FakeOpenCodeServerRuntime {
 
   readonly terminateProcess: ProcessTerminator = async (target: TreeKillTarget) => {
     const process = this.processForChild(target as ChildProcess);
+    this.terminateAttempts.push(process.port);
+    if (this.remainingTerminateFailures > 0) {
+      this.remainingTerminateFailures -= 1;
+      throw new Error("fake termination failed");
+    }
     this.terminatedPorts.push(process.port);
     process.exitBySignal("SIGTERM");
     return "terminated";

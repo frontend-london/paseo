@@ -4913,11 +4913,16 @@ class OpenCodeAgentSession implements AgentSession {
     if (this.closePromise) {
       return this.closePromise;
     }
-    this.closePromise = this.closeInternal();
+    this.closePromise = this.closeInternal().catch((error) => {
+      this.closePromise = null;
+      throw error;
+    });
     return this.closePromise;
   }
 
   private async closeInternal(): Promise<void> {
+    let releaseFailed = false;
+    let releaseError: unknown;
     try {
       this.closed = true;
       this.abortController?.abort();
@@ -4952,17 +4957,22 @@ class OpenCodeAgentSession implements AgentSession {
       this.releaseBridge?.();
       this.releaseBridge = null;
       const release = this.releaseServer;
-      this.releaseServer = null;
       if (release) {
         try {
           await release();
+          this.releaseServer = null;
         } catch (releaseErr) {
           this.logger.warn(
             { err: releaseErr, sessionId: this.sessionId },
             "Failed to release OpenCode server during close",
           );
+          releaseFailed = true;
+          releaseError = releaseErr;
         }
       }
+    }
+    if (releaseFailed) {
+      throw releaseError;
     }
   }
 
