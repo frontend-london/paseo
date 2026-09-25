@@ -112,6 +112,7 @@ describe("paseo daemon bootstrap", () => {
     const daemon = await createPaseoDaemon(config, logger);
     const stalledAgentId = "stalled-agent";
     const resumedAgentId = "resumed-agent";
+    const daemonOwnedAgentId = "daemon-owned-agent";
     const now = new Date().toISOString();
 
     for (const agentId of [stalledAgentId, resumedAgentId]) {
@@ -126,16 +127,27 @@ describe("paseo daemon bootstrap", () => {
         persistence: { provider: "codex", sessionId: agentId },
       });
     }
-    await writeAgentResumeLedger(paseoHome, [stalledAgentId, resumedAgentId]);
+    await daemon.agentStorage.upsert({
+      id: daemonOwnedAgentId,
+      provider: "codex",
+      cwd: "/tmp/project",
+      createdAt: now,
+      updatedAt: now,
+      labels: {},
+      lastStatus: "running",
+      persistence: { provider: "codex", sessionId: daemonOwnedAgentId },
+      owner: { kind: "daemon", daemonId: "hub-daemon", executionId: "execution-1" },
+    });
+    await writeAgentResumeLedger(paseoHome, [stalledAgentId, resumedAgentId, daemonOwnedAgentId]);
 
-    vi.spyOn(daemon.agentManager, "resumeAgentFromPersistence").mockImplementation(
-      async (handle) => {
+    const resumeAgentFromPersistence = vi
+      .spyOn(daemon.agentManager, "resumeAgentFromPersistence")
+      .mockImplementation(async (handle) => {
         if (handle.sessionId === stalledAgentId) {
           return await new Promise<ManagedAgent>(() => {});
         }
         return {} as ManagedAgent;
-      },
-    );
+      });
 
     let client: DaemonClient | null = null;
     try {
@@ -150,6 +162,12 @@ describe("paseo daemon bootstrap", () => {
 
       expect(await daemon.agentStorage.get(stalledAgentId)).not.toBeNull();
       expect(await daemon.agentStorage.get(resumedAgentId)).not.toBeNull();
+      expect(await daemon.agentStorage.get(daemonOwnedAgentId)).not.toBeNull();
+      expect(
+        resumeAgentFromPersistence.mock.calls
+          .map(([handle]) => handle.sessionId)
+          .sort((left, right) => left.localeCompare(right)),
+      ).toEqual([resumedAgentId, stalledAgentId]);
       expect(logEntries).toEqual(
         expect.arrayContaining([
           expect.objectContaining({

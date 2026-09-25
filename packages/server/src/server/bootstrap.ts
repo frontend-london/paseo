@@ -565,6 +565,13 @@ async function rehydrateResumableAgents(
           logger.debug({ agentId }, "Resume ledger agent is archived; skipping");
           return;
         }
+        if (record.owner?.kind === "daemon") {
+          logger.debug(
+            { agentId, daemonId: record.owner.daemonId },
+            "Resume ledger agent is daemon-owned; Hub restart semantics own recovery",
+          );
+          return;
+        }
 
         const handle = toAgentPersistenceHandle(validProviders, record.persistence);
         if (!handle) {
@@ -1877,10 +1884,11 @@ export async function createPaseoDaemon(
       .listAgents()
       .filter(
         (agent) =>
-          agent.lifecycle === "running" ||
-          agent.lifecycle === "initializing" ||
-          agent.activeForegroundTurnId !== null ||
-          agent.activeTurnId !== null,
+          agent.owner?.kind !== "daemon" &&
+          (agent.lifecycle === "running" ||
+            agent.lifecycle === "initializing" ||
+            agent.activeForegroundTurnId !== null ||
+            agent.activeTurnId !== null),
       )
       .map((agent) => agent.id);
     await writeAgentResumeLedger(config.paseoHome, liveAgentIds);
