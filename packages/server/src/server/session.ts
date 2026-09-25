@@ -3566,50 +3566,52 @@ export class Session {
   ): Promise<void> {
     const { workspaceId, requestId } = request;
     try {
-      const workspace = await this.workspaceRegistry.get(workspaceId);
-      if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
+      await this.agentManager.withWorkspaceRemoval(workspaceId, async () => {
+        const workspace = await this.workspaceRegistry.get(workspaceId);
+        if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
 
-      const persistedAgents = await this.agentStorage.listByWorkspace(workspaceId);
-      const activeAgentIds = new Set(
-        persistedAgents.filter((agent) => !agent.archivedAt).map((agent) => agent.id),
-      );
-      for (const agent of this.agentManager.listAgents()) {
-        if (agent.workspaceId === workspaceId && agent.lifecycle !== "closed") {
-          activeAgentIds.add(agent.id);
+        const persistedAgents = await this.agentStorage.listByWorkspace(workspaceId);
+        const activeAgentIds = new Set(
+          persistedAgents.filter((agent) => !agent.archivedAt).map((agent) => agent.id),
+        );
+        for (const agent of this.agentManager.listAgents()) {
+          if (agent.workspaceId === workspaceId && agent.lifecycle !== "closed") {
+            activeAgentIds.add(agent.id);
+          }
         }
-      }
-      if (activeAgentIds.size > 0) {
-        throw new Error(`Workspace has active agents: ${Array.from(activeAgentIds).join(", ")}`);
-      }
+        if (activeAgentIds.size > 0) {
+          throw new Error(`Workspace has active agents: ${Array.from(activeAgentIds).join(", ")}`);
+        }
 
-      if (this.terminalManager) {
-        const terminals = (
-          await Promise.all(
-            this.terminalManager
-              .listDirectories()
-              .map((cwd) => this.terminalManager!.getTerminals(cwd, { workspaceId })),
-          )
-        ).flat();
-        if (terminals.length > 0) {
+        if (this.terminalManager) {
+          const terminals = (
+            await Promise.all(
+              this.terminalManager
+                .listDirectories()
+                .map((cwd) => this.terminalManager!.getTerminals(cwd, { workspaceId })),
+            )
+          ).flat();
+          if (terminals.length > 0) {
+            throw new Error(
+              `Workspace has active terminals: ${terminals.map((terminal) => terminal.id).join(", ")}`,
+            );
+          }
+        }
+
+        const runningScripts =
+          this.scriptRuntimeStore
+            ?.listForWorkspace(workspaceId)
+            .filter((entry) => entry.lifecycle === "running") ?? [];
+        if (runningScripts.length > 0) {
           throw new Error(
-            `Workspace has active terminals: ${terminals.map((terminal) => terminal.id).join(", ")}`,
+            `Workspace has running scripts: ${runningScripts.map((entry) => entry.scriptName).join(", ")}`,
           );
         }
-      }
 
-      const runningScripts =
-        this.scriptRuntimeStore
-          ?.listForWorkspace(workspaceId)
-          .filter((entry) => entry.lifecycle === "running") ?? [];
-      if (runningScripts.length > 0) {
-        throw new Error(
-          `Workspace has running scripts: ${runningScripts.map((entry) => entry.scriptName).join(", ")}`,
-        );
-      }
-
-      await this.workspaceRegistry.remove(workspaceId);
-      await this.teardownArchivedWorkspace(workspaceId);
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], { forceRemove: true });
+        await this.workspaceRegistry.remove(workspaceId);
+        await this.teardownArchivedWorkspace(workspaceId);
+        await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], { forceRemove: true });
+      });
       this.emit({
         type: "workspace.remove.response",
         payload: { requestId, workspaceId, accepted: true, error: null },
@@ -4327,6 +4329,7 @@ export class Session {
           paseoHome: this.paseoHome,
           worktreesRoot: this.worktreesRoot,
           providerSnapshotManager: this.providerSnapshotManager,
+          workspaceRegistry: this.workspaceRegistry,
         },
         {
           kind: "session",

@@ -314,6 +314,7 @@ export interface CreateAgentOptions {
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
   owner?: AgentOwner;
+  validateWorkspace?: () => Promise<void>;
 }
 
 export interface AgentManagerOptions {
@@ -739,6 +740,8 @@ export class AgentManager {
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
+  private readonly workspaceAgentCreations = new Map<string, Set<Promise<void>>>();
+  private readonly workspaceRemovals = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -1232,7 +1235,68 @@ export class AgentManager {
     agentId: string | undefined,
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.createAgentInternal(config, agentId, options));
+    const creation = options.workspaceId
+      ? this.withWorkspaceAgentCreation(options.workspaceId, async () => {
+          await options.validateWorkspace?.();
+          return this.createAgentInternal(config, agentId, options);
+        })
+      : this.createAgentInternal(config, agentId, options);
+    return this.trackAgentRegistrationOperation(creation);
+  }
+
+  async withWorkspaceAgentCreation<T>(
+    workspaceId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    while (true) {
+      const removal = this.workspaceRemovals.get(workspaceId);
+      if (removal) {
+        await removal;
+        continue;
+      }
+
+      let release!: () => void;
+      const completion = new Promise<void>((resolveCompletion) => {
+        release = resolveCompletion;
+      });
+      const active = this.workspaceAgentCreations.get(workspaceId) ?? new Set<Promise<void>>();
+      active.add(completion);
+      this.workspaceAgentCreations.set(workspaceId, active);
+      try {
+        return await operation();
+      } finally {
+        active.delete(completion);
+        if (active.size === 0 && this.workspaceAgentCreations.get(workspaceId) === active) {
+          this.workspaceAgentCreations.delete(workspaceId);
+        }
+        release();
+      }
+    }
+  }
+
+  async withWorkspaceRemoval<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+    while (true) {
+      const existing = this.workspaceRemovals.get(workspaceId);
+      if (existing) {
+        await existing;
+        continue;
+      }
+
+      let release!: () => void;
+      const removal = new Promise<void>((resolveRemoval) => {
+        release = resolveRemoval;
+      });
+      this.workspaceRemovals.set(workspaceId, removal);
+      try {
+        await Promise.all(this.workspaceAgentCreations.get(workspaceId) ?? []);
+        return await operation();
+      } finally {
+        if (this.workspaceRemovals.get(workspaceId) === removal) {
+          this.workspaceRemovals.delete(workspaceId);
+        }
+        release();
+      }
+    }
   }
 
   private async createAgentInternal(

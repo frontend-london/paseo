@@ -28,6 +28,7 @@ import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/pro
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createTerminalManager } from "../terminal/terminal-manager.js";
 import { AgentManager, type AgentManagerEvent, type ManagedAgent } from "./agent/agent-manager.js";
+import { createAgentCommand } from "./agent/create-agent/create.js";
 import type { ProviderSubagentDescriptor } from "./agent/provider-subagents/store.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
 import type {
@@ -552,6 +553,25 @@ class CreateAgentTestClient implements AgentClient {
   }
 }
 
+class BlockingCreateAgentTestClient extends CreateAgentTestClient {
+  constructor(
+    private readonly started: { resolve: (value?: void) => void },
+    private readonly release: Promise<void>,
+  ) {
+    super();
+  }
+
+  override async createSession(
+    config: AgentSessionConfig,
+    launchContext?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
+  ): Promise<AgentSession> {
+    this.started.resolve();
+    await this.release;
+    return super.createSession(config, launchContext, options);
+  }
+}
+
 function createSessionForWorkspaceTests(
   options: {
     appVersion?: string | null;
@@ -592,6 +612,8 @@ function createSessionForWorkspaceTests(
     clearAgentAttention: async () => {},
     markAgentUnread: async () => {},
     notifyAgentState: () => {},
+    withWorkspaceRemoval: async (_workspaceId: string, operation: () => Promise<unknown>) =>
+      operation(),
     ...options.agentManager,
   });
   const workspaceRegistry: SessionOptions["workspaceRegistry"] = options.workspaceRegistry ?? {
@@ -9635,6 +9657,136 @@ test("workspace.remove.request removes an orphaned workspace record without side
     kind: "remove",
     id: workspace.workspaceId,
   });
+});
+
+test("workspace.remove.request waits for an in-flight agent create before deciding removal", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-workspace-create-remove-race-"));
+  const providerStarted = deferred<void>();
+  const releaseProvider = deferred<void>();
+  const emitted: SessionOutboundMessage[] = [];
+  const raceCwd = path.join(workdir, "repo");
+  mkdirSync(raceCwd, { recursive: true });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-create-remove-race",
+    projectId: "proj-create-remove-race",
+    cwd: raceCwd,
+    kind: "local_checkout",
+    displayName: "create-remove-race",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspaces = new Map<string, PersistedWorkspaceRecord>([
+    [workspace.workspaceId, workspace],
+  ]);
+  const logger = createTestLogger();
+  const agentStorage = new AgentStorage(path.join(workdir, "agents"), logger);
+  const agentManager = new AgentManager({
+    clients: {
+      codex: new BlockingCreateAgentTestClient(providerStarted, releaseProvider.promise),
+    },
+    registry: agentStorage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000592",
+  });
+
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(workspaces.values()),
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+      update: async (workspaceId, updater) => {
+        const existing = workspaces.get(workspaceId);
+        if (!existing) return null;
+        const next = updater(existing);
+        workspaces.set(workspaceId, next);
+        return next;
+      },
+      upsert: async (record) => {
+        workspaces.set(record.workspaceId, record);
+      },
+      archive: async () => {},
+      remove: async (workspaceId) => {
+        workspaces.delete(workspaceId);
+      },
+    },
+    agentStorage: {
+      listByWorkspace: (workspaceId: string) => agentStorage.listByWorkspace(workspaceId),
+    },
+    agentManager: {
+      createAgent: agentManager.createAgent.bind(agentManager),
+      withWorkspaceAgentCreation: agentManager.withWorkspaceAgentCreation.bind(agentManager),
+      withWorkspaceRemoval: agentManager.withWorkspaceRemoval.bind(agentManager),
+      listAgents: agentManager.listAgents.bind(agentManager),
+      getAgent: agentManager.getAgent.bind(agentManager),
+      getTimeline: agentManager.getTimeline.bind(agentManager),
+    },
+  });
+
+  try {
+    const create = createAgentCommand(
+      {
+        agentManager,
+        agentStorage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        workspaceRegistry: {
+          get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+        },
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: raceCwd },
+        workspaceId: workspace.workspaceId,
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    );
+
+    await providerStarted.promise;
+    expect(agentManager.listAgents()).toHaveLength(0);
+
+    let removeSettled = false;
+    const remove = session
+      .handleMessage({
+        type: "workspace.remove.request",
+        workspaceId: workspace.workspaceId,
+        requestId: "req-create-remove-race-remove",
+      })
+      .finally(() => {
+        removeSettled = true;
+      });
+
+    await waitForImmediate();
+    expect(removeSettled).toBe(false);
+    expect(workspaces.has(workspace.workspaceId)).toBe(true);
+
+    releaseProvider.resolve();
+    await Promise.all([create, remove]);
+
+    expect(workspaces.has(workspace.workspaceId)).toBe(true);
+    expect(agentManager.listAgents()).toHaveLength(1);
+    expect(agentManager.listAgents()[0]?.workspaceId).toBe(workspace.workspaceId);
+    expect(findByType(emitted, "workspace.remove.response")?.payload).toMatchObject({
+      requestId: "req-create-remove-race-remove",
+      workspaceId: workspace.workspaceId,
+      accepted: false,
+      error: expect.stringContaining("active agents"),
+    });
+    await expect(create).resolves.toMatchObject({
+      snapshot: { workspaceId: workspace.workspaceId },
+    });
+  } finally {
+    releaseProvider.resolve();
+    agentManager.prepareForShutdown();
+    await Promise.all(agentManager.listAgents().map((agent) => agentManager.closeAgent(agent.id)));
+    await agentManager.flushForShutdown();
+    await agentStorage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("workspace.remove.request rejects when the workspace has an active agent", async () => {

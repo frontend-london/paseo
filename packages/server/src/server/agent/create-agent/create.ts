@@ -26,6 +26,7 @@ import {
   emitLiveTimelineItemIfAgentKnown,
 } from "../timeline-append.js";
 import { resolveCreateAgentIntent } from "./intent.js";
+import type { WorkspaceRegistry } from "../../workspace-registry.js";
 
 export interface CreateAgentSessionWorktreeResult {
   sessionConfig: AgentSessionConfig;
@@ -46,6 +47,7 @@ export interface CreateAgentCommandDependencies {
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
 }
 
 export type EnsureWorkspaceForCreate = (
@@ -181,10 +183,22 @@ export async function createAgentCommand(
       ? await resolveSessionCreateAgent(dependencies, input)
       : await resolveMcpCreateAgent(dependencies, input);
 
+  const workspaceId = requireResolvedWorkspaceId(resolved.createOptions.workspaceId);
+  const createOptions = dependencies.workspaceRegistry
+    ? {
+        ...resolved.createOptions,
+        validateWorkspace: async () => {
+          const workspace = await dependencies.workspaceRegistry!.get(workspaceId);
+          if (!workspace || workspace.archivedAt) {
+            throw new Error(`Workspace ${workspaceId} not found`);
+          }
+        },
+      }
+    : resolved.createOptions;
   const snapshot = await dependencies.agentManager.createAgent(
     resolved.config,
     input.kind === "session" ? input.agentId : undefined,
-    resolved.createOptions,
+    createOptions,
   );
 
   resolved.setupContinuation?.startAfterAgentCreate({
