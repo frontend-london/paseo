@@ -2,10 +2,6 @@
 // controls remain available to managed launches and their agent processes.
 export const DAEMON_SETTING_ENV_KEYS = [
   "MCP_DEBUG",
-  "PASEO_MCP_OAUTH_ISSUER",
-  "PASEO_MCP_OAUTH_RESOURCE",
-  "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL",
-  "PASEO_MCP_OAUTH_SCOPES",
   "OPENAI_STT_BASE_URL",
   "OPENAI_TTS_BASE_URL",
   "PASEO_ALLOWED_HOSTS",
@@ -61,6 +57,13 @@ export const DAEMON_SETTING_ENV_KEYS = [
   "TTS_VOICE",
 ] as const;
 
+const MANAGED_DAEMON_PASSTHROUGH_ENV_KEYS = [
+  "PASEO_MCP_OAUTH_ISSUER",
+  "PASEO_MCP_OAUTH_RESOURCE",
+  "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL",
+  "PASEO_MCP_OAUTH_SCOPES",
+] as const;
+
 const CONFIG_CONTEXT_ENV_KEYS = [
   "PASEO_NODE_ENV",
   "PASEO_DESKTOP_MANAGED",
@@ -72,7 +75,11 @@ const CONFIG_CONTEXT_ENV_KEYS = [
 
 export function configurationEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(
-    [...DAEMON_SETTING_ENV_KEYS, ...CONFIG_CONTEXT_ENV_KEYS].map((key) => [key, env[key]]),
+    [
+      ...DAEMON_SETTING_ENV_KEYS,
+      ...MANAGED_DAEMON_PASSTHROUGH_ENV_KEYS,
+      ...CONFIG_CONTEXT_ENV_KEYS,
+    ].map((key) => [key, env[key]]),
   );
 }
 

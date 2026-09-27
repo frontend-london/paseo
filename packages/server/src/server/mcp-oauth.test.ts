@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   createMcpOAuthTokenVerifier,
   createProtectedResourceMetadata,
+  normalizeMcpOAuthConfig,
   type McpOAuthConfig,
 } from "./mcp-oauth.js";
 
@@ -89,6 +90,22 @@ describe("MCP OAuth verifier", () => {
   test("rejects the wrong issuer", async () => {
     const verify = createMcpOAuthTokenVerifier(config());
     expect(await verify(await token({ issuer: "https://wrong.example/" }))).toBe(false);
+  });
+
+  test("accepts bracketed IPv6 loopback HTTP for local OAuth metadata", () => {
+    expect(
+      normalizeMcpOAuthConfig({
+        issuer: "http://[::1]:65534",
+        resource,
+        resourceMetadataUrl: "http://[::1]:6767/.well-known/oauth-protected-resource/mcp/agents",
+        scopes,
+      }),
+    ).toEqual({
+      issuer: "http://[::1]:65534/",
+      resource,
+      resourceMetadataUrl: "http://[::1]:6767/.well-known/oauth-protected-resource/mcp/agents",
+      scopes,
+    });
   });
 
   test("publishes RFC protected-resource metadata", () => {

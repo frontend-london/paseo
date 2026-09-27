@@ -20,7 +20,8 @@ function normalizeHttpUrl(
   options: { allowLoopbackHttp: boolean; trailingSlash: boolean },
 ): string {
   const url = new URL(value);
-  const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+  const hostname = url.hostname.replace(/^\[(.*)\]$/u, "$1");
+  const loopback = ["127.0.0.1", "localhost", "::1"].includes(hostname);
   const httpAllowed = options.allowLoopbackHttp && loopback && url.protocol === "http:";
   if (url.protocol !== "https:" && !httpAllowed) {
     throw new Error(

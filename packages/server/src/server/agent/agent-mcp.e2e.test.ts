@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { experimental_createMCPClient } from "ai";
+import { extractWWWAuthenticateParams } from "@modelcontextprotocol/sdk/client/auth.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
 
@@ -445,12 +446,20 @@ describe("agent MCP end-to-end (offline)", () => {
       expect(unauthorized.headers.get("www-authenticate")).toBe(
         [
           "Bearer",
-          `resource_metadata="http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents"`,
-          'error="invalid_token"',
-          'error_description="Authentication required"',
-          'scope="paseo.mcp"',
-        ].join(", "),
+          [
+            `resource_metadata="http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents"`,
+            'error="invalid_token"',
+            'error_description="Authentication required"',
+            'scope="paseo.mcp"',
+          ].join(", "),
+        ].join(" "),
       );
+      const challenge = extractWWWAuthenticateParams(unauthorized);
+      expect(challenge.resourceMetadataUrl?.toString()).toBe(
+        `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents`,
+      );
+      expect(challenge.scope).toBe("paseo.mcp");
+      expect(challenge.error).toBe("invalid_token");
 
       const capabilityToken = daemon.agentManager.getMcpAuthToken();
       const client = await createMcpClient(mcpUrl, capabilityToken!);
