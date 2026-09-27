@@ -55,4 +55,32 @@ describe("daemon auth config", () => {
     expect(config.auth?.password).toMatch(/^\$2[aby]\$12\$/);
     expect(isBearerTokenValid({ password: config.auth?.password, token: "from-env" })).toBe(true);
   });
+
+  test("loads MCP OAuth only from a complete env contract", async () => {
+    const paseoHome = await createPaseoHome({});
+
+    const config = loadConfig(paseoHome, {
+      env: {
+        PASEO_MCP_OAUTH_ISSUER: "https://tenant.example/",
+        PASEO_MCP_OAUTH_RESOURCE: "https://resource.example/paseo",
+        PASEO_MCP_OAUTH_SCOPES: "paseo.mcp, paseo.read",
+      },
+    });
+
+    expect(config.mcpOAuth).toEqual({
+      issuer: "https://tenant.example/",
+      resource: "https://resource.example/paseo",
+      scopes: ["paseo.mcp", "paseo.read"],
+    });
+  });
+
+  test("rejects partial MCP OAuth configuration", async () => {
+    const paseoHome = await createPaseoHome({});
+
+    expect(() =>
+      loadConfig(paseoHome, {
+        env: { PASEO_MCP_OAUTH_ISSUER: "https://tenant.example/" },
+      }),
+    ).toThrow(/PASEO MCP OAuth requires/u);
+  });
 });

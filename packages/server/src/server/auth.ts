@@ -120,9 +120,17 @@ export function createRequireBearerMiddleware(
 }
 
 const SELF_AUTHENTICATING_ROUTES = new Set(["/api/files/download", "/mcp/agents"]);
+const PUBLIC_METADATA_ROUTES = new Set([
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-protected-resource/mcp/agents",
+]);
 
 function isBearerFreeRoute(path: string): boolean {
-  return path === "/api/health" || SELF_AUTHENTICATING_ROUTES.has(path);
+  return (
+    path === "/api/health" ||
+    SELF_AUTHENTICATING_ROUTES.has(path) ||
+    PUBLIC_METADATA_ROUTES.has(path)
+  );
 }
 
 export function shouldBypassBearerAuth(method: string, path: string): boolean {
@@ -136,18 +144,17 @@ export function shouldBypassBearerAuth(method: string, path: string): boolean {
  * Authorizes a request to the Agent MCP endpoint (/mcp/agents), which is exempt
  * from the global daemon-password middleware. Accepts either the per-daemon-run
  * capability token the daemon injects into its own agents' configs and MCP
- * client, or a valid daemon-password bearer (so existing password-authenticated
- * callers keep working). When no daemon password is configured the endpoint is
- * open, matching the global middleware's behavior.
+ * client, an optional externally validated OAuth bearer, or a valid daemon-
+ * password bearer. When external OAuth is configured the route fails closed
+ * without a valid credential; otherwise no-password deployments keep the
+ * historical open behavior.
  */
 export async function isAgentMcpRequestAuthorized(input: {
   password: string | undefined;
   capabilityToken: string | null;
   authorizationHeader: string | undefined;
+  externalBearerValidator?: (token: string) => Promise<boolean>;
 }): Promise<boolean> {
-  if (!input.password) {
-    return true;
-  }
   const token = extractHttpBearerToken(input.authorizationHeader);
   if (input.capabilityToken !== null && token !== null) {
     // Constant-time compare; length-guard first because timingSafeEqual throws
@@ -158,5 +165,16 @@ export async function isAgentMcpRequestAuthorized(input: {
       return true;
     }
   }
-  return isBearerTokenValidAsync({ password: input.password, token });
+
+  if (token !== null && input.externalBearerValidator) {
+    if (await input.externalBearerValidator(token)) {
+      return true;
+    }
+  }
+
+  if (input.password) {
+    return isBearerTokenValidAsync({ password: input.password, token });
+  }
+
+  return input.externalBearerValidator === undefined;
 }

@@ -65,6 +65,10 @@ describe("daemon bearer validator", () => {
     // Guarded by its own per-daemon-run capability token (see
     // isAgentMcpRequestAuthorized), not the daemon password.
     expect(shouldBypassBearerAuth("POST", "/mcp/agents")).toBe(true);
+    expect(shouldBypassBearerAuth("GET", "/.well-known/oauth-protected-resource")).toBe(true);
+    expect(shouldBypassBearerAuth("GET", "/.well-known/oauth-protected-resource/mcp/agents")).toBe(
+      true,
+    );
     // Everything else stays behind the daemon password.
     expect(shouldBypassBearerAuth("GET", "/api/status")).toBe(false);
     expect(shouldBypassBearerAuth("POST", "/api/files/upload")).toBe(false);
@@ -117,6 +121,37 @@ describe("agent MCP request authorizer", () => {
         password: CORRECT_PASSWORD_HASH,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: "Bearer wrong-token",
+      }),
+    ).toBe(false);
+  });
+
+  test("accepts a valid external OAuth bearer", async () => {
+    expect(
+      await isAgentMcpRequestAuthorized({
+        password: undefined,
+        capabilityToken: CAPABILITY_TOKEN,
+        authorizationHeader: "Bearer oauth-token",
+        externalBearerValidator: async (token) => token === "oauth-token",
+      }),
+    ).toBe(true);
+  });
+
+  test("fails closed when external OAuth is configured", async () => {
+    const validator = async () => false;
+    expect(
+      await isAgentMcpRequestAuthorized({
+        password: undefined,
+        capabilityToken: CAPABILITY_TOKEN,
+        authorizationHeader: undefined,
+        externalBearerValidator: validator,
+      }),
+    ).toBe(false);
+    expect(
+      await isAgentMcpRequestAuthorized({
+        password: undefined,
+        capabilityToken: CAPABILITY_TOKEN,
+        authorizationHeader: "Bearer invalid-oauth",
+        externalBearerValidator: validator,
       }),
     ).toBe(false);
   });

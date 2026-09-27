@@ -395,6 +395,69 @@ describe("agent MCP end-to-end (offline)", () => {
     }
   }, 30_000);
 
+  test("OAuth mode publishes PRM, rejects anonymous remote MCP, and preserves capability auth", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-oauth-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-oauth-"));
+    const port = await getAvailablePort();
+    const resource = "https://tunnel.example.test/paseo";
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+        mcpOAuth: {
+          issuer: "http://127.0.0.1:65534/",
+          resource,
+          scopes: ["paseo.mcp"],
+        },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    try {
+      const prm = await fetch(
+        `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents`,
+      );
+      expect(prm.status).toBe(200);
+      expect(await prm.json()).toEqual({
+        resource,
+        authorization_servers: ["http://127.0.0.1:65534/"],
+        bearer_methods_supported: ["header"],
+        scopes_supported: ["paseo.mcp"],
+      });
+
+      const unauthorized = await fetch(mcpUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(unauthorized.status).toBe(401);
+      expect(unauthorized.headers.get("www-authenticate")).toContain("paseo.mcp");
+
+      const capabilityToken = daemon.agentManager.getMcpAuthToken();
+      const client = await createMcpClient(mcpUrl, capabilityToken!);
+      try {
+        const result = await client.callTool({ name: "list_agents", args: {} });
+        expect(result.isError).not.toBe(true);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("create_agent auto-injects paseo MCP by default and can be disabled", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));

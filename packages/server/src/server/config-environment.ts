@@ -2,6 +2,9 @@
 // controls remain available to managed launches and their agent processes.
 export const DAEMON_SETTING_ENV_KEYS = [
   "MCP_DEBUG",
+  "PASEO_MCP_OAUTH_ISSUER",
+  "PASEO_MCP_OAUTH_RESOURCE",
+  "PASEO_MCP_OAUTH_SCOPES",
   "OPENAI_STT_BASE_URL",
   "OPENAI_TTS_BASE_URL",
   "PASEO_ALLOWED_HOSTS",

@@ -90,6 +90,42 @@ export function formatListenTarget(listenTarget: ListenTarget | null): string | 
   return listenTarget.path;
 }
 
+interface McpOAuthRuntime {
+  tokenVerifier?: (token: string) => Promise<boolean>;
+  metadata: ProtectedResourceMetadata | null;
+  applyChallenge: (res: express.Response) => void;
+}
+
+function createMcpOAuthRuntime(config: McpOAuthConfig | undefined): McpOAuthRuntime {
+  if (!config) {
+    return {
+      metadata: null,
+      applyChallenge: () => undefined,
+    };
+  }
+  const challenge = `Bearer scope="${config.scopes.join(" ")}"`;
+  return {
+    tokenVerifier: createMcpOAuthTokenVerifier(config),
+    metadata: createProtectedResourceMetadata(config),
+    applyChallenge: (res) => {
+      res.setHeader("WWW-Authenticate", challenge);
+    },
+  };
+}
+
+function createMcpProtectedResourceMetadataHandler(
+  metadata: ProtectedResourceMetadata | null,
+): express.RequestHandler {
+  if (!metadata) {
+    return (_req, res) => {
+      res.status(404).json({ error: "MCP OAuth is not configured" });
+    };
+  }
+  return (_req, res) => {
+    res.json(metadata);
+  };
+}
+
 export async function fanOutReconciledWorkspaceUpdates(input: {
   sessions: Iterable<{
     syncWorkspaceGitObserversForExternalWorkspaceIds(workspaceIds: Iterable<string>): Promise<void>;
@@ -212,6 +248,12 @@ import {
   isAgentMcpRequestAuthorized,
   type DaemonAuthConfig,
 } from "./auth.js";
+import {
+  createMcpOAuthTokenVerifier,
+  createProtectedResourceMetadata,
+  type McpOAuthConfig,
+  type ProtectedResourceMetadata,
+} from "./mcp-oauth.js";
 import { createWebUiMiddleware } from "./web-ui.js";
 import { WorkspaceAutoName } from "./workspace-auto-name.js";
 import { createGitMutationService } from "./session/git-mutation/git-mutation-service.js";
@@ -437,6 +479,7 @@ export interface PaseoDaemonConfig {
   };
   appBaseUrl?: string;
   auth?: DaemonAuthConfig;
+  mcpOAuth?: McpOAuthConfig;
   openai?: PaseoOpenAIConfig;
   speech?: PaseoSpeechConfig;
   voiceLlmProvider?: AgentProvider | null;
@@ -731,6 +774,7 @@ export async function createPaseoDaemon(
   // no plaintext available). Mirrors the /api/files/download capability-token
   // pattern.
   const agentMcpAuthToken = randomUUID();
+  const mcpOAuthRuntime = createMcpOAuthRuntime(config.mcpOAuth);
 
   const listenTarget = parseListenString(config.listen);
 
@@ -849,6 +893,12 @@ export async function createPaseoDaemon(
     express.json(),
     createTerminalActivityRouteHandler(terminalManager),
   );
+
+  const handleMcpProtectedResourceMetadata = createMcpProtectedResourceMetadataHandler(
+    mcpOAuthRuntime.metadata,
+  );
+  app.get("/.well-known/oauth-protected-resource", handleMcpProtectedResourceMetadata);
+  app.get("/.well-known/oauth-protected-resource/mcp/agents", handleMcpProtectedResourceMetadata);
 
   // Serve the bundled browser web UI when enabled. Mounted after service-proxy
   // classification and host/CORS handling, but before daemon bearer auth, so
@@ -1582,8 +1632,10 @@ export async function createPaseoDaemon(
           password: config.auth?.password,
           capabilityToken: agentMcpAuthToken,
           authorizationHeader: req.header("authorization"),
+          externalBearerValidator: mcpOAuthRuntime.tokenVerifier,
         }))
       ) {
+        mcpOAuthRuntime.applyChallenge(res);
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
