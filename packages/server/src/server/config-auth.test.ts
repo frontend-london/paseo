@@ -63,6 +63,8 @@ describe("daemon auth config", () => {
       env: {
         PASEO_MCP_OAUTH_ISSUER: "https://tenant.example/",
         PASEO_MCP_OAUTH_RESOURCE: "https://resource.example/paseo",
+        PASEO_MCP_OAUTH_RESOURCE_METADATA_URL:
+          "http://127.0.0.1:6767/.well-known/oauth-protected-resource/mcp/agents",
         PASEO_MCP_OAUTH_SCOPES: "paseo.mcp, paseo.read",
       },
     });
@@ -70,6 +72,7 @@ describe("daemon auth config", () => {
     expect(config.mcpOAuth).toEqual({
       issuer: "https://tenant.example/",
       resource: "https://resource.example/paseo",
+      resourceMetadataUrl: "http://127.0.0.1:6767/.well-known/oauth-protected-resource/mcp/agents",
       scopes: ["paseo.mcp", "paseo.read"],
     });
   });

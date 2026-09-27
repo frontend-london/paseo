@@ -415,6 +415,7 @@ describe("agent MCP end-to-end (offline)", () => {
         mcpOAuth: {
           issuer: "http://127.0.0.1:65534/",
           resource,
+          resourceMetadataUrl: `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents`,
           scopes: ["paseo.mcp"],
         },
       },
@@ -441,7 +442,15 @@ describe("agent MCP end-to-end (offline)", () => {
         body: "{}",
       });
       expect(unauthorized.status).toBe(401);
-      expect(unauthorized.headers.get("www-authenticate")).toContain("paseo.mcp");
+      expect(unauthorized.headers.get("www-authenticate")).toBe(
+        [
+          "Bearer",
+          `resource_metadata="http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents"`,
+          'error="invalid_token"',
+          'error_description="Authentication required"',
+          'scope="paseo.mcp"',
+        ].join(", "),
+      );
 
       const capabilityToken = daemon.agentManager.getMcpAuthToken();
       const client = await createMcpClient(mcpUrl, capabilityToken!);

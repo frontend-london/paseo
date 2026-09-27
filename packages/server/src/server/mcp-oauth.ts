@@ -3,6 +3,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 export interface McpOAuthConfig {
   issuer: string;
   resource: string;
+  resourceMetadataUrl: string;
   scopes: string[];
 }
 
@@ -13,29 +14,49 @@ export interface ProtectedResourceMetadata {
   scopes_supported: string[];
 }
 
-function normalizeIssuer(value: string): string {
+function normalizeHttpUrl(
+  value: string,
+  fieldName: string,
+  options: { allowLoopbackHttp: boolean; trailingSlash: boolean },
+): string {
   const url = new URL(value);
   const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
-  if (url.protocol !== "https:" && !(loopback && url.protocol === "http:")) {
-    throw new Error("PASEO_MCP_OAUTH_ISSUER must use HTTPS (except loopback tests)");
+  const httpAllowed = options.allowLoopbackHttp && loopback && url.protocol === "http:";
+  if (url.protocol !== "https:" && !httpAllowed) {
+    throw new Error(
+      `${fieldName} must use HTTPS${options.allowLoopbackHttp ? " (except loopback HTTP)" : ""}`,
+    );
   }
   url.search = "";
   url.hash = "";
-  if (!url.pathname.endsWith("/")) url.pathname += "/";
+  if (options.trailingSlash && !url.pathname.endsWith("/")) url.pathname += "/";
   return url.toString();
 }
 
 export function normalizeMcpOAuthConfig(config: McpOAuthConfig): McpOAuthConfig {
-  const issuer = normalizeIssuer(config.issuer.trim());
-  const resource = config.resource.trim();
-  if (!resource) throw new Error("PASEO_MCP_OAUTH_RESOURCE must not be empty");
+  const issuer = normalizeHttpUrl(config.issuer.trim(), "PASEO_MCP_OAUTH_ISSUER", {
+    allowLoopbackHttp: true,
+    trailingSlash: true,
+  });
+  const resource = normalizeHttpUrl(config.resource.trim(), "PASEO_MCP_OAUTH_RESOURCE", {
+    allowLoopbackHttp: false,
+    trailingSlash: false,
+  });
+  const resourceMetadataUrl = normalizeHttpUrl(
+    config.resourceMetadataUrl.trim(),
+    "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL",
+    { allowLoopbackHttp: true, trailingSlash: false },
+  );
 
   const scopes = Array.from(new Set(config.scopes.map((scope) => scope.trim()).filter(Boolean)));
   if (scopes.length === 0) {
     throw new Error("PASEO_MCP_OAUTH_SCOPES must contain at least one scope");
   }
+  if (scopes.some((scope) => !/^[A-Za-z0-9._:-]+$/u.test(scope))) {
+    throw new Error("PASEO_MCP_OAUTH_SCOPES contains an invalid scope token");
+  }
 
-  return { issuer, resource, scopes };
+  return { issuer, resource, resourceMetadataUrl, scopes };
 }
 
 export function createProtectedResourceMetadata(config: McpOAuthConfig): ProtectedResourceMetadata {

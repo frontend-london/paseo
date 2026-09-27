@@ -103,7 +103,13 @@ function createMcpOAuthRuntime(config: McpOAuthConfig | undefined): McpOAuthRunt
       applyChallenge: () => undefined,
     };
   }
-  const challenge = `Bearer scope="${config.scopes.join(" ")}"`;
+  const challenge = [
+    "Bearer",
+    `resource_metadata="${config.resourceMetadataUrl}"`,
+    'error="invalid_token"',
+    'error_description="Authentication required"',
+    `scope="${config.scopes.join(" ")}"`,
+  ].join(", ");
   return {
     tokenVerifier: createMcpOAuthTokenVerifier(config),
     metadata: createProtectedResourceMetadata(config),

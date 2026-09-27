@@ -49,7 +49,12 @@ describe("MCP OAuth verifier", () => {
   });
 
   function config(): McpOAuthConfig {
-    return { issuer, resource, scopes };
+    return {
+      issuer,
+      resource,
+      resourceMetadataUrl: "http://127.0.0.1:6767/.well-known/oauth-protected-resource/mcp/agents",
+      scopes,
+    };
   }
 
   async function token(overrides?: {
