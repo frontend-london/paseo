@@ -25,6 +25,7 @@ import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
+import { normalizeMcpOAuthConfig, type McpOAuthConfig } from "./mcp-oauth.js";
 
 export {
   loadPersistedConfig,
@@ -494,6 +495,26 @@ function resolveAuthConfig(
     : undefined;
 }
 
+function resolveMcpOAuthConfig(env: NodeJS.ProcessEnv): McpOAuthConfig | undefined {
+  const issuer = env.PASEO_MCP_OAUTH_ISSUER?.trim();
+  const resource = env.PASEO_MCP_OAUTH_RESOURCE?.trim();
+  const jwksUrl = env.PASEO_MCP_OAUTH_JWKS_URL?.trim();
+  const scopesRaw = env.PASEO_MCP_OAUTH_SCOPES?.trim();
+  const anyConfigured = Boolean(issuer || resource || jwksUrl || scopesRaw);
+  if (!anyConfigured) return undefined;
+  if (!issuer || !resource || !jwksUrl || !scopesRaw) {
+    throw new Error(
+      "PASEO MCP OAuth requires PASEO_MCP_OAUTH_ISSUER, PASEO_MCP_OAUTH_RESOURCE, PASEO_MCP_OAUTH_JWKS_URL, and PASEO_MCP_OAUTH_SCOPES",
+    );
+  }
+  return normalizeMcpOAuthConfig({
+    issuer,
+    resource,
+    jwksUrl,
+    scopes: scopesRaw.split(/[\s,]+/u),
+  });
+}
+
 function resolveWorktreesRoot(
   paseoHome: string,
   persisted: ReturnType<typeof loadPersistedConfig>,
@@ -641,6 +662,7 @@ export function resolveConfigFromPersisted(
     webUi,
     appBaseUrl,
     auth: resolveAuthConfig(env, persisted),
+    mcpOAuth: resolveMcpOAuthConfig(env),
     openai,
     speech,
     voiceLlmProvider: voiceLlm.provider,

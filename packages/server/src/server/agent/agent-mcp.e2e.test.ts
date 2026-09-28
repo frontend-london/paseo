@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { experimental_createMCPClient } from "ai";
+import { extractWWWAuthenticateParams } from "@modelcontextprotocol/sdk/client/auth.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
 
@@ -392,6 +393,90 @@ describe("agent MCP end-to-end (offline)", () => {
       await rm(paseoHome, { recursive: true, force: true });
       await rm(staticDir, { recursive: true, force: true });
       await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("OAuth mode publishes PRM, rejects anonymous remote MCP, and preserves capability auth", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-oauth-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-oauth-"));
+    const port = await getAvailablePort();
+    const resource = "https://tunnel.example.test/paseo?tenant=agt627&mode=strict";
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+        mcpOAuth: {
+          issuer: "http://127.0.0.1:65534/",
+          resource,
+          jwksUrl: "http://127.0.0.1:65534/keys/jwks.json",
+          resourceMetadataUrl:
+            "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict",
+          scopes: ["paseo.mcp"],
+        },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    try {
+      const unauthorized = await fetch(mcpUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(unauthorized.status).toBe(401);
+      expect(unauthorized.headers.get("www-authenticate")).toBe(
+        [
+          "Bearer",
+          [
+            'resource_metadata="https://tunnel.example.test/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict"',
+            'error="invalid_token"',
+            'error_description="Authentication required"',
+            'scope="paseo.mcp"',
+          ].join(", "),
+        ].join(" "),
+      );
+      const challenge = extractWWWAuthenticateParams(unauthorized);
+      expect(challenge.resourceMetadataUrl?.toString()).toBe(
+        "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict",
+      );
+      expect(challenge.scope).toBe("paseo.mcp");
+      expect(challenge.error).toBe("invalid_token");
+
+      const advertisedMetadataUrl = challenge.resourceMetadataUrl;
+      expect(advertisedMetadataUrl).toBeDefined();
+      const prm = await fetch(
+        `http://127.0.0.1:${port}${advertisedMetadataUrl!.pathname}${advertisedMetadataUrl!.search}`,
+      );
+      expect(prm.status).toBe(200);
+      expect(await prm.json()).toEqual({
+        resource,
+        authorization_servers: ["http://127.0.0.1:65534/"],
+        bearer_methods_supported: ["header"],
+        scopes_supported: ["paseo.mcp"],
+      });
+
+      const capabilityToken = daemon.agentManager.getMcpAuthToken();
+      const client = await createMcpClient(mcpUrl, capabilityToken!);
+      try {
+        const result = await client.callTool({ name: "list_agents", args: {} });
+        expect(result.isError).not.toBe(true);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
     }
   }, 30_000);
 
