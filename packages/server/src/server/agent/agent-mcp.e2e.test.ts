@@ -400,7 +400,7 @@ describe("agent MCP end-to-end (offline)", () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-oauth-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-oauth-"));
     const port = await getAvailablePort();
-    const resource = "https://tunnel.example.test/paseo";
+    const resource = "https://tunnel.example.test/paseo?tenant=agt627&mode=strict";
 
     const daemon = await createPaseoDaemon(
       {
@@ -418,7 +418,7 @@ describe("agent MCP end-to-end (offline)", () => {
           resource,
           jwksUrl: "http://127.0.0.1:65534/keys/jwks.json",
           resourceMetadataUrl:
-            "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo",
+            "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict",
           scopes: ["paseo.mcp"],
         },
       },
@@ -449,7 +449,7 @@ describe("agent MCP end-to-end (offline)", () => {
         [
           "Bearer",
           [
-            'resource_metadata="https://tunnel.example.test/.well-known/oauth-protected-resource/paseo"',
+            'resource_metadata="https://tunnel.example.test/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict"',
             'error="invalid_token"',
             'error_description="Authentication required"',
             'scope="paseo.mcp"',
@@ -458,7 +458,7 @@ describe("agent MCP end-to-end (offline)", () => {
       );
       const challenge = extractWWWAuthenticateParams(unauthorized);
       expect(challenge.resourceMetadataUrl?.toString()).toBe(
-        "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo",
+        "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict",
       );
       expect(challenge.scope).toBe("paseo.mcp");
       expect(challenge.error).toBe("invalid_token");

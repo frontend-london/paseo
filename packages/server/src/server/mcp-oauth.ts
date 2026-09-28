@@ -80,7 +80,7 @@ export function normalizeMcpOAuthConfig(config: McpOAuthConfigInput): McpOAuthCo
     const configuredMetadataUrl = normalizeHttpUrl(
       config.resourceMetadataUrl.trim(),
       "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL",
-      { allowLoopbackHttp: false, trailingSlash: false },
+      { allowLoopbackHttp: false, trailingSlash: false, preserveQuery: true },
     );
     if (configuredMetadataUrl !== resourceMetadataUrl) {
       throw new Error(

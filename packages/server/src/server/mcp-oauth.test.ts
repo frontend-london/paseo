@@ -235,11 +235,12 @@ describe("MCP OAuth verifier", () => {
     );
   });
 
-  test("preserves a resource query in the audience and derived RFC 9728 metadata URL", () => {
+  test("preserves a resource query across repeated normalization", () => {
     const resourceWithQuery = `${resource}?tenant=agt627&mode=strict`;
     const normalized = normalizeMcpOAuthConfig(config({ resource: resourceWithQuery }));
-    expect(normalized.resource).toBe(resourceWithQuery);
-    expect(normalized.resourceMetadataUrl).toBe(
+    const renormalized = normalizeMcpOAuthConfig(normalized);
+    expect(renormalized.resource).toBe(resourceWithQuery);
+    expect(renormalized.resourceMetadataUrl).toBe(
       "https://example.test/.well-known/oauth-protected-resource/v1/mcp/tunnel_agt627?tenant=agt627&mode=strict",
     );
   });
