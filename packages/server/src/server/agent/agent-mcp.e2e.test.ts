@@ -428,17 +428,6 @@ describe("agent MCP end-to-end (offline)", () => {
 
     const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
     try {
-      const prm = await fetch(
-        `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents`,
-      );
-      expect(prm.status).toBe(200);
-      expect(await prm.json()).toEqual({
-        resource,
-        authorization_servers: ["http://127.0.0.1:65534/"],
-        bearer_methods_supported: ["header"],
-        scopes_supported: ["paseo.mcp"],
-      });
-
       const unauthorized = await fetch(mcpUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -462,6 +451,19 @@ describe("agent MCP end-to-end (offline)", () => {
       );
       expect(challenge.scope).toBe("paseo.mcp");
       expect(challenge.error).toBe("invalid_token");
+
+      const advertisedMetadataUrl = challenge.resourceMetadataUrl;
+      expect(advertisedMetadataUrl).toBeDefined();
+      const prm = await fetch(
+        `http://127.0.0.1:${port}${advertisedMetadataUrl!.pathname}${advertisedMetadataUrl!.search}`,
+      );
+      expect(prm.status).toBe(200);
+      expect(await prm.json()).toEqual({
+        resource,
+        authorization_servers: ["http://127.0.0.1:65534/"],
+        bearer_methods_supported: ["header"],
+        scopes_supported: ["paseo.mcp"],
+      });
 
       const capabilityToken = daemon.agentManager.getMcpAuthToken();
       const client = await createMcpClient(mcpUrl, capabilityToken!);

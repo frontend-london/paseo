@@ -903,8 +903,14 @@ export async function createPaseoDaemon(
   const handleMcpProtectedResourceMetadata = createMcpProtectedResourceMetadataHandler(
     mcpOAuthRuntime.metadata,
   );
-  app.get("/.well-known/oauth-protected-resource", handleMcpProtectedResourceMetadata);
-  app.get("/.well-known/oauth-protected-resource/mcp/agents", handleMcpProtectedResourceMetadata);
+  const mcpProtectedResourceMetadataPaths = new Set([
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp/agents",
+    ...(config.mcpOAuth ? [new URL(config.mcpOAuth.resourceMetadataUrl).pathname] : []),
+  ]);
+  mcpProtectedResourceMetadataPaths.forEach((metadataPath) => {
+    app.get(metadataPath, handleMcpProtectedResourceMetadata);
+  });
 
   // Serve the bundled browser web UI when enabled. Mounted after service-proxy
   // classification and host/CORS handling, but before daemon bearer auth, so
