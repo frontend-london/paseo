@@ -28,7 +28,11 @@ export interface ProtectedResourceMetadata {
 function normalizeHttpUrl(
   value: string,
   fieldName: string,
-  options: { allowLoopbackHttp: boolean; trailingSlash: boolean },
+  options: {
+    allowLoopbackHttp: boolean;
+    trailingSlash: boolean;
+    preserveQuery?: boolean;
+  },
 ): string {
   const url = new URL(value);
   const hostname = url.hostname.replace(/^\[(.*)\]$/u, "$1");
@@ -39,7 +43,7 @@ function normalizeHttpUrl(
       `${fieldName} must use HTTPS${options.allowLoopbackHttp ? " (except loopback HTTP)" : ""}`,
     );
   }
-  url.search = "";
+  if (!options.preserveQuery) url.search = "";
   url.hash = "";
   if (options.trailingSlash && !url.pathname.endsWith("/")) url.pathname += "/";
   return url.toString();
@@ -60,6 +64,7 @@ export function normalizeMcpOAuthConfig(config: McpOAuthConfigInput): McpOAuthCo
   const resource = normalizeHttpUrl(config.resource.trim(), "PASEO_MCP_OAUTH_RESOURCE", {
     allowLoopbackHttp: false,
     trailingSlash: false,
+    preserveQuery: true,
   });
   const jwksUrl = normalizeHttpUrl(config.jwksUrl.trim(), "PASEO_MCP_OAUTH_JWKS_URL", {
     allowLoopbackHttp: true,
@@ -117,6 +122,36 @@ function tokenScopes(scopeClaim: unknown): Set<string> {
   );
 }
 
+async function readResponseBodyWithLimit(response: Response): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array();
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_JWKS_BYTES) {
+        await reader.cancel("JWKS response exceeds size limit").catch(() => undefined);
+        throw new Error("JWKS response exceeds size limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 async function fetchJwks(
   url: string,
   options: {
@@ -129,13 +164,13 @@ async function fetchJwks(
   const response = await fetch(url, { ...options, redirect: "error" });
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > MAX_JWKS_BYTES) {
+    await response.body?.cancel("JWKS response exceeds size limit").catch(() => undefined);
     throw new Error("JWKS response exceeds size limit");
   }
-  const body = new Uint8Array(await response.arrayBuffer());
-  if (body.byteLength > MAX_JWKS_BYTES) {
-    throw new Error("JWKS response exceeds size limit");
-  }
-  return new Response(body, {
+  const body = await readResponseBodyWithLimit(response);
+  const responseBody = new ArrayBuffer(body.byteLength);
+  new Uint8Array(responseBody).set(body);
+  return new Response(responseBody, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,

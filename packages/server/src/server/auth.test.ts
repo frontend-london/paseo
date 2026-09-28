@@ -136,6 +136,21 @@ describe("agent MCP request authorizer", () => {
     ).toBe(true);
   });
 
+  test("does not invoke the external OAuth validator for an obvious non-JWT bearer", async () => {
+    let calls = 0;
+    const authorized = await isAgentMcpRequestAuthorized({
+      password: undefined,
+      capabilityToken: CAPABILITY_TOKEN,
+      authorizationHeader: "Bearer definitely-not-a-jwt",
+      externalBearerValidator: async () => {
+        calls += 1;
+        return true;
+      },
+    });
+    expect(authorized).toBe(false);
+    expect(calls).toBe(0);
+  });
+
   test("fails closed when external OAuth is configured", async () => {
     const validator = async () => false;
     expect(

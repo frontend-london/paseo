@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
@@ -10,11 +10,49 @@ import {
   type McpOAuthConfigInput,
 } from "./mcp-oauth.js";
 
+interface OversizeJwksState {
+  chunksWritten: number;
+  responseClosed: boolean;
+}
+
+function sendSlowJwks(res: ServerResponse, jwksJson: string): void {
+  const timer = setTimeout(() => {
+    if (res.destroyed) return;
+    res.setHeader("content-type", "application/json");
+    res.end(jwksJson);
+  }, 5_500);
+  res.on("close", () => clearTimeout(timer));
+}
+
+function sendOversizeChunkedJwks(res: ServerResponse, state: OversizeJwksState): void {
+  state.chunksWritten = 0;
+  state.responseClosed = false;
+  res.setHeader("content-type", "application/json");
+  const chunk = Buffer.alloc(64 * 1024, 0x61);
+  const timer = setInterval(() => {
+    if (res.destroyed) {
+      clearInterval(timer);
+      return;
+    }
+    state.chunksWritten += 1;
+    res.write(chunk);
+    if (state.chunksWritten >= 32) {
+      clearInterval(timer);
+      res.end();
+    }
+  }, 2);
+  res.on("close", () => {
+    state.responseClosed = true;
+    clearInterval(timer);
+  });
+}
+
 describe("MCP OAuth verifier", () => {
   let server: Server;
   let issuer: string;
-  let jwksUrl: string;
   let privateKey: CryptoKey;
+  let jwksJson = "";
+  const oversizeState: OversizeJwksState = { chunksWritten: 0, responseClosed: false };
   const resource = "https://example.test/v1/mcp/tunnel_agt627";
   const scopes = ["paseo.mcp"];
 
@@ -23,11 +61,26 @@ describe("MCP OAuth verifier", () => {
     privateKey = pair.privateKey;
     const jwk = await exportJWK(pair.publicKey);
     Object.assign(jwk, { kid: "agt627-test", alg: "RS256", use: "sig" });
+    jwksJson = JSON.stringify({ keys: [jwk] });
 
     server = createServer((req, res) => {
       if (req.url === "/keys/custom-jwks.json") {
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ keys: [jwk] }));
+        res.end(jwksJson);
+        return;
+      }
+      if (req.url === "/keys/redirect-jwks.json") {
+        res.statusCode = 302;
+        res.setHeader("location", "/keys/custom-jwks.json");
+        res.end();
+        return;
+      }
+      if (req.url === "/keys/slow-jwks.json") {
+        sendSlowJwks(res, jwksJson);
+        return;
+      }
+      if (req.url === "/keys/oversize-jwks.json") {
+        sendOversizeChunkedJwks(res, oversizeState);
         return;
       }
       res.statusCode = 404;
@@ -37,7 +90,6 @@ describe("MCP OAuth verifier", () => {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Missing test server port");
     issuer = `http://127.0.0.1:${address.port}/`;
-    jwksUrl = `${issuer}keys/custom-jwks.json`;
   });
 
   afterAll(async () => {
@@ -52,8 +104,13 @@ describe("MCP OAuth verifier", () => {
     });
   });
 
-  function config(): McpOAuthConfigInput {
-    return { issuer, resource, jwksUrl, scopes };
+  function config(overrides?: { resource?: string; jwksPath?: string }): McpOAuthConfigInput {
+    return {
+      issuer,
+      resource: overrides?.resource ?? resource,
+      jwksUrl: new URL(overrides?.jwksPath ?? "keys/custom-jwks.json", issuer).toString(),
+      scopes,
+    };
   }
 
   async function token(overrides?: {
@@ -69,12 +126,8 @@ describe("MCP OAuth verifier", () => {
       .setIssuer(overrides?.issuer ?? issuer)
       .setAudience(overrides?.audience ?? resource)
       .setIssuedAt();
-    if (!overrides?.omitExpiration) {
-      jwt = jwt.setExpirationTime(overrides?.expiresIn ?? "5m");
-    }
-    if (overrides?.notBefore) {
-      jwt = jwt.setNotBefore(overrides.notBefore);
-    }
+    if (!overrides?.omitExpiration) jwt = jwt.setExpirationTime(overrides?.expiresIn ?? "5m");
+    if (overrides?.notBefore) jwt = jwt.setNotBefore(overrides.notBefore);
     return jwt.sign(privateKey);
   }
 
@@ -114,8 +167,26 @@ describe("MCP OAuth verifier", () => {
   });
 
   test("uses an explicitly configured JWKS URL instead of assuming an issuer-relative path", async () => {
-    const verify = createMcpOAuthTokenVerifier(config());
+    const verify = createMcpOAuthTokenVerifier(config({ jwksPath: "keys/custom-jwks.json" }));
     expect(await verify(await token())).toBe(true);
+  });
+
+  test("rejects a JWKS redirect", async () => {
+    const verify = createMcpOAuthTokenVerifier(config({ jwksPath: "keys/redirect-jwks.json" }));
+    expect(await verify(await token())).toBe(false);
+  });
+
+  test("times out a slow JWKS response", async () => {
+    const verify = createMcpOAuthTokenVerifier(config({ jwksPath: "keys/slow-jwks.json" }));
+    expect(await verify(await token())).toBe(false);
+  }, 7_000);
+
+  test("stops reading an oversized chunked JWKS response", async () => {
+    const verify = createMcpOAuthTokenVerifier(config({ jwksPath: "keys/oversize-jwks.json" }));
+    expect(await verify(await token())).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(oversizeState.responseClosed).toBe(true);
+    expect(oversizeState.chunksWritten).toBeLessThan(32);
   });
 
   test("accepts bracketed IPv6 loopback HTTP for local issuer and JWKS tests", () => {
@@ -136,6 +207,17 @@ describe("MCP OAuth verifier", () => {
     });
   });
 
+  test("rejects non-loopback plaintext HTTP for JWKS", () => {
+    expect(() =>
+      normalizeMcpOAuthConfig({
+        issuer: "https://tenant.example/",
+        resource,
+        jwksUrl: "http://tenant.example/keys.json",
+        scopes,
+      }),
+    ).toThrow(/must use HTTPS/u);
+  });
+
   test("rejects a JWKS URL on a different origin than the issuer", () => {
     expect(() =>
       normalizeMcpOAuthConfig({
@@ -150,6 +232,15 @@ describe("MCP OAuth verifier", () => {
   test("derives the RFC 9728 protected-resource metadata URL from the resource identifier", () => {
     expect(deriveProtectedResourceMetadataUrl(resource)).toBe(
       "https://example.test/.well-known/oauth-protected-resource/v1/mcp/tunnel_agt627",
+    );
+  });
+
+  test("preserves a resource query in the audience and derived RFC 9728 metadata URL", () => {
+    const resourceWithQuery = `${resource}?tenant=agt627&mode=strict`;
+    const normalized = normalizeMcpOAuthConfig(config({ resource: resourceWithQuery }));
+    expect(normalized.resource).toBe(resourceWithQuery);
+    expect(normalized.resourceMetadataUrl).toBe(
+      "https://example.test/.well-known/oauth-protected-resource/v1/mcp/tunnel_agt627?tenant=agt627&mode=strict",
     );
   });
 
