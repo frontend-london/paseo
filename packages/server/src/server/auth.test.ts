@@ -130,8 +130,8 @@ describe("agent MCP request authorizer", () => {
       await isAgentMcpRequestAuthorized({
         password: undefined,
         capabilityToken: CAPABILITY_TOKEN,
-        authorizationHeader: "Bearer oauth-token",
-        externalBearerValidator: async (token) => token === "oauth-token",
+        authorizationHeader: "Bearer header.payload.signature",
+        externalBearerValidator: async (token) => token === "header.payload.signature",
       }),
     ).toBe(true);
   });

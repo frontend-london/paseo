@@ -416,7 +416,9 @@ describe("agent MCP end-to-end (offline)", () => {
         mcpOAuth: {
           issuer: "http://127.0.0.1:65534/",
           resource,
-          resourceMetadataUrl: `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents`,
+          jwksUrl: "http://127.0.0.1:65534/keys/jwks.json",
+          resourceMetadataUrl:
+            "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo",
           scopes: ["paseo.mcp"],
         },
       },
@@ -447,7 +449,7 @@ describe("agent MCP end-to-end (offline)", () => {
         [
           "Bearer",
           [
-            `resource_metadata="http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents"`,
+            'resource_metadata="https://tunnel.example.test/.well-known/oauth-protected-resource/paseo"',
             'error="invalid_token"',
             'error_description="Authentication required"',
             'scope="paseo.mcp"',
@@ -456,7 +458,7 @@ describe("agent MCP end-to-end (offline)", () => {
       );
       const challenge = extractWWWAuthenticateParams(unauthorized);
       expect(challenge.resourceMetadataUrl?.toString()).toBe(
-        `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp/agents`,
+        "https://tunnel.example.test/.well-known/oauth-protected-resource/paseo",
       );
       expect(challenge.scope).toBe("paseo.mcp");
       expect(challenge.error).toBe("invalid_token");

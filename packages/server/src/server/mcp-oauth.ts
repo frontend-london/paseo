@@ -1,8 +1,19 @@
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, customFetch, jwtVerify } from "jose";
+
+const MAX_JWKS_BYTES = 1024 * 1024;
+
+export interface McpOAuthConfigInput {
+  issuer: string;
+  resource: string;
+  jwksUrl: string;
+  resourceMetadataUrl?: string;
+  scopes: string[];
+}
 
 export interface McpOAuthConfig {
   issuer: string;
   resource: string;
+  jwksUrl: string;
   resourceMetadataUrl: string;
   scopes: string[];
 }
@@ -34,7 +45,14 @@ function normalizeHttpUrl(
   return url.toString();
 }
 
-export function normalizeMcpOAuthConfig(config: McpOAuthConfig): McpOAuthConfig {
+export function deriveProtectedResourceMetadataUrl(resource: string): string {
+  const url = new URL(resource);
+  const resourcePath = url.pathname === "/" ? "" : url.pathname;
+  url.pathname = `/.well-known/oauth-protected-resource${resourcePath}`;
+  return url.toString();
+}
+
+export function normalizeMcpOAuthConfig(config: McpOAuthConfigInput): McpOAuthConfig {
   const issuer = normalizeHttpUrl(config.issuer.trim(), "PASEO_MCP_OAUTH_ISSUER", {
     allowLoopbackHttp: true,
     trailingSlash: true,
@@ -43,11 +61,28 @@ export function normalizeMcpOAuthConfig(config: McpOAuthConfig): McpOAuthConfig 
     allowLoopbackHttp: false,
     trailingSlash: false,
   });
-  const resourceMetadataUrl = normalizeHttpUrl(
-    config.resourceMetadataUrl.trim(),
-    "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL",
-    { allowLoopbackHttp: true, trailingSlash: false },
-  );
+  const jwksUrl = normalizeHttpUrl(config.jwksUrl.trim(), "PASEO_MCP_OAUTH_JWKS_URL", {
+    allowLoopbackHttp: true,
+    trailingSlash: false,
+  });
+
+  if (new URL(jwksUrl).origin !== new URL(issuer).origin) {
+    throw new Error("PASEO_MCP_OAUTH_JWKS_URL must use the same origin as PASEO_MCP_OAUTH_ISSUER");
+  }
+
+  const resourceMetadataUrl = deriveProtectedResourceMetadataUrl(resource);
+  if (config.resourceMetadataUrl !== undefined) {
+    const configuredMetadataUrl = normalizeHttpUrl(
+      config.resourceMetadataUrl.trim(),
+      "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL",
+      { allowLoopbackHttp: false, trailingSlash: false },
+    );
+    if (configuredMetadataUrl !== resourceMetadataUrl) {
+      throw new Error(
+        "PASEO_MCP_OAUTH_RESOURCE_METADATA_URL must equal the RFC 9728 URL derived from PASEO_MCP_OAUTH_RESOURCE",
+      );
+    }
+  }
 
   const scopes = Array.from(new Set(config.scopes.map((scope) => scope.trim()).filter(Boolean)));
   if (scopes.length === 0) {
@@ -57,10 +92,12 @@ export function normalizeMcpOAuthConfig(config: McpOAuthConfig): McpOAuthConfig 
     throw new Error("PASEO_MCP_OAUTH_SCOPES contains an invalid scope token");
   }
 
-  return { issuer, resource, resourceMetadataUrl, scopes };
+  return { issuer, resource, jwksUrl, resourceMetadataUrl, scopes };
 }
 
-export function createProtectedResourceMetadata(config: McpOAuthConfig): ProtectedResourceMetadata {
+export function createProtectedResourceMetadata(
+  config: McpOAuthConfigInput,
+): ProtectedResourceMetadata {
   const normalized = normalizeMcpOAuthConfig(config);
   return {
     resource: normalized.resource,
@@ -80,18 +117,46 @@ function tokenScopes(scopeClaim: unknown): Set<string> {
   );
 }
 
+async function fetchJwks(
+  url: string,
+  options: {
+    headers: Headers;
+    method: "GET";
+    redirect: "manual";
+    signal: AbortSignal;
+  },
+): Promise<Response> {
+  const response = await fetch(url, { ...options, redirect: "error" });
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_JWKS_BYTES) {
+    throw new Error("JWKS response exceeds size limit");
+  }
+  const body = new Uint8Array(await response.arrayBuffer());
+  if (body.byteLength > MAX_JWKS_BYTES) {
+    throw new Error("JWKS response exceeds size limit");
+  }
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 export function createMcpOAuthTokenVerifier(
-  config: McpOAuthConfig,
+  config: McpOAuthConfigInput,
 ): (token: string) => Promise<boolean> {
   const normalized = normalizeMcpOAuthConfig(config);
-  const jwksUrl = new URL(".well-known/jwks.json", normalized.issuer);
-  const keySet = createRemoteJWKSet(jwksUrl);
+  const keySet = createRemoteJWKSet(new URL(normalized.jwksUrl), {
+    timeoutDuration: 5_000,
+    [customFetch]: fetchJwks,
+  });
   return async (token: string): Promise<boolean> => {
     try {
       const { payload } = await jwtVerify(token, keySet, {
         issuer: normalized.issuer,
         audience: normalized.resource,
         algorithms: ["RS256"],
+        requiredClaims: ["exp"],
       });
       const scopes = tokenScopes(payload.scope);
       return normalized.scopes.every((scope) => scopes.has(scope));

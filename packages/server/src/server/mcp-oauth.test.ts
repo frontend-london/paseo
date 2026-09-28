@@ -5,15 +5,17 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   createMcpOAuthTokenVerifier,
   createProtectedResourceMetadata,
+  deriveProtectedResourceMetadataUrl,
   normalizeMcpOAuthConfig,
-  type McpOAuthConfig,
+  type McpOAuthConfigInput,
 } from "./mcp-oauth.js";
 
 describe("MCP OAuth verifier", () => {
   let server: Server;
   let issuer: string;
+  let jwksUrl: string;
   let privateKey: CryptoKey;
-  const resource = "https://example.test/paseo-worker";
+  const resource = "https://example.test/v1/mcp/tunnel_agt627";
   const scopes = ["paseo.mcp"];
 
   beforeAll(async () => {
@@ -23,7 +25,7 @@ describe("MCP OAuth verifier", () => {
     Object.assign(jwk, { kid: "agt627-test", alg: "RS256", use: "sig" });
 
     server = createServer((req, res) => {
-      if (req.url === "/.well-known/jwks.json") {
+      if (req.url === "/keys/custom-jwks.json") {
         res.setHeader("content-type", "application/json");
         res.end(JSON.stringify({ keys: [jwk] }));
         return;
@@ -35,6 +37,7 @@ describe("MCP OAuth verifier", () => {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Missing test server port");
     issuer = `http://127.0.0.1:${address.port}/`;
+    jwksUrl = `${issuer}keys/custom-jwks.json`;
   });
 
   afterAll(async () => {
@@ -49,13 +52,8 @@ describe("MCP OAuth verifier", () => {
     });
   });
 
-  function config(): McpOAuthConfig {
-    return {
-      issuer,
-      resource,
-      resourceMetadataUrl: "http://127.0.0.1:6767/.well-known/oauth-protected-resource/mcp/agents",
-      scopes,
-    };
+  function config(): McpOAuthConfigInput {
+    return { issuer, resource, jwksUrl, scopes };
   }
 
   async function token(overrides?: {
@@ -63,16 +61,24 @@ describe("MCP OAuth verifier", () => {
     issuer?: string;
     scope?: string;
     expiresIn?: string;
+    omitExpiration?: boolean;
+    notBefore?: string;
   }): Promise<string> {
-    return new SignJWT({ scope: overrides?.scope ?? "paseo.mcp openid" })
+    let jwt = new SignJWT({ scope: overrides?.scope ?? "paseo.mcp openid" })
       .setProtectedHeader({ alg: "RS256", kid: "agt627-test" })
       .setIssuer(overrides?.issuer ?? issuer)
       .setAudience(overrides?.audience ?? resource)
-      .setIssuedAt()
-      .setExpirationTime(overrides?.expiresIn ?? "5m")
-      .sign(privateKey);
+      .setIssuedAt();
+    if (!overrides?.omitExpiration) {
+      jwt = jwt.setExpirationTime(overrides?.expiresIn ?? "5m");
+    }
+    if (overrides?.notBefore) {
+      jwt = jwt.setNotBefore(overrides.notBefore);
+    }
+    return jwt.sign(privateKey);
   }
-  test("accepts a valid RS256 token with matching issuer, audience, and scope", async () => {
+
+  test("accepts a valid RS256 token with matching issuer, audience, scope, and exp", async () => {
     const verify = createMcpOAuthTokenVerifier(config());
     expect(await verify(await token())).toBe(true);
   });
@@ -92,20 +98,71 @@ describe("MCP OAuth verifier", () => {
     expect(await verify(await token({ issuer: "https://wrong.example/" }))).toBe(false);
   });
 
-  test("accepts bracketed IPv6 loopback HTTP for local OAuth metadata", () => {
+  test("rejects a token without exp", async () => {
+    const verify = createMcpOAuthTokenVerifier(config());
+    expect(await verify(await token({ omitExpiration: true }))).toBe(false);
+  });
+
+  test("rejects an expired token", async () => {
+    const verify = createMcpOAuthTokenVerifier(config());
+    expect(await verify(await token({ expiresIn: "-1m" }))).toBe(false);
+  });
+
+  test("rejects a token with a future nbf", async () => {
+    const verify = createMcpOAuthTokenVerifier(config());
+    expect(await verify(await token({ notBefore: "5m" }))).toBe(false);
+  });
+
+  test("uses an explicitly configured JWKS URL instead of assuming an issuer-relative path", async () => {
+    const verify = createMcpOAuthTokenVerifier(config());
+    expect(await verify(await token())).toBe(true);
+  });
+
+  test("accepts bracketed IPv6 loopback HTTP for local issuer and JWKS tests", () => {
     expect(
       normalizeMcpOAuthConfig({
         issuer: "http://[::1]:65534",
         resource,
-        resourceMetadataUrl: "http://[::1]:6767/.well-known/oauth-protected-resource/mcp/agents",
+        jwksUrl: "http://[::1]:65534/keys/custom.json",
         scopes,
       }),
     ).toEqual({
       issuer: "http://[::1]:65534/",
       resource,
-      resourceMetadataUrl: "http://[::1]:6767/.well-known/oauth-protected-resource/mcp/agents",
+      jwksUrl: "http://[::1]:65534/keys/custom.json",
+      resourceMetadataUrl:
+        "https://example.test/.well-known/oauth-protected-resource/v1/mcp/tunnel_agt627",
       scopes,
     });
+  });
+
+  test("rejects a JWKS URL on a different origin than the issuer", () => {
+    expect(() =>
+      normalizeMcpOAuthConfig({
+        issuer: "https://tenant.example/",
+        resource,
+        jwksUrl: "https://keys.example/jwks.json",
+        scopes,
+      }),
+    ).toThrow(/same origin/u);
+  });
+
+  test("derives the RFC 9728 protected-resource metadata URL from the resource identifier", () => {
+    expect(deriveProtectedResourceMetadataUrl(resource)).toBe(
+      "https://example.test/.well-known/oauth-protected-resource/v1/mcp/tunnel_agt627",
+    );
+  });
+
+  test("rejects a configured resource metadata URL that is not authoritative for the resource", () => {
+    expect(() =>
+      normalizeMcpOAuthConfig({
+        issuer: "https://tenant.example/",
+        resource,
+        jwksUrl: "https://tenant.example/keys.json",
+        resourceMetadataUrl: "https://example.test/.well-known/oauth-protected-resource/wrong",
+        scopes,
+      }),
+    ).toThrow(/must equal the RFC 9728 URL/u);
   });
 
   test("publishes RFC protected-resource metadata", () => {

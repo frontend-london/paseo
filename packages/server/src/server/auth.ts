@@ -149,6 +149,12 @@ export function shouldBypassBearerAuth(method: string, path: string): boolean {
  * without a valid credential; otherwise no-password deployments keep the
  * historical open behavior.
  */
+function looksLikeJwtAccessToken(token: string): boolean {
+  if (token.length > 8192) return false;
+  const parts = token.split(".");
+  return parts.length === 3 && parts.every((part) => part.length > 0);
+}
+
 export async function isAgentMcpRequestAuthorized(input: {
   password: string | undefined;
   capabilityToken: string | null;
@@ -166,7 +172,7 @@ export async function isAgentMcpRequestAuthorized(input: {
     }
   }
 
-  if (token !== null && input.externalBearerValidator) {
+  if (token !== null && input.externalBearerValidator && looksLikeJwtAccessToken(token)) {
     if (await input.externalBearerValidator(token)) {
       return true;
     }

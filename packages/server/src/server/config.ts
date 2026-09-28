@@ -498,19 +498,19 @@ function resolveAuthConfig(
 function resolveMcpOAuthConfig(env: NodeJS.ProcessEnv): McpOAuthConfig | undefined {
   const issuer = env.PASEO_MCP_OAUTH_ISSUER?.trim();
   const resource = env.PASEO_MCP_OAUTH_RESOURCE?.trim();
-  const resourceMetadataUrl = env.PASEO_MCP_OAUTH_RESOURCE_METADATA_URL?.trim();
+  const jwksUrl = env.PASEO_MCP_OAUTH_JWKS_URL?.trim();
   const scopesRaw = env.PASEO_MCP_OAUTH_SCOPES?.trim();
-  const anyConfigured = Boolean(issuer || resource || resourceMetadataUrl || scopesRaw);
+  const anyConfigured = Boolean(issuer || resource || jwksUrl || scopesRaw);
   if (!anyConfigured) return undefined;
-  if (!issuer || !resource || !resourceMetadataUrl || !scopesRaw) {
+  if (!issuer || !resource || !jwksUrl || !scopesRaw) {
     throw new Error(
-      "PASEO MCP OAuth requires PASEO_MCP_OAUTH_ISSUER, PASEO_MCP_OAUTH_RESOURCE, PASEO_MCP_OAUTH_RESOURCE_METADATA_URL, and PASEO_MCP_OAUTH_SCOPES",
+      "PASEO MCP OAuth requires PASEO_MCP_OAUTH_ISSUER, PASEO_MCP_OAUTH_RESOURCE, PASEO_MCP_OAUTH_JWKS_URL, and PASEO_MCP_OAUTH_SCOPES",
     );
   }
   return normalizeMcpOAuthConfig({
     issuer,
     resource,
-    resourceMetadataUrl,
+    jwksUrl,
     scopes: scopesRaw.split(/[\s,]+/u),
   });
 }
