@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { loadConfig } from "./config.js";
 import { isBearerTokenValid } from "./auth.js";
+import { createMcpOAuthTokenVerifier } from "./mcp-oauth.js";
 
 const roots: string[] = [];
 const CONFIG_PASSWORD_HASH = "$2b$12$OLxyuuP9uLK30Uzc4wQX0O6liuU/Q1t5P2b0Ebf36mULvpVK3DRZW";
@@ -54,5 +55,57 @@ describe("daemon auth config", () => {
     expect(config.auth?.password).not.toBe(CONFIG_PASSWORD_HASH);
     expect(config.auth?.password).toMatch(/^\$2[aby]\$12\$/);
     expect(isBearerTokenValid({ password: config.auth?.password, token: "from-env" })).toBe(true);
+  });
+
+  test("loads MCP OAuth only from a complete env contract", async () => {
+    const paseoHome = await createPaseoHome({});
+
+    const config = loadConfig(paseoHome, {
+      env: {
+        PASEO_MCP_OAUTH_ISSUER: "https://tenant.example/",
+        PASEO_MCP_OAUTH_RESOURCE: "https://resource.example/paseo",
+        PASEO_MCP_OAUTH_JWKS_URL: "https://tenant.example/keys/jwks.json",
+        PASEO_MCP_OAUTH_SCOPES: "paseo.mcp, paseo.read",
+      },
+    });
+
+    expect(config.mcpOAuth).toEqual({
+      issuer: "https://tenant.example/",
+      resource: "https://resource.example/paseo",
+      jwksUrl: "https://tenant.example/keys/jwks.json",
+      resourceMetadataUrl: "https://resource.example/.well-known/oauth-protected-resource/paseo",
+      scopes: ["paseo.mcp", "paseo.read"],
+    });
+  });
+
+  test("loaded MCP OAuth config with a resource query can initialize the runtime verifier", async () => {
+    const paseoHome = await createPaseoHome({});
+
+    const config = loadConfig(paseoHome, {
+      env: {
+        PASEO_MCP_OAUTH_ISSUER: "https://tenant.example/",
+        PASEO_MCP_OAUTH_RESOURCE: "https://resource.example/paseo?tenant=agt627&mode=strict",
+        PASEO_MCP_OAUTH_JWKS_URL: "https://tenant.example/keys/jwks.json",
+        PASEO_MCP_OAUTH_SCOPES: "paseo.mcp",
+      },
+    });
+
+    expect(config.mcpOAuth?.resource).toBe(
+      "https://resource.example/paseo?tenant=agt627&mode=strict",
+    );
+    expect(config.mcpOAuth?.resourceMetadataUrl).toBe(
+      "https://resource.example/.well-known/oauth-protected-resource/paseo?tenant=agt627&mode=strict",
+    );
+    expect(() => createMcpOAuthTokenVerifier(config.mcpOAuth!)).not.toThrow();
+  });
+
+  test("rejects partial MCP OAuth configuration", async () => {
+    const paseoHome = await createPaseoHome({});
+
+    expect(() =>
+      loadConfig(paseoHome, {
+        env: { PASEO_MCP_OAUTH_ISSUER: "https://tenant.example/" },
+      }),
+    ).toThrow(/PASEO MCP OAuth requires/u);
   });
 });
