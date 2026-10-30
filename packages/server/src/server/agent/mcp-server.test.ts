@@ -1217,6 +1217,30 @@ describe("create_agent MCP tool", () => {
   });
   const ensureWorkspaceForCreate = async () => "workspace-created";
 
+  it("rejects a removed OmniRoute model before creating an agent", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const { manager, stub } = createOpenCodeManager();
+    stub.listModels.mockResolvedValue([
+      { provider: "opencode", id: "omniroute/omni-opus-4.6-1m", label: "Opus 4.6" },
+    ]);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: manager,
+      ensureWorkspaceForCreate,
+      logger,
+    });
+    await expect(
+      registeredTool(server, "create_agent").handler({
+        ...detachedDirectoryWorkspace(existingCwd),
+        provider: "opencode/omniroute/omni-opus-4.8-1m",
+        title: "Independent reviewer",
+        initialPrompt: "Review this exact SHA",
+      }),
+    ).rejects.toThrow("Unknown OmniRoute model 'omniroute/omni-opus-4.8-1m'");
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+  });
+
   it("requires a concise title no longer than 60 characters", async () => {
     const { agentManager, agentStorage } = createTestDeps();
     const server = await createAgentMcpServer({
