@@ -262,5 +262,5 @@ export function recordMessageIngressReceipt(
   proof: Proof | null,
   outcome: string,
 ): void {
-  if (proof) audit(request, proof, "receipt", outcome);
+  if (proof || outcome === "trusted_system_allow") audit(request, proof, "receipt", outcome);
 }

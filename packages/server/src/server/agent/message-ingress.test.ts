@@ -1,10 +1,14 @@
 import { generateKeyPair, exportSPKI, SignJWT } from "jose";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 
-import { authorizeMessageIngress, type IngressSnapshot } from "./message-ingress.js";
+import {
+  authorizeMessageIngress,
+  recordMessageIngressReceipt,
+  type IngressSnapshot,
+} from "./message-ingress.js";
 
 const oldEnv = {
   PASEO_HOME: process.env.PASEO_HOME,
@@ -97,4 +101,34 @@ it("AGT-880 verifies source and target binding, rejects cross-ticket, wrong host
     ),
   ).rejects.toThrow(/source_identity_mismatch/);
   await expect(authorizeMessageIngress(req(""))).rejects.toThrow(/source_authorization_missing/);
+});
+
+it("AGT-880 persists trusted-system grant exceptions into the ingress audit", () => {
+  const root = mkdtempSync(join(tmpdir(), "agt-880-system-audit-"));
+  roots.push(root);
+  process.env.PASEO_HOME = root;
+  recordMessageIngressReceipt(
+    {
+      target: {
+        id: "isolated-session",
+        labels: { ticket: "AGT-101" },
+        cwd: "/test/session",
+        workspaceId: "ws",
+      },
+      getSource: () => null,
+      channel: "permission_followup",
+      nativeMessageId: "system-1",
+      consume: true,
+    },
+    null,
+    "trusted_system_allow",
+  );
+  const row = JSON.parse(readFileSync(join(root, "message-ingress", "audit.jsonl"), "utf8").trim());
+  expect(row).toMatchObject({
+    channel: "permission_followup",
+    decision: "receipt",
+    reason: "trusted_system_allow",
+    native_session_id: "isolated-session",
+    native_message_id: "system-1",
+  });
 });
