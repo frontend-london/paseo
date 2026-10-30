@@ -1,5 +1,8 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   AgentSideConnection,
@@ -3686,6 +3689,34 @@ describe("ACPAgentSession close() tree-kill", () => {
       `Unknown terminal '${terminalId}'`,
     );
   });
+});
+
+describe("AGT-886 ACP spawn error resilience", () => {
+  for (const action of ["new", "resume"] as const) {
+    test.each([action])(
+      "invalid session cwd on %s returns ENOENT without crashing worker",
+      async (kind) => {
+        // The executable exists; an absent cwd alone causes Node spawn ENOENT.
+        const cwd = join(tmpdir(), `paseo-agt886-missing-${randomUUID()}`);
+        const session = new ACPAgentSession(
+          { provider: "cursor", cwd },
+          {
+            provider: "cursor",
+            logger: createTestLogger(),
+            defaultCommand: [process.execPath, "-e", "process.exit(0)"],
+            defaultModes: [],
+            capabilities: { supportsStreaming: true, supportsSessionPersistence: true },
+            ...(kind === "resume"
+              ? { handle: { provider: "cursor", sessionId: "prior-session" } }
+              : {}),
+          },
+        );
+        await expect(
+          kind === "new" ? session.initializeNewSession() : session.initializeResumedSession(),
+        ).rejects.toThrow(/ENOENT/);
+      },
+    );
+  }
 });
 
 describe("ACPAgentSession initialization cleanup", () => {
