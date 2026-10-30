@@ -2831,6 +2831,19 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }),
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // Node emits an asynchronous "error" (not a normal "exit") when a
+    // previously valid session cwd disappears, even if the binary exists.
+    // Without a listener this becomes an uncaught daemon-level exception.
+    // Preserve the actual spawn error for the initialization gate instead.
+    const spawnFailure = new Promise<never>((_, reject) => {
+      child.once("error", (error: Error) => {
+        this.logger.warn(
+          { err: error, provider: this.provider, cwd: this.config.cwd },
+          "ACP provider spawn failed",
+        );
+        reject(error);
+      });
+    });
     assertChildWithPipes(child);
 
     const stderrChunks: string[] = [];
@@ -2876,7 +2889,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     let initialize: InitializeResponse;
     try {
-      initialize = await this.initializeConnection(connection, spawnAbort.signal);
+      initialize = await this.initializeConnection(connection, spawnAbort.signal, spawnFailure);
       await recordPromise;
       if (spawnAbort.signal.aborted || this.closed) {
         // close() raced the successful initialize; tear down instead of
@@ -2904,6 +2917,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private async initializeConnection(
     connection: ClientSideConnection,
     signal: AbortSignal,
+    spawnFailure: Promise<never>,
   ): Promise<InitializeResponse> {
     let timeout: ReturnType<typeof setTimeout> | null = null;
     let onAbort: (() => void) | null = null;
@@ -2935,6 +2949,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
             onAbort = () => reject(new Error(`${this.provider} session is closed`));
             signal.addEventListener("abort", onAbort, { once: true });
           }),
+          spawnFailure,
           connection.closed.then(() => {
             throw new Error(
               `${this.provider} ACP agent process exited before initialize completed`,
