@@ -33,6 +33,7 @@ import {
   type ArchiveDependencies,
 } from "../../workspace-archive-service.js";
 import { createAgentCommand, type CreateAgentFromMcpInput } from "../create-agent/create.js";
+import { preflightOmniRouteModel } from "./model-preflight.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "../../voice-types.js";
 import type { FirstAgentContext } from "../../messages.js";
 import { everyMsToFiveFieldCron } from "@getpaseo/protocol/schedule/cadence";
@@ -1455,7 +1456,14 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         requestedBackground = resolvedArgs.parsedArgs.background;
         notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
       }
-      const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
+      const requested = resolveRequiredProviderModel(parsedArgs.provider);
+      const selectedProvider = requested.provider;
+      await preflightOmniRouteModel({
+        provider: selectedProvider,
+        model: requested.model,
+        cwd: resolvedArgs.cwd,
+        snapshotManager: providerSnapshotManager,
+      });
       const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
       const {
         snapshot,
