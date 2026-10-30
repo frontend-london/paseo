@@ -8144,6 +8144,8 @@ export class Session {
           messageId: msg.messageId,
           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
           clearPendingPermissions: true,
+          ingressAuthorization: msg.ingressAuthorization,
+          ingressChannel: "session",
           logger: this.sessionLogger,
         });
         if (result.disposition === "turn_started") {
