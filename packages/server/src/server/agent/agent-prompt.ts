@@ -5,7 +5,7 @@ import type {
   AgentPromptInput,
   AgentRunOptions,
 } from "./agent-sdk-types.js";
-import type { AgentManager, ManagedAgent } from "./agent-manager.js";
+import type { AgentManager, ManagedAgent, AgentDispatchOptions } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
@@ -53,6 +53,19 @@ export interface StartAgentRunOptions {
 
 export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
 
+function guardedRunOptions(
+  manager: AgentRunController,
+  agentId: string,
+  options: AgentRunOptions | undefined,
+  expectedTarget?: Binding,
+): AgentDispatchOptions | undefined {
+  if (!expectedTarget) return options;
+  return {
+    ...options,
+    beforeDispatch: () => checkSnapshot(expectedTarget, manager.getAgent(agentId)),
+  };
+}
+
 async function steerOrReplaceActiveRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -70,9 +83,10 @@ async function steerOrReplaceActiveRun(
   if (options?.activeTurnBehavior !== "steer") {
     return null;
   }
+  const runOptions = guardedRunOptions(agentManager, agentId, options.runOptions, expectedTarget);
   const steerOptions = options.clearPendingPermissions
-    ? { ...options.runOptions, clearPendingPermissions: true }
-    : options.runOptions;
+    ? { ...runOptions, clearPendingPermissions: true }
+    : runOptions;
   if (expectedTarget) checkSnapshot(expectedTarget, agentManager.getAgent(agentId));
   const result = await agentManager.steerOrReplaceActiveTurn(agentId, prompt, steerOptions);
   if (result.status === "steered") {
@@ -96,9 +110,10 @@ async function startOrReplaceRun(
 }> {
   const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
   if (expectedTarget) checkSnapshot(expectedTarget, agentManager.getAgent(agentId));
+  const runOptions = guardedRunOptions(agentManager, agentId, options?.runOptions, expectedTarget);
   const iterator = replaced
-    ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
-    : agentManager.streamAgent(agentId, prompt, options?.runOptions);
+    ? await agentManager.replaceAgentRun(agentId, prompt, runOptions)
+    : agentManager.streamAgent(agentId, prompt, runOptions);
   return { iterator, replaced };
 }
 

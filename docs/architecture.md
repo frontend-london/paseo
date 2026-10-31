@@ -89,6 +89,58 @@ not retain non-Git directories.
 | `server/relay-transport.ts`     | Outbound relay connection with E2E encryption                                  |
 | `server/schedule/`              | Cron-based scheduled agents                                                    |
 
+#### Wiadomości między daemonami Agents
+
+Narzędzie lokalnego daemona `send_peer_message` przekazuje tekst i podpisany grant przez
+istniejący `DaemonClient` oraz relay Paseo z E2EE. SSH i CLI nie należą do tej ścieżki.
+Nadawca i odbiorca muszą używać bramki ingress; brak konfiguracji kończy się odmową.
+
+Konfiguracja operatora jest poza repozytorium. Ustaw `AGENTS_INGRESS_HOST`,
+`AGENTS_INGRESS_TRUST_FILE` (klucze emitentów grantów) i `AGENTS_PEERS_FILE`.
+Plik peerów ma postać:
+
+```json
+{
+  "local": {
+    "host": "agents_worker",
+    "daemonId": "unikalny-identyfikator-instancji",
+    "keyId": "worker-signing-key",
+    "issuer": "worker-daemon",
+    "privateKey": "PKCS8 PEM Ed25519"
+  },
+  "peers": {
+    "orange_pi": {
+      "host": "orange_pi",
+      "daemonId": "unikalny-identyfikator-celu",
+      "keyId": "orange-signing-key",
+      "issuer": "orange-daemon",
+      "publicKey": "SPKI PEM Ed25519",
+      "url": "wss://relay.paseo.sh/v2/ws?serverId=ID&role=client",
+      "daemonPublicKeyB64": "klucz-pairing-Paseo"
+    }
+  }
+}
+```
+
+Na odbiorcy wpis źródła musi zawierać jego publiczny klucz podpisujący i tożsamość.
+Klucz prywatny jest potrzebny tylko do wysyłania. Pliki i pairing capability chroń
+uprawnieniami użytkownika daemona; testowe instancje mają własne klucze i `PASEO_HOME`.
+
+Grant zachowuje siedem pól `source`/`target` z ACP. Dla dostawy peer wymaga dodatkowo
+podpisanych claims `source_provider`, `target_provider` i `message_sha256` (SHA-256
+dokładnego tekstu UTF-8, bez otaczających białych znaków). TTL grantu nie przekracza
+300 s. Podpis daemona źródłowego wiąże grant i tekst z odbiorcą na 30 s; odbiorca
+sprawdza obydwa podpisy oraz świeżą sesję przed uruchomieniem providera.
+
+Wysyłanie jest at-most-once dla `jti`. Po timeout wynik jest nieznany: sprawdź audyt,
+a ewentualne ponowienie wykonaj z tym samym grantem i treścią. Jeśli pierwsza próba
+dotarła, ponowienie otrzyma DENY z powodu zajętego `jti`; nie nadaje się nowego ID,
+aby ominąć ten wynik. Nie ma automatycznego ponowienia przez inny transport.
+
+Źródło zapisuje `message.peer.egress.*` z PID daemona, trasą i hashami.
+Odbiorca zapisuje `message-ingress/audit.jsonl`, kanał `daemon_peer`, decyzję
+i receipt. Logi nie zawierają grantu ani prywatnych kluczy.
+
 ### `packages/protocol` — Wire schemas and shared protocol types
 
 The source of truth for WebSocket messages, binary frame codecs, endpoint parsing,

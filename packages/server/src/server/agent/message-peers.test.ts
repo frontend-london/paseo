@@ -7,7 +7,12 @@ import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { AgentManager } from "./agent-manager.js";
 import { startAgentRun } from "./agent-prompt.js";
 import pino from "pino";
-import { authorizeMessageIngress, type Binding, type IngressSnapshot } from "./message-ingress.js";
+import {
+  authorizeMessageIngress,
+  checkSnapshot,
+  type Binding,
+  type IngressSnapshot,
+} from "./message-ingress.js";
 import { messageDigest, sendPeerMessage } from "./message-peers.js";
 
 const env = { ...process.env };
@@ -295,3 +300,69 @@ it.each(["ticket", "provider-session"] as const)(
     expect(outOfBand).not.toHaveBeenCalled();
   },
 );
+
+it("REV-003 blokuje retarget podczas anulowania aktywnego turnu", async () => {
+  const { authorization } = await envelope();
+  const logger = pino({ level: "silent" });
+  const manager = new AgentManager({ clients: {}, logger });
+  const startTurn = vi.fn();
+  const live = {
+    ...snapshot(to),
+    session: { startTurn },
+    lifecycle: "running",
+    updatedAt: new Date(),
+    activeForegroundTurnId: "old-turn",
+  };
+  Reflect.set(manager, "getAgent", () => ({ ...live }));
+  Reflect.set(manager, "requireAgent", () => live);
+  Reflect.set(manager, "requireSessionAgent", () => live);
+  Reflect.set(manager, "emitState", () => {});
+  Reflect.set(manager, "tryRunOutOfBand", () => false);
+  Reflect.set(manager, "hasInFlightRun", () => true);
+  let entered!: () => void;
+  let release!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const releasePromise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  Reflect.set(manager, "cancelAgentRun", async () => {
+    entered();
+    await releasePromise;
+    return { status: "settled" };
+  });
+  const pending = startAgentRun(manager, to.native_session_id, text, logger, {
+    ingressAuthorization: authorization,
+    replaceRunning: true,
+  });
+  await enteredPromise;
+  live.labels = { ticket: "AGT-OTHER" };
+  release();
+  await expect(pending).rejects.toThrow(/session_binding_mismatch/);
+  expect(startTurn).not.toHaveBeenCalled();
+});
+
+it("guard blokuje zmianę celu po utworzeniu iteratora, bez zapisu historii błędu", async () => {
+  const logger = pino({ level: "silent" });
+  const manager = new AgentManager({ clients: {}, logger });
+  const startTurn = vi.fn();
+  const live = {
+    ...snapshot(to),
+    session: { startTurn },
+    lifecycle: "idle",
+    updatedAt: new Date(),
+    activeForegroundTurnId: null,
+  };
+  Reflect.set(manager, "getAgent", () => ({ ...live }));
+  Reflect.set(manager, "requireSessionAgent", () => live);
+  const emit = vi.fn();
+  Reflect.set(manager, "dispatchStream", emit);
+  const iterator = manager.streamAgent(to.native_session_id, text, {
+    beforeDispatch: () => checkSnapshot(to, manager.getAgent(to.native_session_id)),
+  });
+  live.labels = { ticket: "AGT-OTHER" };
+  await expect(iterator.next()).rejects.toThrow(/session_binding_mismatch/);
+  expect(startTurn).not.toHaveBeenCalled();
+  expect(emit).not.toHaveBeenCalled();
+});
