@@ -93,7 +93,6 @@ if (mode === "prepare") {
     workspace_id: s.workspaceId,
     workspace: s.cwd,
     provider_session_id: s.persistence?.sessionId ?? s.runtimeInfo?.sessionId,
-    provider: s.provider,
   });
   const source = { ...binding(from), ...input.sourceOverride };
   const target = { ...binding(to), ...input.targetOverride };
@@ -101,6 +100,8 @@ if (mode === "prepare") {
   const authorization = await new SignJWT({
     source,
     target,
+    source_provider: from.provider,
+    target_provider: to.provider,
     purpose: "message",
     message_sha256: digest(input.text),
   })
@@ -142,8 +143,8 @@ if (mode === "prepare") {
           initialPrompt: "Reply exactly: AGT880_FIXTURE_READY. Do not use tools.",
         });
         await client.waitForFinish(agent.id, 12e4);
-        const listing = await client.fetchAgents();
-        const updated = listing.entries.find((entry) => entry.id === agent.id);
+        const updated = (await client.fetchAgentTimeline(agent.id, { direction: "tail", limit: 0 }))
+          .agent;
         sessions[name] = { ...agent, ...updated, host };
       }
       save("sessions.json", sessions);
@@ -158,8 +159,7 @@ if (mode === "prepare") {
           limit: 0,
           projection: "canonical",
         });
-        const listing = await client.fetchAgents();
-        output[name] = { snapshot: listing.entries.find((entry) => entry.id === id), timeline };
+        output[name] = { snapshot: timeline.agent, timeline };
       }
       save(process.argv[3] ?? "snapshot.json", output);
       console.log(JSON.stringify(output));

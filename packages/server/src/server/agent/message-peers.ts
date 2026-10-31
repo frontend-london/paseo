@@ -131,21 +131,7 @@ async function deliverPeerMessage(input: {
     new URL(peer.url).protocol !== "wss:"
   )
     throw new PeerMessageError("encrypted_peer_route_required");
-  const attestation = await new SignJWT({
-    source_host: config.local.host,
-    target_host: peer.host,
-    target_daemon: peer.daemonId,
-    grant_sha256: messageDigest(input.authorization),
-    message_sha256: proof.message_sha256,
-  })
-    .setProtectedHeader({ alg: "EdDSA", kid: config.local.keyId })
-    .setIssuer(config.local.issuer)
-    .setAudience(PEER_AUDIENCE)
-    .setSubject(config.local.daemonId)
-    .setIssuedAt()
-    .setExpirationTime("30s")
-    .setJti(proof.request_id)
-    .sign(await importPKCS8(config.local.privateKey, "EdDSA"));
+  const signingKey = await importPKCS8(config.local.privateKey, "EdDSA");
   const fields = {
     requestId: proof.request_id,
     sourceHost: config.local.host,
@@ -178,6 +164,25 @@ async function deliverPeerMessage(input: {
         if (expired) throw new PeerMessageError("delivery_timeout_outcome_unknown");
         await client.fetchAgents();
         if (expired) throw new PeerMessageError("delivery_timeout_outcome_unknown");
+        await verifyIngressGrant(input.authorization);
+        checkSnapshot(proof.source, input.getSource(proof.source.native_session_id));
+        const attestation = await new SignJWT({
+          source_host: config.local.host,
+          target_host: peer.host,
+          target_daemon: peer.daemonId,
+          grant_sha256: messageDigest(input.authorization),
+          message_sha256: proof.message_sha256,
+        })
+          .setProtectedHeader({ alg: "EdDSA", kid: config.local.keyId })
+          .setIssuer(config.local.issuer)
+          .setAudience(PEER_AUDIENCE)
+          .setSubject(config.local.daemonId)
+          .setIssuedAt()
+          .setExpirationTime("30s")
+          .setJti(proof.request_id)
+          .sign(signingKey);
+        if (expired) throw new PeerMessageError("delivery_timeout_outcome_unknown");
+        checkSnapshot(proof.source, input.getSource(proof.source.native_session_id));
         await client.sendMessage(proof.target.native_session_id, input.text, {
           ingressAuthorization: `${PREFIX}${input.authorization}:${attestation}`,
         });

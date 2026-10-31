@@ -16,6 +16,8 @@ import {
   recordMessageIngressReceipt,
   type IngressSnapshot,
   type IngressRequest,
+  type Binding,
+  checkSnapshot,
 } from "./message-ingress.js";
 import { randomUUID } from "node:crypto";
 
@@ -56,6 +58,7 @@ async function steerOrReplaceActiveRun(
   agentId: string,
   prompt: AgentPromptInput,
   options: StartAgentRunOptions | undefined,
+  expectedTarget?: Binding,
 ): Promise<
   | { disposition: "steered" }
   | {
@@ -70,6 +73,7 @@ async function steerOrReplaceActiveRun(
   const steerOptions = options.clearPendingPermissions
     ? { ...options.runOptions, clearPendingPermissions: true }
     : options.runOptions;
+  if (expectedTarget) checkSnapshot(expectedTarget, agentManager.getAgent(agentId));
   const result = await agentManager.steerOrReplaceActiveTurn(agentId, prompt, steerOptions);
   if (result.status === "steered") {
     return { disposition: "steered" };
@@ -85,11 +89,13 @@ async function startOrReplaceRun(
   agentId: string,
   prompt: AgentPromptInput,
   options: StartAgentRunOptions | undefined,
+  expectedTarget?: Binding,
 ): Promise<{
   iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
   replaced: boolean;
 }> {
   const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+  if (expectedTarget) checkSnapshot(expectedTarget, agentManager.getAgent(agentId));
   const iterator = replaced
     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
     : agentManager.streamAgent(agentId, prompt, options?.runOptions);
@@ -116,6 +122,7 @@ function agentRunIngressRequest(
     authorization: options?.ingressAuthorization,
     text: typeof prompt === "string" ? prompt : undefined,
     target: (snapshot ?? { id: agentId }) as IngressSnapshot,
+    getTarget: () => agentManager.getAgent(agentId),
     getSource: (id: string) => (agentManager.getAgent(id) as IngressSnapshot | null) ?? null,
     callerAgentId: options?.callerAgentId,
     channel: options?.ingressChannel ?? (options?.trustedSystem ? "system" : "unspecified"),
@@ -124,13 +131,13 @@ function agentRunIngressRequest(
   };
 }
 
-export async function startAgentRun(
+function traceStartAgentRun(
   agentManager: AgentRunController,
   agentId: string,
   prompt: AgentPromptInput,
   logger: Logger,
   options?: StartAgentRunOptions,
-): Promise<{ disposition: PromptDispatchDisposition }> {
+): void {
   const snapshot = agentManager.getAgent(agentId);
   logger.trace(
     {
@@ -144,6 +151,16 @@ export async function startAgentRun(
     },
     "agent.session.start_stream.request",
   );
+}
+
+export async function startAgentRun(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  logger: Logger,
+  options?: StartAgentRunOptions,
+): Promise<{ disposition: PromptDispatchDisposition }> {
+  traceStartAgentRun(agentManager, agentId, prompt, logger, options);
   const ingressRequest = agentRunIngressRequest(agentManager, agentId, prompt, options);
   let ingressProof = null;
   if (options?.trustedSystem === true) {
@@ -156,11 +173,19 @@ export async function startAgentRun(
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
   try {
+    if (ingressProof) checkSnapshot(ingressProof.target, agentManager.getAgent(agentId));
     if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
       recordMessageIngressReceipt(ingressRequest, ingressProof, "out_of_band");
       return { disposition: "out_of_band" };
     }
-    const result = await startAgentRunInner(agentManager, agentId, prompt, logger, options);
+    const result = await startAgentRunInner(
+      agentManager,
+      agentId,
+      prompt,
+      logger,
+      options,
+      ingressProof?.target,
+    );
     recordMessageIngressReceipt(ingressRequest, ingressProof, result.disposition);
     return result;
   } catch (error) {
@@ -193,15 +218,22 @@ async function startAgentRunInner(
   prompt: AgentPromptInput,
   logger: Logger,
   options?: StartAgentRunOptions,
+  expectedTarget?: Binding,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
   const snapshot = agentManager.getAgent(agentId);
-  const steered = await steerOrReplaceActiveRun(agentManager, agentId, prompt, options);
+  const steered = await steerOrReplaceActiveRun(
+    agentManager,
+    agentId,
+    prompt,
+    options,
+    expectedTarget,
+  );
   if (steered?.disposition === "steered") {
     return steered;
   }
   const { iterator, replaced } = steered
     ? { iterator: steered.iterator, replaced: true }
-    : await startOrReplaceRun(agentManager, agentId, prompt, options);
+    : await startOrReplaceRun(agentManager, agentId, prompt, options, expectedTarget);
   logger.trace(
     {
       agentId,
@@ -222,7 +254,13 @@ async function startAgentRunInner(
           "Provider session went stale; reopening from persistence",
         );
         await agentManager.reloadAgentSession(agentId);
-        const retry = await startOrReplaceRun(agentManager, agentId, prompt, options);
+        const retry = await startOrReplaceRun(
+          agentManager,
+          agentId,
+          prompt,
+          options,
+          expectedTarget,
+        );
         await drainAgentRunIterator(retry.iterator);
       }
       logger.trace(

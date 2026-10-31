@@ -53,6 +53,7 @@ interface TrustedKey {
 export interface IngressRequest {
   authorization?: string;
   target: IngressSnapshot;
+  getTarget?: () => IngressSnapshot | null;
   getSource: (id: string) => IngressSnapshot | null;
   callerAgentId?: string;
   channel: string;
@@ -81,8 +82,7 @@ function binding(value: unknown): Binding {
     throw new IngressError("invalid_binding");
   const object = value as Record<string, unknown>;
   if (
-    Object.keys(object).some((field) => ![...fields, "provider"].includes(field)) ||
-    ("provider" in object && (typeof object.provider !== "string" || !object.provider)) ||
+    Object.keys(object).length !== fields.length ||
     fields.some((field) => typeof object[field] !== "string" || !object[field])
   ) {
     throw new IngressError("invalid_binding");
@@ -227,6 +227,8 @@ export async function verifyIngressGrant(authorization: string): Promise<Proof> 
     const source = binding(payload.source);
     const target = binding(payload.target);
     const scope = checkAuthorizationScope(payload, source, target, key);
+    if (typeof payload.source_provider === "string") source.provider = payload.source_provider;
+    if (typeof payload.target_provider === "string") target.provider = payload.target_provider;
     return {
       source,
       target,
@@ -274,6 +276,7 @@ async function validateProofBinding(
   } else if (hasEnvelope) {
     throw new IngressError("unexpected_peer_attestation");
   }
+  if (request.getTarget) request.target = request.getTarget() ?? { id: request.target.id };
   checkSnapshot(proof.target, request.target);
   if (request.callerAgentId && request.callerAgentId !== proof.source.native_session_id)
     throw new IngressError("source_identity_mismatch");

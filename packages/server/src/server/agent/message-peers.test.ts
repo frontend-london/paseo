@@ -2,7 +2,10 @@ import { generateKeyPair, exportSPKI, exportPKCS8, SignJWT } from "jose";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { AgentManager } from "./agent-manager.js";
+import { startAgentRun } from "./agent-prompt.js";
 import pino from "pino";
 import { authorizeMessageIngress, type Binding, type IngressSnapshot } from "./message-ingress.js";
 import { messageDigest, sendPeerMessage } from "./message-peers.js";
@@ -88,6 +91,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   rmSync(root, { recursive: true, force: true });
   for (const key of [
     "PASEO_HOME",
@@ -112,9 +116,13 @@ async function envelope(
 ) {
   const now = Math.floor(Date.now() / 1000);
   const jti = options.jti ?? "peer-request";
+  const { provider: sourceProvider, ...sourceBinding } = options.source ?? from;
+  const { provider: targetProvider, ...targetBinding } = options.target ?? to;
   const grant = await new SignJWT({
-    source: options.source ?? from,
-    target: options.target ?? to,
+    source: sourceBinding,
+    source_provider: sourceProvider,
+    target: targetBinding,
+    target_provider: targetProvider,
     purpose: "message",
     message_sha256: messageDigest(text),
   })
@@ -237,3 +245,53 @@ it("egress odmawia podszytego i nieaktualnego nadawcę przed siecią", async () 
     /session_binding_mismatch/,
   );
 });
+
+it("REV-001 blokuje źródło unieważnione podczas łączenia", async () => {
+  const { grant } = await envelope();
+  process.env.AGENTS_INGRESS_HOST = "agents_worker";
+  const cfg = JSON.parse(readFileSync(process.env.AGENTS_PEERS_FILE!, "utf8"));
+  cfg.local = { ...cfg.peers.agents_worker, privateKey: await exportPKCS8(daemon.privateKey) };
+  cfg.peers.orange_pi = { ...cfg.local, host: "orange_pi", daemonId: "orange-test" };
+  writeFileSync(process.env.AGENTS_PEERS_FILE!, JSON.stringify(cfg));
+  let live: IngressSnapshot | null = snapshot(from);
+  // Kontrolowany transport pozwala wymusić zmianę sesji dokładnie podczas await.
+  vi.spyOn(DaemonClient.prototype, "connect").mockImplementation(async () => {
+    live = null;
+  });
+  vi.spyOn(DaemonClient.prototype, "fetchAgents").mockResolvedValue({
+    requestId: "fixture",
+    entries: [],
+    pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+  });
+  vi.spyOn(DaemonClient.prototype, "close").mockResolvedValue();
+  const send = vi.spyOn(DaemonClient.prototype, "sendMessage").mockResolvedValue();
+  await expect(
+    sendPeerMessage({
+      authorization: grant,
+      text,
+      getSource: () => live,
+      logger: pino({ level: "silent" }),
+    }),
+  ).rejects.toThrow(/session_binding_mismatch/);
+  expect(send).not.toHaveBeenCalled();
+});
+
+it.each(["ticket", "provider-session"] as const)(
+  "REV-002 blokuje zmieniony cel %s podczas kryptografii",
+  async (field) => {
+    const { authorization } = await envelope();
+    const logger = pino({ level: "silent" });
+    const manager = new AgentManager({ clients: {}, logger });
+    const live = snapshot(to);
+    Reflect.set(manager, "getAgent", () => ({ ...live }));
+    const outOfBand = vi.fn(() => true);
+    Reflect.set(manager, "tryRunOutOfBand", outOfBand);
+    const pending = startAgentRun(manager, to.native_session_id, text, logger, {
+      ingressAuthorization: authorization,
+    });
+    if (field === "ticket") live.labels = { ticket: "AGT-OTHER" };
+    else live.persistence = { sessionId: "changed" };
+    await expect(pending).rejects.toThrow(/session_binding_mismatch/);
+    expect(outOfBand).not.toHaveBeenCalled();
+  },
+);
