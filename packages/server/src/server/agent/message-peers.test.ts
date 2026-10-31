@@ -382,6 +382,7 @@ it("REV-005 czyści niedoszłą wymianę po odmowie anulowania starego runu", as
   const runs = new AgentRunState();
   const live = {
     ...snapshot(to),
+    session: { describePersistence: () => null },
     lifecycle: "running",
     updatedAt: new Date(),
     activeForegroundTurnId: "old-turn",
