@@ -1,3 +1,5 @@
+import { IngressError } from "./agent/message-ingress.js";
+import { preflightAgentPromptIngress } from "./agent/agent-prompt.js";
 import { searchTimeline } from "./agent/chat-search/index.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
@@ -8135,6 +8137,16 @@ export class Session {
         },
         "agent.session.send_agent_message",
       );
+      await preflightAgentPromptIngress({
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        agentId,
+        prompt,
+        ingressAuthorization: msg.ingressAuthorization,
+        ingressChannel: "session_preflight",
+        messageId: msg.messageId,
+        logger: this.sessionLogger,
+      });
       const send = async () => {
         const result = await sendPromptToAgent({
           agentManager: this.agentManager,
@@ -8181,7 +8193,8 @@ export class Session {
       });
     } catch (error) {
       if (this.delivery.requestSignal.aborted) return;
-      this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
+      if (!(error instanceof IngressError))
+        this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
       this.emit({
         type: "send_agent_message_response",
         payload: {

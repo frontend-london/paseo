@@ -15,6 +15,7 @@ import {
   authorizeMessageIngress,
   recordMessageIngressReceipt,
   type IngressSnapshot,
+  type IngressRequest,
 } from "./message-ingress.js";
 import { randomUUID } from "node:crypto";
 
@@ -103,6 +104,26 @@ async function drainAgentRunIterator(
   }
 }
 
+function agentRunIngressRequest(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  options?: StartAgentRunOptions,
+): IngressRequest {
+  const snapshot = agentManager.getAgent(agentId);
+  const nativeMessageId = options?.nativeMessageId ?? randomUUID();
+  return {
+    authorization: options?.ingressAuthorization,
+    text: typeof prompt === "string" ? prompt : undefined,
+    target: (snapshot ?? { id: agentId }) as IngressSnapshot,
+    getSource: (id: string) => (agentManager.getAgent(id) as IngressSnapshot | null) ?? null,
+    callerAgentId: options?.callerAgentId,
+    channel: options?.ingressChannel ?? (options?.trustedSystem ? "system" : "unspecified"),
+    nativeMessageId,
+    consume: true,
+  };
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -123,16 +144,7 @@ export async function startAgentRun(
     },
     "agent.session.start_stream.request",
   );
-  const nativeMessageId = options?.nativeMessageId ?? randomUUID();
-  const ingressRequest = {
-    authorization: options?.ingressAuthorization,
-    target: (snapshot ?? { id: agentId }) as IngressSnapshot,
-    getSource: (id: string) => (agentManager.getAgent(id) as IngressSnapshot | null) ?? null,
-    callerAgentId: options?.callerAgentId,
-    channel: options?.ingressChannel ?? (options?.trustedSystem ? "system" : "unspecified"),
-    nativeMessageId,
-    consume: true,
-  };
+  const ingressRequest = agentRunIngressRequest(agentManager, agentId, prompt, options);
   let ingressProof = null;
   if (options?.trustedSystem === true) {
     // Jawny wyjątek systemowy — nie globalny bypass; audytowany osobno.
@@ -154,6 +166,10 @@ export async function startAgentRun(
   } catch (error) {
     if (!isStaleProviderSessionError(error)) {
       recordMessageIngressReceipt(ingressRequest, ingressProof, "failed");
+      throw error;
+    }
+    if (ingressProof) {
+      recordMessageIngressReceipt(ingressRequest, ingressProof, "stale_provider_denied");
       throw error;
     }
     logger.info({ agentId, err: error }, "Provider session went stale; reopening from persistence");
@@ -351,9 +367,26 @@ export async function waitForAgentRunStartWithTimeout(
  * When `unarchive` is false and the agent is archived, the call is a silent
  * no-op (returns the normal turn-start disposition) — the agent is not run.
  */
+export async function preflightAgentPromptIngress(params: SendPromptToAgentParams): Promise<void> {
+  if (params.trustedSystem) return;
+  const target =
+    params.agentManager.getAgent(params.agentId) ?? (await params.agentStorage.get(params.agentId));
+  await authorizeMessageIngress({
+    authorization: params.ingressAuthorization,
+    target: target ?? { id: params.agentId },
+    getSource: (id) => params.agentManager.getAgent(id) ?? null,
+    callerAgentId: params.callerAgentId,
+    channel: params.ingressChannel ?? "prompt_preflight",
+    nativeMessageId: params.messageId ?? "preflight",
+    consume: false,
+    text: typeof params.prompt === "string" ? params.prompt : undefined,
+  });
+}
+
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
+  await preflightAgentPromptIngress(params);
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
