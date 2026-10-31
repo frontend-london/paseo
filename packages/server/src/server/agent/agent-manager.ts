@@ -2523,6 +2523,13 @@ export class AgentManager {
     });
   }
 
+  private clearFailedReplacement(agent: ActiveManagedAgent): void {
+    if (this.agents.get(agent.id) !== agent || this.runs.hasRun(agent.id)) return;
+    agent.pendingReplacement = false;
+    if (!agent.activeForegroundTurnId) agent.lifecycle = "idle";
+    this.emitState(agent);
+  }
+
   private async startPendingForegroundTurn(params: {
     agent: ActiveManagedAgent;
     agentId: string;
@@ -2539,6 +2546,7 @@ export class AgentManager {
         error: error instanceof Error ? error.message : "ingress denied",
       };
       this.runs.settleForegroundRun(agentId, pendingRun.token);
+      this.clearFailedReplacement(agent);
       throw error;
     }
     try {
@@ -2797,10 +2805,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "replace");
       return this.streamAgent(agentId, prompt, options);
     } catch (error) {
-      const latest = this.agents.get(agentId);
-      if (latest) {
-        latest.pendingReplacement = false;
-      }
+      this.clearFailedReplacement(agent);
       throw error;
     }
   }
@@ -2945,10 +2950,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agent.id, "replace");
       return this.streamAgent(agent.id, prompt, options);
     } catch (error) {
-      const latest = this.agents.get(agent.id);
-      if (latest) {
-        latest.pendingReplacement = false;
-      }
+      this.clearFailedReplacement(agent);
       throw error;
     }
   }

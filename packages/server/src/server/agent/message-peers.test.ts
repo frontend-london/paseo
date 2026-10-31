@@ -313,6 +313,7 @@ it("REV-003 blokuje retarget podczas anulowania aktywnego turnu", async () => {
     updatedAt: new Date(),
     activeForegroundTurnId: "old-turn",
   };
+  Reflect.set(manager, "agents", new Map([[to.native_session_id, live]]));
   Reflect.set(manager, "getAgent", () => ({ ...live }));
   Reflect.set(manager, "requireAgent", () => live);
   Reflect.set(manager, "requireSessionAgent", () => live);
@@ -330,6 +331,7 @@ it("REV-003 blokuje retarget podczas anulowania aktywnego turnu", async () => {
   Reflect.set(manager, "cancelAgentRun", async () => {
     entered();
     await releasePromise;
+    Reflect.set(live, "activeForegroundTurnId", null);
     return { status: "settled" };
   });
   const pending = startAgentRun(manager, to.native_session_id, text, logger, {
@@ -341,6 +343,8 @@ it("REV-003 blokuje retarget podczas anulowania aktywnego turnu", async () => {
   release();
   await expect(pending).rejects.toThrow(/session_binding_mismatch/);
   expect(startTurn).not.toHaveBeenCalled();
+  expect(live.lifecycle).toBe("idle");
+  expect(Reflect.get(live, "pendingReplacement")).toBe(false);
 });
 
 it("guard blokuje zmianę celu po utworzeniu iteratora, bez zapisu historii błędu", async () => {
@@ -350,19 +354,24 @@ it("guard blokuje zmianę celu po utworzeniu iteratora, bez zapisu historii bł�
   const live = {
     ...snapshot(to),
     session: { startTurn },
-    lifecycle: "idle",
+    lifecycle: "running",
+    pendingReplacement: true,
     updatedAt: new Date(),
     activeForegroundTurnId: null,
   };
+  Reflect.set(manager, "agents", new Map([[to.native_session_id, live]]));
   Reflect.set(manager, "getAgent", () => ({ ...live }));
   Reflect.set(manager, "requireSessionAgent", () => live);
   const emit = vi.fn();
   Reflect.set(manager, "dispatchStream", emit);
+  Reflect.set(manager, "emitState", vi.fn());
   const iterator = manager.streamAgent(to.native_session_id, text, {
     beforeDispatch: () => checkSnapshot(to, manager.getAgent(to.native_session_id)),
   });
   live.labels = { ticket: "AGT-OTHER" };
   await expect(iterator.next()).rejects.toThrow(/session_binding_mismatch/);
   expect(startTurn).not.toHaveBeenCalled();
+  expect(live.lifecycle).toBe("idle");
+  expect(Reflect.get(live, "pendingReplacement")).toBe(false);
   expect(emit).not.toHaveBeenCalled();
 });
