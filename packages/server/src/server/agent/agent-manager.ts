@@ -2523,10 +2523,12 @@ export class AgentManager {
     });
   }
 
-  private clearFailedReplacement(agent: ActiveManagedAgent): void {
-    if (this.agents.get(agent.id) !== agent || this.runs.hasRun(agent.id)) return;
+  private clearFailedReplacement(agent: ActiveManagedAgent, ownedRunToken?: string): void {
+    if (this.agents.get(agent.id) !== agent) return;
+    const currentRun = this.runs.getRun(agent.id);
+    if (currentRun && currentRun.token !== ownedRunToken) return;
     agent.pendingReplacement = false;
-    if (!agent.activeForegroundTurnId) agent.lifecycle = "idle";
+    if (!agent.activeForegroundTurnId && !currentRun) agent.lifecycle = "idle";
     this.emitState(agent);
   }
 
@@ -2546,7 +2548,7 @@ export class AgentManager {
         error: error instanceof Error ? error.message : "ingress denied",
       };
       this.runs.settleForegroundRun(agentId, pendingRun.token);
-      this.clearFailedReplacement(agent);
+      this.clearFailedReplacement(agent, pendingRun.token);
       throw error;
     }
     try {
@@ -2796,6 +2798,7 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
+    const ownedRunToken = this.runs.getRun(agentId)?.token;
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -2805,7 +2808,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "replace");
       return this.streamAgent(agentId, prompt, options);
     } catch (error) {
-      this.clearFailedReplacement(agent);
+      this.clearFailedReplacement(agent, ownedRunToken);
       throw error;
     }
   }
@@ -2941,6 +2944,7 @@ export class AgentManager {
     options?: AgentDispatchOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
     this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
+    const ownedRunToken = this.runs.getRun(agent.id)?.token;
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -2950,7 +2954,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agent.id, "replace");
       return this.streamAgent(agent.id, prompt, options);
     } catch (error) {
-      this.clearFailedReplacement(agent);
+      this.clearFailedReplacement(agent, ownedRunToken);
       throw error;
     }
   }

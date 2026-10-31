@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { AgentRunState } from "./agent-run-state.js";
 import { AgentManager } from "./agent-manager.js";
 import { startAgentRun } from "./agent-prompt.js";
 import pino from "pino";
@@ -374,4 +375,33 @@ it("guard blokuje zmianę celu po utworzeniu iteratora, bez zapisu historii bł�
   expect(live.lifecycle).toBe("idle");
   expect(Reflect.get(live, "pendingReplacement")).toBe(false);
   expect(emit).not.toHaveBeenCalled();
+});
+
+it("REV-005 czyści niedoszłą wymianę po odmowie anulowania starego runu", async () => {
+  const manager = new AgentManager({ clients: {}, logger: pino({ level: "silent" }) });
+  const runs = new AgentRunState();
+  const live = {
+    ...snapshot(to),
+    lifecycle: "running",
+    updatedAt: new Date(),
+    activeForegroundTurnId: "old-turn",
+    activeTurnId: "old-turn",
+    pendingReplacement: false,
+    finalizedForegroundTurnIds: new Set<string>(),
+  };
+  Reflect.set(manager, "agents", new Map([[to.native_session_id, live]]));
+  Reflect.set(manager, "runs", runs);
+  Reflect.set(manager, "requireAgent", () => live);
+  Reflect.set(manager, "requireSessionAgent", () => live);
+  Reflect.set(manager, "emitState", vi.fn());
+  Reflect.set(manager, "cancelAgentRun", async () => ({ status: "refused", reason: "fixture" }));
+  runs.trackAutonomousRun(to.native_session_id, "old-turn");
+  await expect(manager.replaceAgentRun(to.native_session_id, text)).rejects.toThrow();
+  expect(live.pendingReplacement).toBe(false);
+  expect(live.lifecycle).toBe("running");
+  runs.settleTerminalRun(to.native_session_id, "old-turn");
+  Reflect.set(live, "activeForegroundTurnId", null);
+  Reflect.get(manager, "finalizeForegroundTurn").call(manager, live);
+  expect(live.lifecycle).toBe("idle");
+  expect(live.pendingReplacement).toBe(false);
 });
