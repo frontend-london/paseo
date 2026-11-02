@@ -1361,6 +1361,8 @@ export const SendAgentMessageRequestSchema = z.object({
   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
+  /** Podpisany grant AGT-880 wiążący źródło z target ticket/session. */
+  ingressAuthorization: z.string().min(1).max(16384).optional(),
 });
 
 export const WaitForFinishRequestSchema = z.object({

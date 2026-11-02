@@ -12,6 +12,7 @@ import {
   formatSystemNotificationPrompt,
   isSystemInjectedEnvelope,
   setupFinishNotification,
+  startAgentRun,
   waitForAgentRunStartWithTimeout,
 } from "./agent-prompt.js";
 import type { AgentManagerEvent, ManagedAgent } from "./agent-manager.js";
@@ -21,6 +22,19 @@ import type {
   AgentSession,
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
+
+it("AGT-880 refuses unverified ingress before out-of-band dispatch", async () => {
+  const manager = new AgentManager({ clients: {}, logger: createTestLogger() });
+  const target: ManagedAgent = Object.create(null);
+  Reflect.set(target, "id", "11111111-1111-4111-8111-111111111111");
+  Reflect.set(target, "labels", { ticket: "AGT-101" });
+  Reflect.set(manager, "getAgent", () => target);
+  const outOfBand = vi.fn(() => true);
+  Reflect.set(manager, "tryRunOutOfBand", outOfBand);
+  await expect(startAgentRun(manager, target.id, "/goal pause", createTestLogger()))
+    .rejects.toThrow(/ingress/);
+  expect(outOfBand).not.toHaveBeenCalled();
+});
 
 interface CapturedLogger {
   logger: Logger;

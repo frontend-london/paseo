@@ -498,6 +498,54 @@ describe("ScheduleService", () => {
     ]);
   });
 
+  test("AGT-880 denies agent-target schedules without source grants in secured or ticket-bound mode", async () => {
+    const manager = new AgentManager({
+      logger: createTestLogger(),
+      clients: createTestAgentClients(),
+      registry: agentStorage,
+    });
+    const agent = await manager.createAgent({ provider: "claude", cwd: tempDir }, undefined, {
+      workspaceId: undefined,
+    });
+    const steer = vi.spyOn(manager, "steerOrReplaceActiveTurn");
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+    const schedule = await service.create({
+      prompt: "cross-ticket schedule injection",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "agent", agentId: agent.id },
+    });
+    const oldTrust = process.env.AGENTS_INGRESS_TRUST_FILE;
+    try {
+      // Even if an agent's mutable ticket label is stripped, a secured host
+      // must refuse unsigned scheduled prompts.
+      process.env.AGENTS_INGRESS_TRUST_FILE = join(tempDir, "secured-host-trust.json");
+      await expect(
+        (service as unknown as ScheduleServiceInternals).executeSchedule(schedule, "secured-run"),
+      ).rejects.toThrow("schedule_target_requires_signed_ingress_authorization");
+      delete process.env.AGENTS_INGRESS_TRUST_FILE;
+      const persisted = await agentStorage.get(agent.id);
+      expect(persisted).not.toBeNull();
+      await agentStorage.upsert({
+        ...persisted!,
+        labels: { ...persisted!.labels, ticket: "AGT-101" },
+      });
+      await expect(
+        (service as unknown as ScheduleServiceInternals).executeSchedule(schedule, "ticket-run"),
+      ).rejects.toThrow("schedule_target_requires_signed_ingress_authorization");
+      expect(steer).not.toHaveBeenCalled();
+    } finally {
+      if (oldTrust === undefined) delete process.env.AGENTS_INGRESS_TRUST_FILE;
+      else process.env.AGENTS_INGRESS_TRUST_FILE = oldTrust;
+    }
+  });
+
   test("titles scheduled new agents from the schedule prompt", async () => {
     const manager = new AgentManager({
       logger: createTestLogger(),

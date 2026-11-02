@@ -11,6 +11,12 @@ import { ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
+import {
+  authorizeMessageIngress,
+  recordMessageIngressReceipt,
+  type IngressSnapshot,
+} from "./message-ingress.js";
+import { randomUUID } from "node:crypto";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
 
@@ -32,6 +38,14 @@ export interface StartAgentRunOptions {
   runOptions?: AgentRunOptions;
   /** Ask the provider to deny permissions blocking this steer. */
   clearPendingPermissions?: boolean;
+  /** Podpisany grant AGT-880; wymagany dla sesji z etykietą ticket. */
+  ingressAuthorization?: string;
+  /** Kanał wejścia — CLI/MCP/UI vs zaufany system in-process. */
+  ingressChannel?: string;
+  callerAgentId?: string;
+  /** Jawny, audytowany wyjątek wyłącznie dla ścieżek systemowych in-process. */
+  trustedSystem?: boolean;
+  nativeMessageId?: string;
 }
 
 export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
@@ -109,21 +123,51 @@ export async function startAgentRun(
     },
     "agent.session.start_stream.request",
   );
+  const nativeMessageId = options?.nativeMessageId ?? randomUUID();
+  const ingressRequest = {
+    authorization: options?.ingressAuthorization,
+    target: (snapshot ?? { id: agentId }) as IngressSnapshot,
+    getSource: (id: string) => (agentManager.getAgent(id) as IngressSnapshot | null) ?? null,
+    callerAgentId: options?.callerAgentId,
+    channel: options?.ingressChannel ?? (options?.trustedSystem ? "system" : "unspecified"),
+    nativeMessageId,
+    consume: true,
+  };
+  let ingressProof = null;
+  if (options?.trustedSystem === true) {
+    // Jawny wyjątek systemowy — nie globalny bypass; audytowany osobno.
+    recordMessageIngressReceipt(ingressRequest, null, "trusted_system_allow");
+  } else {
+    ingressProof = await authorizeMessageIngress(ingressRequest);
+  }
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
-    return { disposition: "out_of_band" };
-  }
   try {
-    return await startAgentRunInner(agentManager, agentId, prompt, logger, options);
+    if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
+      recordMessageIngressReceipt(ingressRequest, ingressProof, "out_of_band");
+      return { disposition: "out_of_band" };
+    }
+    const result = await startAgentRunInner(agentManager, agentId, prompt, logger, options);
+    recordMessageIngressReceipt(ingressRequest, ingressProof, result.disposition);
+    return result;
   } catch (error) {
-    if (!isStaleProviderSessionError(error)) throw error;
+    if (!isStaleProviderSessionError(error)) {
+      recordMessageIngressReceipt(ingressRequest, ingressProof, "failed");
+      throw error;
+    }
     logger.info({ agentId, err: error }, "Provider session went stale; reopening from persistence");
     // The live session belongs to a retired plugin runtime. Reload swaps in a
     // fresh session on the current runtime while preserving history and labels.
     await agentManager.reloadAgentSession(agentId);
-    return await startAgentRunInner(agentManager, agentId, prompt, logger, options);
+    try {
+      const result = await startAgentRunInner(agentManager, agentId, prompt, logger, options);
+      recordMessageIngressReceipt(ingressRequest, ingressProof, result.disposition);
+      return result;
+    } catch (retryError) {
+      recordMessageIngressReceipt(ingressRequest, ingressProof, "failed");
+      throw retryError;
+    }
   }
 }
 
@@ -240,6 +284,10 @@ export interface SendPromptToAgentParams {
   unarchive?: boolean;
   /** See {@link StartAgentRunOptions.clearPendingPermissions}. */
   clearPendingPermissions?: boolean;
+  ingressAuthorization?: string;
+  ingressChannel?: string;
+  callerAgentId?: string;
+  trustedSystem?: boolean;
   logger: Logger;
 }
 
@@ -335,6 +383,11 @@ export async function sendPromptToAgent(
     activeTurnBehavior: params.activeTurnBehavior,
     clearPendingPermissions: params.clearPendingPermissions,
     runOptions,
+    ingressAuthorization: params.ingressAuthorization,
+    ingressChannel: params.ingressChannel,
+    callerAgentId: params.callerAgentId,
+    trustedSystem: params.trustedSystem,
+    nativeMessageId: params.messageId,
   });
 }
 
@@ -357,6 +410,8 @@ export async function startCreatedAgentInitialPrompt(
     params.logger,
     {
       runOptions: params.runOptions,
+      trustedSystem: true,
+      ingressChannel: "initial_prompt",
     },
   );
 
@@ -476,6 +531,9 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       prompt: formatSystemNotificationPrompt(body),
       activeTurnBehavior: "steer",
       unarchive: false,
+      trustedSystem: true,
+      ingressChannel: "finish_notification",
+      callerAgentId,
       logger,
     });
   }

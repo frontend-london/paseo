@@ -362,6 +362,7 @@ export interface SendMessageOptions {
   activeTurnBehavior?: ActiveTurnBehavior;
   images?: Array<{ data: string; mimeType: string }>;
   attachments?: SendAgentMessageRequest["attachments"];
+  ingressAuthorization?: string;
 }
 
 export interface AgentAttentionRequiredNotification {
@@ -3373,6 +3374,9 @@ export class DaemonClient {
       ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
       ...(options?.images ? { images: options.images } : {}),
       ...(options?.attachments ? { attachments: options.attachments } : {}),
+      ...(options?.ingressAuthorization
+        ? { ingressAuthorization: options.ingressAuthorization }
+        : {}),
     });
     const payload = await this.sendRequest({
       requestId,
