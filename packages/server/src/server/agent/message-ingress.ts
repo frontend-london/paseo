@@ -1,3 +1,4 @@
+import { splitPeerAuthorization, verifyPeerAttestation, messageDigest } from "./message-peers.js";
 import { createHash } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
@@ -9,7 +10,8 @@ const AUDIENCE = "agents-message-ingress/v1";
 const MAX_TTL_SECONDS = 300;
 const MAX_TOKEN_BYTES = 16384;
 
-interface Binding {
+export interface Binding {
+  provider?: string;
   identity: string;
   ticket: string;
   host: string;
@@ -22,6 +24,7 @@ interface Binding {
 export interface IngressSnapshot {
   id: string;
   cwd?: string;
+  provider?: string;
   workspaceId?: string;
   labels?: Record<string, string>;
   persistence?: { sessionId: string } | null;
@@ -29,7 +32,8 @@ export interface IngressSnapshot {
   archivedAt?: string | null;
 }
 
-interface Proof {
+export interface Proof {
+  message_sha256?: string;
   source: Binding;
   target: Binding;
   provenance: string;
@@ -42,19 +46,23 @@ interface TrustedKey {
   issuer: string;
   public_key: string;
   purposes: string[];
+  revoked?: boolean;
+  revoked_jtis?: string[];
 }
 
 export interface IngressRequest {
   authorization?: string;
   target: IngressSnapshot;
+  getTarget?: () => IngressSnapshot | null;
   getSource: (id: string) => IngressSnapshot | null;
   callerAgentId?: string;
   channel: string;
   nativeMessageId: string;
   consume: boolean;
+  text?: string;
 }
 
-class IngressError extends Error {
+export class IngressError extends Error {
   constructor(readonly reason: string) {
     super(`message ingress refused: ${reason}`);
   }
@@ -82,9 +90,10 @@ function binding(value: unknown): Binding {
   return object as unknown as Binding;
 }
 
-function checkSnapshot(expected: Binding, actual: IngressSnapshot | null): void {
+export function checkSnapshot(expected: Binding, actual: IngressSnapshot | null): void {
   if (
     !actual ||
+    (expected.provider !== undefined && expected.provider !== actual.provider) ||
     actual.archivedAt ||
     expected.native_session_id !== actual.id ||
     expected.ticket !== actual.labels?.ticket ||
@@ -197,7 +206,7 @@ function checkAuthorizationScope(
   return { requestId: payload.jti as string, purpose: payload.purpose as string };
 }
 
-async function verify(authorization: string): Promise<Proof> {
+export async function verifyIngressGrant(authorization: string): Promise<Proof> {
   const trustFile = process.env.AGENTS_INGRESS_TRUST_FILE;
   if (!trustFile || !authorization || authorization.length > MAX_TOKEN_BYTES)
     throw new IngressError("source_authorization_missing");
@@ -207,20 +216,24 @@ async function verify(authorization: string): Promise<Proof> {
     if (header.alg !== "EdDSA" || !header.kid || !Object.hasOwn(trust, header.kid))
       throw new IngressError("untrusted_key");
     const key = trust[header.kid]!;
+    if (key.revoked) throw new IngressError("revoked_key");
     const { payload } = await jwtVerify(authorization, await importSPKI(key.public_key, "EdDSA"), {
       algorithms: ["EdDSA"],
       issuer: key.issuer,
       audience: AUDIENCE,
       requiredClaims: ["sub", "iat", "exp", "jti"],
     });
+    if (key.revoked_jtis?.includes(payload.jti!)) throw new IngressError("revoked_grant");
     const source = binding(payload.source);
     const target = binding(payload.target);
     const scope = checkAuthorizationScope(payload, source, target, key);
-    if (!process.env.AGENTS_INGRESS_HOST || process.env.AGENTS_INGRESS_HOST !== target.host)
-      throw new IngressError("wrong_daemon_host");
+    if (typeof payload.source_provider === "string") source.provider = payload.source_provider;
+    if (typeof payload.target_provider === "string") target.provider = payload.target_provider;
     return {
       source,
       target,
+      message_sha256:
+        typeof payload.message_sha256 === "string" ? payload.message_sha256 : undefined,
       provenance: `${key.issuer}#${key.name}`,
       request_id: scope.requestId,
       purpose: scope.purpose,
@@ -229,6 +242,46 @@ async function verify(authorization: string): Promise<Proof> {
     if (error instanceof IngressError) throw error;
     throw new IngressError("source_authorization_invalid");
   }
+}
+
+async function validateProofBinding(
+  request: IngressRequest,
+  proof: Proof,
+  hasEnvelope: boolean,
+): Promise<void> {
+  if (!process.env.AGENTS_INGRESS_HOST || process.env.AGENTS_INGRESS_HOST !== proof.target.host)
+    throw new IngressError("wrong_daemon_host");
+  if (
+    proof.message_sha256 &&
+    (request.text === undefined || proof.message_sha256 !== messageDigest(request.text))
+  )
+    throw new IngressError("message_binding_mismatch");
+  if (proof.source.host !== proof.target.host) {
+    if (
+      !proof.source.provider ||
+      !proof.target.provider ||
+      !proof.message_sha256 ||
+      request.text === undefined ||
+      proof.purpose !== "message"
+    )
+      throw new IngressError("invalid_peer_scope");
+    await verifyPeerAttestation({
+      authorization: request.authorization ?? "",
+      sourceHost: proof.source.host,
+      targetHost: proof.target.host,
+      requestId: proof.request_id,
+      text: request.text,
+    });
+    request.channel = "daemon_peer";
+  } else if (hasEnvelope) {
+    throw new IngressError("unexpected_peer_attestation");
+  }
+  if (request.getTarget) request.target = request.getTarget() ?? { id: request.target.id };
+  checkSnapshot(proof.target, request.target);
+  if (request.callerAgentId && request.callerAgentId !== proof.source.native_session_id)
+    throw new IngressError("source_identity_mismatch");
+  if (proof.source.host === proof.target.host && proof.source.identity.startsWith("agent:"))
+    checkSnapshot(proof.source, request.getSource(proof.source.native_session_id));
 }
 
 /** Bramka jest niezależna od ACP i działa przed providerem oraz poleceniami out-of-band. */
@@ -241,12 +294,9 @@ export async function authorizeMessageIngress(request: IngressRequest): Promise<
     return null;
   let proof: Proof | null = null;
   try {
-    proof = await verify(request.authorization ?? "");
-    checkSnapshot(proof.target, request.target);
-    if (request.callerAgentId && request.callerAgentId !== proof.source.native_session_id)
-      throw new IngressError("source_identity_mismatch");
-    if (proof.source.identity.startsWith("agent:"))
-      checkSnapshot(proof.source, request.getSource(proof.source.native_session_id));
+    const envelope = splitPeerAuthorization(request.authorization ?? "");
+    proof = await verifyIngressGrant(envelope?.grant ?? request.authorization ?? "");
+    await validateProofBinding(request, proof, envelope !== null);
     if (request.consume) claim(proof.request_id);
     audit(request, proof, request.consume ? "intent" : "validated", "verified");
     return proof;

@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises";
 import { z } from "zod";
+import { sendPeerMessage } from "../message-peers.js";
 import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
 
@@ -1885,6 +1886,29 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         throw new Error("unreachable");
     }
   }
+
+  registerTool(
+    "send_peer_message",
+    {
+      title: "Send daemon peer message",
+      description:
+        "Deliver a signed ticket-bound message through this daemon to a configured remote daemon.",
+      inputSchema: {
+        authorization: z.string().min(1).max(16384),
+        text: z.string().min(1).max(65536),
+      },
+    },
+    async ({ authorization, text }) => {
+      const result = await sendPeerMessage({
+        authorization,
+        text,
+        callerAgentId,
+        logger: childLogger,
+        getSource: (id) => agentManager.getAgent(id) ?? null,
+      });
+      return { content: [], structuredContent: result };
+    },
+  );
 
   registerTool(
     "send_agent_prompt",

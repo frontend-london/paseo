@@ -31,8 +31,9 @@ it("AGT-880 refuses unverified ingress before out-of-band dispatch", async () =>
   Reflect.set(manager, "getAgent", () => target);
   const outOfBand = vi.fn(() => true);
   Reflect.set(manager, "tryRunOutOfBand", outOfBand);
-  await expect(startAgentRun(manager, target.id, "/goal pause", createTestLogger()))
-    .rejects.toThrow(/ingress/);
+  await expect(
+    startAgentRun(manager, target.id, "/goal pause", createTestLogger()),
+  ).rejects.toThrow(/ingress/);
   expect(outOfBand).not.toHaveBeenCalled();
 });
 

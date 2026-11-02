@@ -342,11 +342,28 @@ export interface AgentManagerOptions {
   logger: Logger;
 }
 
+export interface AgentDispatchOptions extends AgentRunOptions {
+  /** Wyłącznie in-process: ponowna walidacja po await, przed efektem providera. */
+  beforeDispatch?: () => void;
+}
+
+export interface AgentSteerDispatchOptions extends AgentSteerOptions {
+  beforeDispatch?: () => void;
+}
+
+function providerRunOptions<T extends AgentDispatchOptions>(
+  options?: T,
+): Omit<T, "beforeDispatch"> | undefined {
+  if (!options) return undefined;
+  const { beforeDispatch: _, ...providerOptions } = options;
+  return providerOptions;
+}
+
 export type ActiveTurnSteerDispatchResult =
   | { status: "inactive" | "steered" }
   | { status: "replaced"; iterator: AsyncGenerator<AgentStreamEvent> };
 
-function stripSteerOptions(options?: AgentSteerOptions): AgentRunOptions | undefined {
+function stripSteerOptions(options?: AgentSteerDispatchOptions): AgentDispatchOptions | undefined {
   if (!options) return undefined;
   const { clearPendingPermissions: _, ...runOptions } = options;
   return runOptions;
@@ -2384,7 +2401,7 @@ export class AgentManager {
   async runAgent(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    options?: AgentDispatchOptions,
   ): Promise<AgentRunResult> {
     const events = this.streamAgent(agentId, prompt, options);
     const timeline: AgentTimelineItem[] = [];
@@ -2427,7 +2444,11 @@ export class AgentManager {
    * emitted by the handler flow through dispatchStream so they persist and
    * broadcast like normal timeline events.
    */
-  tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
+  tryRunOutOfBand(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentDispatchOptions,
+  ): boolean {
     const agent = this.requireSessionAgent(agentId);
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
@@ -2502,16 +2523,36 @@ export class AgentManager {
     });
   }
 
+  private clearFailedReplacement(agent: ActiveManagedAgent, ownedRunToken?: string): void {
+    if (this.agents.get(agent.id) !== agent) return;
+    const currentRun = this.runs.getRun(agent.id);
+    if (currentRun && currentRun.token !== ownedRunToken) return;
+    agent.pendingReplacement = false;
+    if (!agent.activeForegroundTurnId && !currentRun) agent.lifecycle = "idle";
+    this.emitState(agent);
+  }
+
   private async startPendingForegroundTurn(params: {
     agent: ActiveManagedAgent;
     agentId: string;
     pendingRun: PendingForegroundRun;
     prompt: AgentPromptInput;
-    options?: AgentRunOptions;
+    options?: AgentDispatchOptions;
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
-      const result = await agent.session.startTurn(prompt, options);
+      options?.beforeDispatch?.();
+    } catch (error) {
+      pendingRun.start = {
+        status: "failed",
+        error: error instanceof Error ? error.message : "ingress denied",
+      };
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+      this.clearFailedReplacement(agent, pendingRun.token);
+      throw error;
+    }
+    try {
+      const result = await agent.session.startTurn(prompt, providerRunOptions(options));
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -2544,8 +2585,9 @@ export class AgentManager {
   streamAgent(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    options?: AgentDispatchOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    options?.beforeDispatch?.();
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -2744,7 +2786,7 @@ export class AgentManager {
   async replaceAgentRun(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    options?: AgentDispatchOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
     const snapshot = this.requireAgent(agentId);
     if (
@@ -2756,6 +2798,7 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
+    const ownedRunToken = this.runs.getRun(agentId)?.token;
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -2765,10 +2808,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "replace");
       return this.streamAgent(agentId, prompt, options);
     } catch (error) {
-      const latest = this.agents.get(agentId);
-      if (latest) {
-        latest.pendingReplacement = false;
-      }
+      this.clearFailedReplacement(agent, ownedRunToken);
       throw error;
     }
   }
@@ -2776,7 +2816,7 @@ export class AgentManager {
   async steerAgentRun(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentSteerOptions,
+    options?: AgentSteerDispatchOptions,
   ): Promise<SteerResult> {
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
@@ -2784,8 +2824,9 @@ export class AgentManager {
       return { status: "unavailable" };
     }
     const result = await this.runSteerAdmission(agent, expectedTurnId, async () => {
+      options?.beforeDispatch?.();
       const admission = await agent.session.steerActiveTurn!(prompt, {
-        ...options,
+        ...providerRunOptions(options),
         expectedTurnId,
       });
       if (admission.status === "accepted") {
@@ -2804,7 +2845,7 @@ export class AgentManager {
   async steerOrReplaceActiveTurn(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentSteerOptions,
+    options?: AgentSteerDispatchOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
@@ -2814,8 +2855,9 @@ export class AgentManager {
 
     const result = agent.session.steerActiveTurn
       ? await this.runSteerAdmission(agent, expectedTurnId, async () => {
+          options?.beforeDispatch?.();
           const admission = await agent.session.steerActiveTurn!(prompt, {
-            ...options,
+            ...providerRunOptions(options),
             expectedTurnId,
           });
           if (admission.status === "accepted") {
@@ -2899,9 +2941,10 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     expectedTurnId: string,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    options?: AgentDispatchOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
     this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
+    const ownedRunToken = this.runs.getRun(agent.id)?.token;
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -2911,10 +2954,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agent.id, "replace");
       return this.streamAgent(agent.id, prompt, options);
     } catch (error) {
-      const latest = this.agents.get(agent.id);
-      if (latest) {
-        latest.pendingReplacement = false;
-      }
+      this.clearFailedReplacement(agent, ownedRunToken);
       throw error;
     }
   }
